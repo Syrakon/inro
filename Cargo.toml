@@ -1,0 +1,16 @@
+[package]
+name = "inro"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Minimum-footprint embedded key-value database engine, in pure Rust. Name reserved — implementation in progress."
+repository = "https://gitlab.com/syrakon/inro"
+license = "MIT OR Apache-2.0"
+keywords = ["database", "embedded", "key-value", "btree", "iot"]
+categories = ["database-implementations", "database", "embedded", "no-std"]
+# Lista blanca, no lista negra: el paquete publicado en crates.io lleva solo el
+# stub, la licencia y el README. El diseño en `docs/` no se publica mientras el
+# repositorio siga siendo privado.
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[dependencies]
