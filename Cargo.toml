@@ -22,3 +22,7 @@ unsafe_code = "forbid"
 # escrita aquí al lado, igual que en arkeion. Parser, B-tree, codificaciones,
 # varint, CRC32, bitpacking y compresión se escriben a mano.
 [dependencies]
+
+[features]
+default = ["std"]
+std = []
