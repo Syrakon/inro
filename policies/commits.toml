@@ -1,0 +1,26 @@
+# torii commit policy — written by `torii init`.
+# Edit / extend; run `torii scan --commits` to evaluate.
+# Docs: https://gitorii.com/docs/policies/commits
+
+# Block AI-tooling co-author trailers from leaking into history.
+forbid_trailers = [
+    "Co-Authored-By:.*Claude",
+    "Co-Authored-By:.*Copilot",
+    "Co-Authored-By:.*GPT",
+]
+
+# Reject lazy / temp subjects.
+forbid_subjects = ["^(wip|tmp|temp|misc|asdf|update|fix)$"]
+
+# Subject sanity.
+subject_min_length = 8
+subject_max_length = 72
+
+# Conventional Commits — uncomment to enforce.
+# require_conventional = true
+
+# Pin commits to your domain (uncomment + adjust):
+# author_email_matches = ".*@example\\.com$"
+
+# DCO sign-off (uncomment to require):
+# require_trailers = ["Signed-off-by:"]

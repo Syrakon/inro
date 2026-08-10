@@ -1,0 +1,52 @@
+# Torii ignore file — controls what torii tracks and snapshots
+# Syntax extends .gitignore with optional [sections]
+
+# Build output
+/target
+/build
+/dist
+
+# Dependencies
+node_modules/
+.bun/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Torii local config
+.torii/
+
+# OS & editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# ─── Custom secret patterns (uncomment to enable) ─────────────────
+# [secrets]
+# deny: AKIA[0-9A-Z]{16}              # AWS access keys
+# deny: ghp_[A-Za-z0-9]{36}           # GitHub PAT
+# deny: xkeysib-[a-z0-9]{64,}         # Brevo API
+
+# ─── File size limits (uncomment to enable) ───────────────────────
+# [size]
+# max: 10MB
+# warn: 1MB
+# exclude: *.psd, *.zip, *.bin
+
+# ─── Pre-save / pre-sync hooks (uncomment to enable) ──────────────
+# [hooks]
+# pre-save: cargo fmt --check
+# pre-save: cargo clippy -- -D warnings
+# pre-sync: cargo test --no-run
+
+# ─── Sensitive rules → use .toriignore.local ──────────────────────
+# Rules whose existence would help an attacker recon (internal
+# paths, proprietary secret formats) belong in .toriignore.local.
+# That file is gitignored automatically — never committed.
+# Same syntax as this file. Local rules merge on top of public ones.
