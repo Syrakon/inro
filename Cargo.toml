@@ -1,6 +1,6 @@
 [package]
 name = "inro"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Minimum-footprint embedded key-value database engine, in pure Rust. Name reserved — implementation in progress."
