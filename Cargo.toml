@@ -13,4 +13,12 @@ categories = ["database-implementations", "database", "embedded", "no-std"]
 # repositorio siga siendo privado.
 include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 
+# Prohibido en todo el crate, no solo en lib.rs: así cubre también tests,
+# benches y ejemplos.
+[lints.rust]
+unsafe_code = "forbid"
+
+# Cero dependencias de runtime. Cada una que se añada lleva su justificación
+# escrita aquí al lado, igual que en arkeion. Parser, B-tree, codificaciones,
+# varint, CRC32, bitpacking y compresión se escriben a mano.
 [dependencies]
