@@ -246,8 +246,29 @@ impl Db {
         // Recuperación: las páginas más allá de `n_pages` las escribió una
         // transacción que nunca confirmó. Nadie las referencia y ningún lector
         // puede verlas, así que son reutilizables de inmediato — etiqueta 0.
+        //
+        // Salta la página destino de la reubicación de la meta B (tarea 18,
+        // hallazgo BLOCKER de revisión): este bucle es un TERCER sitio que
+        // reparte números de página — además de `alloc` y del cierre de
+        // `commit` que serializa la lista de libres, los dos ya protegidos
+        // con `skip_meta_b_target` — y la propia escritura de
+        // `relocate_meta_b` en la posición nueva extiende el fichero hasta
+        // esa página (offset `final_meta_b_page * page_size`) antes de que
+        // la cabecera cambie o la transacción confirme. Un corte justo ahí
+        // dejaba `meta.n_pages` (de la última confirmación real) a
+        // `file_pages` (que ya incluye la página destino) apuntando de lleno
+        // a ella: sin este salto, la recuperación la mete en la lista de
+        // libres, `alloc` la reparte con normalidad, el árbol la usa como
+        // dato, y la siguiente reubicación le escribe meta encima —
+        // corrupción silenciosa que sobrevive a la reapertura. Confirmado de
+        // punta a punta con
+        // `reopening_after_a_crash_during_relocation_never_recovers_the_relocation_target_into_the_freelist`.
         let file_pages = pager.file_pages()?;
+        let relocation_target = WriteTxn::final_meta_b_page(geometry.page_size);
         for p in meta.n_pages..file_pages {
+            if p == relocation_target {
+                continue;
+            }
             freelist.push(p, 0);
         }
 
@@ -1487,8 +1508,9 @@ impl<'db> WriteTxn<'db> {
     /// Es la ÚNICA operación de este motor que reescribe la cabecera —
     /// escrita una sola vez en el resto de la vida del fichero (tarea 3) — y
     /// por eso el orden importa tanto: primero se escribe una copia de la
-    /// meta CONFIRMADA en su sitio nuevo, se sincroniza, y solo entonces se
-    /// reescribe la cabecera para que apunte ahí, y se vuelve a sincronizar.
+    /// meta CONFIRMADA en su sitio nuevo y se sincroniza; luego el ESPEJO de
+    /// la cabecera (`Geometry::write_mirror`) y se sincroniza; y solo
+    /// entonces la cabecera PRINCIPAL, con otra sincronización final.
     ///
     /// **La copia es la meta CONFIRMADA (`self.db.committed`), nunca
     /// `self.meta`** — la de esta transacción, con su propio `root` todavía
@@ -1498,18 +1520,44 @@ impl<'db> WriteTxn<'db> {
     /// último estado que YA lo estaba antes de que esta transacción
     /// empezara — jamás un commit a medio hacer.
     ///
-    /// **Corte entre el primer `sync` y la escritura de cabecera**: la
-    /// cabecera sigue apuntando a la posición antigua, donde la meta
-    /// también sigue estando intacta (nunca se toca) — se monta igual, y la
-    /// reubicación se reintenta en el commit siguiente (la próxima vez que
-    /// se llame a esta función, `geometry.meta_b_page` seguirá siendo el
-    /// antiguo).
+    /// **Corte entre el primer `sync` y las cabeceras**: ninguna de las dos
+    /// copias de cabecera ha cambiado todavía — la principal sigue
+    /// apuntando a la posición antigua, donde la meta también sigue estando
+    /// intacta (nunca se toca) — se monta igual, y la reubicación se
+    /// reintenta en el commit siguiente.
     ///
-    /// **Corte después de la cabecera dura**: la posición nueva ya tiene,
-    /// de forma duradera, una copia válida del último estado confirmado —
-    /// montar por ahí (si el desempate de `Meta::load` la elige) no pierde
-    /// nada tampoco. Ver `the_database_survives_a_crash_during_relocation`
-    /// y `a_crash_after_the_header_write_does_not_roll_back_a_commit`, en
+    /// **Corte a medio escribir el espejo o la principal — hallazgo HIGH de
+    /// revisión, corregido en esta ronda.** Antes de este arreglo, la
+    /// cabecera se escribía UNA sola vez aquí, sin ninguna copia de
+    /// respaldo: un corte que aterrizara a medias (la nueva cabecera solo
+    /// difiere de la vieja en `meta_b_page`, bytes 44..48, y el CRC, bytes
+    /// 60..64 — cualquier corte entre el byte 45 y el 63 deja un
+    /// `meta_b_page` actualizado con un CRC que no le corresponde) dejaba
+    /// `Geometry::decode` fallando con `Corrupt { kind: Checksum }` PARA
+    /// SIEMPRE — `Db::open` no podía volver a montar la base nunca más,
+    /// aunque las dos metas y el árbol entero siguieran intactos. Justo la
+    /// inmunidad que tenía la cabecera de escritura-única (tarea 3), que
+    /// esta tarea le quita al convertirla en reescribible. Confirmado de
+    /// punta a punta con `a_torn_header_rewrite_does_not_permanently_brick_the_database`
+    /// (`relocation_tests`, siete prefijos de corte distintos dentro de la
+    /// región que cambia) contra la versión sin espejo.
+    ///
+    /// El espejo va PRIMERO — mismo patrón que el resto de esta función y
+    /// que `Db::extend_counter_ceiling`: escribir la copia de respaldo
+    /// primero y sincronizarla antes de tocar la que `Geometry::read` prueba
+    /// primero. Con las dos sincronizadas por separado, un corte a medio
+    /// escribir CUALQUIERA de las dos deja a la otra — ya sincronizada,
+    /// intacta, con el contenido completo de una de las dos versiones
+    /// (vieja si el corte fue en el espejo, nueva si fue en la principal) —
+    /// como la única fuente fiable, y `Geometry::read` cae a ella
+    /// automáticamente si la principal no decodifica.
+    ///
+    /// **Corte después de que la cabecera (principal o su espejo) esté
+    /// duradera**: la posición nueva de la meta B ya tiene, de forma
+    /// duradera, una copia válida del último estado confirmado — montar por
+    /// ahí (si el desempate de `Meta::load` la elige) no pierde nada
+    /// tampoco. Ver `the_database_survives_a_crash_during_relocation` y
+    /// `a_crash_after_the_header_write_does_not_roll_back_a_commit`, en
     /// `relocation_tests`.
     ///
     /// **No hace falta reservar la página destino aquí** — a diferencia de
@@ -1544,21 +1592,55 @@ impl<'db> WriteTxn<'db> {
         current.0.store_via(&self.db.pager, &new_geometry, MetaSlot::B)?;
         self.db.pager.sync()?;
 
+        new_geometry.write_mirror(self.db.pager.storage())?;
+        self.db.pager.sync()?;
+
         new_geometry.write(self.db.pager.storage())?;
         self.db.pager.sync()?;
         self.db.pager.set_geometry(new_geometry);
 
+        // **`set_geometry` corre DESPUÉS de un `sync` que puede fallar
+        // (INFO de revisión posterior a la entrega, decisión documentada en
+        // vez de cambiada).** Si ese `sync()?` devuelve `Err` — un error de
+        // E/S real, no un desgarro (que siempre devuelve `Ok`, ver
+        // `Storage::write_at`) — el `?` corta la función aquí: la geometría
+        // en memoria se queda VIEJA aunque la escritura en sí pueda haber
+        // llegado al medio. No se ajusta a propósito: cualquier fallo de
+        // `sync()` en este motor (también en `Db::maybe_sync`, unas líneas
+        // más abajo en `commit`) ya se trata igual — se propaga como `Err`
+        // sin intentar distinguir "la escritura llegó pero el `fsync` no"
+        // de "no llegó nada" — y aquí AUTOCURA sin necesitar ese distingo:
+        // como `geometry.meta_b_page` (en memoria) sigue siendo la vieja,
+        // el PRÓXIMO commit vuelve a entrar en esta función (el guard de
+        // `commit` sigue viendo el umbral superado) y repite las tres
+        // escrituras desde cero — inofensivo tanto si la vez anterior no
+        // llegó a nada como si llegó pero el `sync` mintió, porque las tres
+        // escrituras son idempotentes (la misma `new_geometry`/copia de
+        // meta, recalculada igual). Verificado de punta a punta con
+        // `relocation_survives_a_torn_write_at_every_cut_point_under_every_sync_policy`
+        // (`crypto.rs`): ninguna combinación de política de `Sync`, ranura
+        // activa o punto de corte pierde datos ni reutiliza un contador.
+        //
         // La posición VIEJA queda libre de verdad: nada vuelve a apuntarla
         // desde aquí en adelante (la cabecera, ya duradera, señala
         // `target`), así que puede reciclarse como cualquier otra página
         // libre en vez de perderse para siempre. Autorrevisión de esta
         // ronda: sin esto, cada base que llega a reubicar pierde una página
         // (512 B a 32 KB, según `page_size`) para siempre — nada la libera
-        // ni la reutiliza jamás — y la contabilidad de fugas de `tree.rs`
-        // (`overflow_inside_a_bulk_freed_subtree_leaves_no_orphan_pages`,
-        // `churn_then_range_delete_on_a_low_fanout_tree_leaves_no_orphan_pages`)
-        // lo detecta de punta a punta como una fuga de una página, siempre
-        // la misma.
+        // ni la reutiliza jamás. Detectado y regresionado con
+        // `free_subtree_accepts_a_child_at_the_old_meta_b_page_once_it_has_been_recycled`
+        // y `relocation_reclaims_the_old_meta_b_page_without_leaking_it`, en
+        // `tree.rs`. **Corrección de atribución (ronda de revisión
+        // posterior a la entrega):** una versión anterior de este comentario
+        // citaba `overflow_inside_a_bulk_freed_subtree_leaves_no_orphan_pages`
+        // y `churn_then_range_delete_on_a_low_fanout_tree_leaves_no_orphan_pages`
+        // como detectores — las dos operan enteras dentro de una única
+        // transacción SIN CONFIRMAR (nunca llaman a `commit()`), así que
+        // `relocate_meta_b` no llega a ejecutarse ni una vez en ninguna de
+        // las dos: lo que de verdad detectaban era el hueco de
+        // `skip_meta_b_target` en `WriteTxn::pages_in_use` (ver su
+        // comentario), un hallazgo relacionado pero distinto — revertir
+        // este `free` las deja en verde.
         //
         // Segura de liberar ANTES de que termine esta transacción, no solo
         // tras confirmar: a diferencia de una página de árbol, una página de
@@ -2293,6 +2375,73 @@ mod tests {
             fn len(&self) -> Result<u64> { self.0.len() }
         }
 
+        /// BLOCKER hallado en revisión: `Db::open`'s orphan-page recovery
+        /// loop es un TERCER sitio que reparte números de página (además de
+        /// `alloc` y del cierre de `commit` que serializa la lista de
+        /// libres) y no aplicaba `skip_meta_b_target`. La propia escritura
+        /// de `relocate_meta_b` en la posición nueva EXTIENDE el fichero
+        /// hasta esa página (offset 4096, 512 B → 4608 B de fichero) antes
+        /// de que la cabecera cambie o esta transacción confirme; si el
+        /// proceso muere justo ahí, `meta.n_pages` (de la ÚLTIMA
+        /// confirmación real, más baja) a `file_pages` (que ya incluye la
+        /// página destino) es exactamente el rango que recorre este bucle
+        /// — sin el salto, empuja la página destino a la lista de libres,
+        /// `alloc` la reparte con normalidad, el árbol la usa como dato, y
+        /// la reubicación siguiente le escribe meta encima.
+        #[test]
+        fn reopening_after_a_crash_during_relocation_never_recovers_the_relocation_target_into_the_freelist() {
+            let crash = Arc::new(CrashOnHeaderWrite {
+                inner: MemStorage::new(),
+                header_writes: std::sync::atomic::AtomicU64::new(0),
+            });
+            let db = Db::create(Box::new(ArcCrash(Arc::clone(&crash))), Options::default()).unwrap();
+
+            // Llega a n_pages = 8 sin cruzar el umbral (cinco asignaciones a
+            // mano, mismo patrón que otras pruebas de este módulo), y
+            // confirma: el guard de `commit` ve 8 * 512 = 4096, no > 4096,
+            // así que `relocate_meta_b` no corre todavía.
+            let mut tx = db.begin_write().unwrap();
+            let mut pages = Vec::new();
+            for _ in 0..5 {
+                let p = tx.alloc().unwrap();
+                tx.write_page(p, &alloc::vec![1u8; 512]).unwrap();
+                pages.push(p);
+            }
+            tx.set_root(pages[0]);
+            tx.commit().unwrap();
+
+            // Una asignación más cruza el umbral (`skip_meta_b_target`
+            // desvía a la 9, n_pages queda en 10): el `commit` dispara
+            // `relocate_meta_b`, que escribe la copia de la meta en la
+            // página 8 (extendiendo el fichero a 4608 B) y sincroniza —
+            // hasta aquí, duradero — y entonces la escritura de cabecera
+            // falla, simulando el corte.
+            let mut tx = db.begin_write().unwrap();
+            let p = tx.alloc().unwrap();
+            tx.write_page(p, &alloc::vec![2u8; 512]).unwrap();
+            assert!(tx.commit().is_err(), "la escritura de cabecera debia fallar en esta prueba");
+
+            let recovered = MemStorage::new();
+            recovered.restore(crash.inner.snapshot());
+            let recovered = Arc::new(recovered);
+            assert!(
+                recovered.len().unwrap() >= 8 * 512 + 512,
+                "la premisa de esta prueba es que la escritura de la meta en la posicion nueva \
+                 ya extendio el fichero mas alla de la pagina destino"
+            );
+
+            let db = Db::open(Box::new(ArcStorage(Arc::clone(&recovered))), Options::default()).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            for _ in 0..20 {
+                let p = tx.alloc().unwrap();
+                assert_ne!(
+                    p, 8,
+                    "la recuperacion de paginas huerfanas de Db::open entrego la pagina destino \
+                     de la reubicacion de la meta B"
+                );
+            }
+        }
+
         #[test]
         fn page_sizes_of_four_kilobytes_or_more_never_relocate() {
             let s = Arc::new(MemStorage::new());
@@ -2402,6 +2551,102 @@ mod tests {
                 "el commit vacio (txn_id 2), ya confirmado antes de la transaccion interrumpida, \
                  no debio retroceder a txn_id 1"
             );
+        }
+
+        /// Envuelve `MemStorage` y DESGARRA (no bloquea) la SEGUNDA
+        /// escritura de cabecera: solo los primeros `prefix` bytes
+        /// aterrizan, el resto conserva lo que ya había — modela un corte
+        /// de corriente a MEDIO ESCRIBIR, no "la escritura nunca llegó".
+        struct TearSecondHeaderWrite {
+            inner: MemStorage,
+            header_writes: std::sync::atomic::AtomicU64,
+            prefix: usize,
+            dead: AtomicBool,
+        }
+        impl Storage for TearSecondHeaderWrite {
+            fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> {
+                self.inner.read_at(o, b)
+            }
+            fn write_at(&self, o: u64, b: &[u8]) -> Result<()> {
+                if self.dead.load(Ordering::SeqCst) {
+                    return self.inner.write_at(o, b);
+                }
+                if o == 0 && b.len() == crate::header::HEADER_SIZE {
+                    let n = self.header_writes.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 2 {
+                        self.dead.store(true, Ordering::SeqCst);
+                        return self.inner.write_at(o, &b[..self.prefix]);
+                    }
+                }
+                self.inner.write_at(o, b)
+            }
+            fn sync(&self) -> Result<()> {
+                self.inner.sync()
+            }
+            fn len(&self) -> Result<u64> {
+                self.inner.len()
+            }
+        }
+        struct ArcTearHeader(Arc<TearSecondHeaderWrite>);
+        impl Storage for ArcTearHeader {
+            fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> { self.0.read_at(o, b) }
+            fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
+            fn sync(&self) -> Result<()> { self.0.sync() }
+            fn len(&self) -> Result<u64> { self.0.len() }
+        }
+
+        /// HIGH hallado en revisión: la reescritura de cabecera de
+        /// `relocate_meta_b` no tenía protección de desgarro, ni espejo, ni
+        /// camino de reconstrucción — justo la inmunidad que tenía la
+        /// cabecera de solo-escritura-una-vez (tarea 3), y que esta tarea le
+        /// quita. La cabecera nueva difiere de la vieja solo en los bytes
+        /// 44..48 (`meta_b_page`) y 60..64 (el CRC); un corte que aterrice
+        /// entre el 45 y el 63 dejaba `meta_b_page` ya actualizado (entero o
+        /// a medias) con el CRC todavía viejo — `Geometry::decode` lo
+        /// rechaza con `Corrupt { kind: Checksum }`, y sin ninguna cabecera
+        /// legible en absoluto, `Db::open` no puede montar la base NUNCA
+        /// MÁS, aunque todo lo demás —las dos metas, el árbol entero— siga
+        /// intacto.
+        #[test]
+        fn a_torn_header_rewrite_does_not_permanently_brick_the_database() {
+            for prefix in [45usize, 47, 48, 55, 60, 62, 63] {
+                let crash = Arc::new(TearSecondHeaderWrite {
+                    inner: MemStorage::new(),
+                    header_writes: std::sync::atomic::AtomicU64::new(0),
+                    prefix,
+                    dead: AtomicBool::new(false),
+                });
+                let db = Db::create(Box::new(ArcTearHeader(Arc::clone(&crash))), Options::default())
+                    .unwrap();
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, b"antes", b"confirmado").unwrap();
+                tx.commit().unwrap();
+
+                // Cruza los 4 KB: dispara `relocate_meta_b`, cuya segunda
+                // escritura de cabecera este arnés desgarra en `prefix`.
+                let mut tx = db.begin_write().unwrap();
+                for i in 0..200u32 {
+                    tx.put(0x02, &i.to_be_bytes(), &[0u8; 40]).unwrap();
+                }
+                let _ = tx.commit();
+
+                let recovered = MemStorage::new();
+                recovered.restore(crash.inner.snapshot());
+                let recovered = Arc::new(recovered);
+
+                let db = Db::open(Box::new(ArcStorage(Arc::clone(&recovered))), Options::default())
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "prefix {prefix}: una cabecera desgarrada no debe dejar la base \
+                             inservible para siempre: {e:?}"
+                        )
+                    });
+                assert_eq!(
+                    db.begin_read().get(0x01, b"antes").unwrap().as_deref(),
+                    Some(b"confirmado".as_slice()),
+                    "prefix {prefix}: el commit anterior al corte no debio perderse"
+                );
+            }
         }
 
         /// Invariante que hace segura la reubicación sin necesidad de

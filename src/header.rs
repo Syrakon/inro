@@ -95,16 +95,75 @@ impl Geometry {
         })
     }
 
+    /// Lee la cabecera principal (página `0`, offset `0`); si no decodifica
+    /// (CRC roto, magic ausente, cualquier motivo), cae al espejo (tarea
+    /// 18, hallazgo HIGH de revisión) antes de rendirse.
+    ///
+    /// La cabecera se escribe una sola vez en toda la vida del fichero,
+    /// salvo por `WriteTxn::relocate_meta_b` — la única reescritura que
+    /// existe (tarea 18). Antes de esa tarea, "se escribe una vez y nunca
+    /// más" era en sí mismo lo que la protegía de un corte de corriente: no
+    /// hay ninguna ESCRITURA que un corte pueda desgarrar salvo la primera,
+    /// y si esa se pierde entera, `Db::create` nunca llegó a devolver
+    /// `Ok`, así que no hay ningún commit previo que proteger — el
+    /// llamante no tiene nada que perder. La reescritura de `relocate_meta_b`
+    /// es distinta: corre sobre un fichero que YA tiene commits reales
+    /// detrás, y un corte a medio escribir la deja con un CRC que no
+    /// corresponde a sus propios bytes — `Geometry::decode` lo rechaza sin
+    /// poder distinguir "cabecera vieja intacta" de "cabecera nueva a
+    /// medias": las dos fallan el mismo CRC. Sin más protección, `Db::open`
+    /// fallaría para siempre — todo lo demás (las dos metas, el árbol
+    /// entero) sigue intacto, pero inalcanzable, porque nada llega a leer
+    /// más allá de la cabecera.
     pub fn read(storage: &dyn Storage) -> Result<Self> {
         let mut b = [0u8; HEADER_SIZE];
         storage.read_at(0, &mut b)?;
-        Self::decode(&b)
+        match Self::decode(&b) {
+            Ok(g) => Ok(g),
+            Err(primary_err) => {
+                let mut mirror = [0u8; HEADER_SIZE];
+                match storage.read_at(HEADER_MIRROR_OFFSET, &mut mirror).ok().and_then(|()| Self::decode(&mirror).ok()) {
+                    Some(g) => Ok(g),
+                    // Sin espejo legible tampoco: el error de la PRINCIPAL,
+                    // no el del espejo, es el que quien llama espera — es
+                    // el mismo `Err` que devolvía este método antes de que
+                    // el espejo existiera (bases creadas antes de la tarea
+                    // 18, o un espejo que nunca llegó a escribirse porque la
+                    // base nunca reubicó).
+                    None => Err(primary_err),
+                }
+            }
+        }
     }
 
     pub fn write(&self, storage: &dyn Storage) -> Result<()> {
         storage.write_at(0, &self.encode())
     }
+
+    /// Copia de la cabecera en `HEADER_MIRROR_OFFSET` (tarea 18): la escribe
+    /// solo `WriteTxn::relocate_meta_b`, ANTES de reescribir la principal —
+    /// ver su comentario para el orden completo y por qué protege contra un
+    /// corte a medio escribir cualquiera de las dos copias. Cabe siempre:
+    /// para cuando `relocate_meta_b` corre, la base ya tiene al menos la
+    /// meta A escrita, así que la página `0` ya se extendió hasta
+    /// `page_size` (como mínimo `MIN_PAGE_SIZE` = 512 B) — muy por encima de
+    /// `HEADER_MIRROR_OFFSET + HEADER_SIZE` = 128.
+    pub fn write_mirror(&self, storage: &dyn Storage) -> Result<()> {
+        storage.write_at(HEADER_MIRROR_OFFSET, &self.encode())
+    }
 }
+
+/// Offset del espejo de la cabecera (tarea 18). Vive a un offset de
+/// fichero FIJO, no en función de `page_size` — deliberado: para poder
+/// leerlo hace falta saber dónde está, y si dependiera de `page_size`
+/// eso crearía el mismo problema de huevo-y-gallina que la reubicación
+/// vino a evitar (no se puede saber `page_size` sin antes poder leer la
+/// cabecera). `HEADER_SIZE` (64), justo después de la principal: la
+/// página `0` mide como mínimo `MIN_PAGE_SIZE` (512 B) en cuanto la base
+/// tiene una sola página más escrita, así que sobra espacio de sobra sin
+/// tocar el formato de página en absoluto — son bytes crudos del fichero,
+/// no una página con su propia estructura.
+pub const HEADER_MIRROR_OFFSET: u64 = HEADER_SIZE as u64;
 
 #[cfg(test)]
 mod tests {
@@ -185,5 +244,76 @@ mod tests {
     fn fix_crc(bytes: &mut [u8; HEADER_SIZE]) {
         let crc = crate::crc32::checksum(&bytes[..HEADER_SIZE - 4]);
         bytes[HEADER_SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Cobertura unitaria y directa del hallazgo HIGH de revisión (tarea
+    /// 18): `Geometry::read` tiene que caer al espejo cuando la principal
+    /// no decodifica — las pruebas de más alto nivel (`tx.rs`, `crypto.rs`)
+    /// ya lo comprueban de punta a punta a través de `relocate_meta_b`
+    /// real, pero esta prueba aísla el mecanismo en sí, sin pasar por
+    /// ningún `WriteTxn`.
+    #[test]
+    #[cfg(feature = "std")]
+    fn read_falls_back_to_the_mirror_when_the_primary_does_not_decode() {
+        use crate::storage::MemStorage;
+        let s = MemStorage::new();
+        let g = sample();
+        g.write(&s).unwrap();
+        g.write_mirror(&s).unwrap();
+
+        // Corrompe solo la principal (un byte dentro de `meta_b_page`, sin
+        // arreglar el CRC): el espejo sigue intacto.
+        let mut bytes = [0u8; HEADER_SIZE];
+        s.read_at(0, &mut bytes).unwrap();
+        bytes[45] ^= 0xff;
+        s.write_at(0, &bytes).unwrap();
+
+        assert_eq!(Geometry::read(&s).unwrap(), g, "debio caer al espejo, todavia legible");
+    }
+
+    /// Sin espejo en absoluto — una base creada antes de que existiera, o
+    /// que nunca llegó a reubicar — `read` debe devolver el mismo error que
+    /// devolvía antes de esta tarea, no uno distinto sobre el espejo (que
+    /// ni siquiera se ha escrito nunca, así que decodificarlo es, como
+    /// mucho, `UnexpectedEof` sobre un fichero mas corto).
+    #[test]
+    #[cfg(feature = "std")]
+    fn read_fails_with_the_primary_error_when_there_is_no_mirror_to_fall_back_to() {
+        use crate::storage::MemStorage;
+        let s = MemStorage::new();
+        let g = sample();
+        g.write(&s).unwrap();
+        // Ningun `write_mirror`: el fichero ni siquiera llega al offset del
+        // espejo.
+
+        let mut bytes = [0u8; HEADER_SIZE];
+        s.read_at(0, &mut bytes).unwrap();
+        bytes[45] ^= 0xff;
+        s.write_at(0, &bytes).unwrap();
+
+        assert!(matches!(
+            Geometry::read(&s),
+            Err(Error::Corrupt { page: 0, kind: CorruptKind::Checksum })
+        ));
+    }
+
+    /// La principal, cuando decodifica, gana siempre — el espejo ni se
+    /// mira. No debería importar en la práctica (las dos copias siempre
+    /// deberían coincidir cuando ambas son legibles, porque
+    /// `relocate_meta_b` escribe la misma `Geometry` en las dos), pero
+    /// confirma que `read` no tiene ninguna lógica de "el espejo manda" por
+    /// accidente.
+    #[test]
+    #[cfg(feature = "std")]
+    fn read_prefers_the_primary_over_the_mirror_when_both_decode() {
+        use crate::storage::MemStorage;
+        let s = MemStorage::new();
+        let primary = sample();
+        primary.write(&s).unwrap();
+        let mut mirror = sample();
+        mirror.created_unix += 1;
+        mirror.write_mirror(&s).unwrap();
+
+        assert_eq!(Geometry::read(&s).unwrap(), primary);
     }
 }

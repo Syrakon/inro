@@ -979,43 +979,65 @@ mod tests {
     /// comprobar directamente que nada se reutiliza tras el "corte".
     ///
     /// Asume `Options::default()` (`page_size` 512, `meta_a_page` 1,
-    /// `meta_b_page` 2) — las mismas que usa `opts()` — para saber dónde
-    /// viven las dos ranuras sin tener que leer la cabecera primero.
+    /// `meta_b_page` 2, salvo que la prueba cruce los 4 KB y dispare
+    /// `relocate_meta_b`, que la traslada a la 8) — las mismas que usa
+    /// `opts()` — para saber dónde viven las tres posiciones posibles sin
+    /// tener que leer la cabecera primero.
     ///
-    /// **Asume además que ninguna prueba de este módulo hace crecer el
-    /// fichero más allá de 4 KB** (tarea 18: a partir de ahí,
-    /// `relocate_meta_b` trasladaría la meta B a la página 8, y
-    /// `META_OFFSETS` —fijo desde la construcción— dejaría de reconocer sus
-    /// escrituras como escrituras de meta). Cierto para las cuatro pruebas
-    /// que usan esta estructura hoy: como mucho una decena de `put`s de
-    /// valores diminutos por sesión. Si una prueba futura necesitara cruzar
-    /// ese umbral con este arnés, `META_OFFSETS` tendría que crecer a un
-    /// tercer offset (la posición final) y `last_synced_meta` a tres
-    /// ranuras, no dos — ninguna prueba de hoy lo necesita, así que no se
-    /// construye sin un caso de uso real que lo ejercite.
+    /// **Ronda de revisión posterior a la tarea 18: el arnés original no
+    /// llegaba a ejercitar NADA de lo que esa tarea introdujo.**
+    /// `META_OFFSETS` solo cubría `[512, 1024]` (meta A y la posición
+    /// INICIAL de la meta B) — la posición FINAL, `4096`, nunca se
+    /// reconocía como escritura de meta, así que un desgarro ahí caía en el
+    /// camino genérico (se registra igual, pero sin la protección de
+    /// `simulate_power_loss`/el autochequeo de que de verdad desgarra algo).
+    /// Y no había NINGÚN mecanismo para desgarrar la cabecera: `TORN_PREFIX`
+    /// (104) es mayor que `HEADER_SIZE` (64), así que ni por accidente podía
+    /// aplicarse ahí, y `arm_meta_tear` solo reconocía escrituras de 512 B
+    /// exactos —el tamaño de una ranura de meta, nunca el de una cabecera
+    /// (64 B). Con "216 pruebas pasan" como única evidencia, ninguna de las
+    /// dos correcciones de esta ronda (recuperación de páginas huérfanas,
+    /// espejo de cabecera) tenía ninguna prueba capaz de contradecirla.
+    ///
+    /// Ahora `META_OFFSETS` tiene TRES posiciones (la tercera es la final,
+    /// misma fórmula que `WriteTxn::final_meta_b_page`) y existe un
+    /// mecanismo paralelo, `arm_header_tear`/`HEADER_OFFSETS`, para
+    /// desgarrar la cabecera principal (offset `0`) o su espejo (offset
+    /// `HEADER_MIRROR_OFFSET`) — ver `Geometry::write_mirror` en
+    /// `header.rs`. Los dos mecanismos comparten el mismo `dead`: un corte
+    /// es un corte, no importa cuál de las dos escrituras lo dispara.
     struct PowerLossStorage {
         inner: MemStorage,
         writes: Mutex<Vec<PhysWrite>>,
-        last_synced_meta: Mutex<[[u8; 512]; 2]>,
-        /// Desgarro armado: ver `arm_meta_tear`.
-        tear: Mutex<Option<Tear>>,
+        last_synced_meta: Mutex<[[u8; 512]; 3]>,
+        last_synced_header: Mutex<[[u8; crate::header::HEADER_SIZE]; 2]>,
+        /// Desgarro de meta armado: ver `arm_meta_tear`.
+        meta_tear: Mutex<Option<Tear>>,
+        /// Desgarro de cabecera armado: ver `arm_header_tear`.
+        header_tear: Mutex<Option<Tear>>,
         /// Imagen del plato en el instante del corte, o `None` si la
-        /// máquina sigue viva. Ver `arm_meta_tear`.
+        /// máquina sigue viva. Ver `arm_meta_tear`/`arm_header_tear`.
         dead: Mutex<Option<Vec<u8>>>,
     }
 
-    /// Escritura de meta que se corta a medias. `skip` es cuántas
-    /// escrituras de meta faltan todavía antes de la que se desgarra.
+    /// Escritura (de meta o de cabecera) que se corta a medias. `skip` es
+    /// cuántas escrituras del tipo correspondiente faltan todavía antes de
+    /// la que se desgarra.
     struct Tear {
         skip: usize,
         prefix: usize,
     }
 
-    // 1024, no 4096 (tarea 18): la meta B vive en la página 2 desde la
-    // creación, no en la 8 — ver el comentario de `PowerLossStorage`, justo
-    // arriba, sobre por qué un valor fijo sigue siendo correcto para las
-    // pruebas de este módulo.
-    const META_OFFSETS: [u64; 2] = [512, 1024];
+    /// Meta A (página 1), meta B en su posición inicial (página 2) y meta B
+    /// en su posición final (página 8 con `page_size` de 512 B — misma
+    /// fórmula que `WriteTxn::final_meta_b_page`). Solo la tercera es nueva
+    /// respecto al arnés previo a esta ronda.
+    const META_OFFSETS: [u64; 3] = [512, 1024, 4096];
+
+    /// Cabecera principal (offset `0`) y su espejo (offset
+    /// `HEADER_MIRROR_OFFSET` = `HEADER_SIZE` = 64) — ver
+    /// `Geometry::write_mirror`.
+    const HEADER_OFFSETS: [u64; 2] = [0, crate::header::HEADER_MIRROR_OFFSET];
 
     /// Cuántos bytes de una escritura de meta desgarrada llegan al plato.
     /// 104 no es arbitrario: cae DENTRO de `write_counter` (bytes 100..108)
@@ -1033,8 +1055,10 @@ mod tests {
             Self {
                 inner: MemStorage::new(),
                 writes: Mutex::new(Vec::new()),
-                last_synced_meta: Mutex::new([[0u8; 512]; 2]),
-                tear: Mutex::new(None),
+                last_synced_meta: Mutex::new([[0u8; 512]; 3]),
+                last_synced_header: Mutex::new([[0u8; crate::header::HEADER_SIZE]; 2]),
+                meta_tear: Mutex::new(None),
+                header_tear: Mutex::new(None),
                 dead: Mutex::new(None),
             }
         }
@@ -1067,15 +1091,26 @@ mod tests {
         ///
         /// `simulate_power_loss` es el "reinicio" que restaura esa foto.
         fn arm_meta_tear(&self, skip: usize, prefix: usize) {
-            *self.tear.lock().unwrap() = Some(Tear { skip, prefix });
+            *self.meta_tear.lock().unwrap() = Some(Tear { skip, prefix });
+        }
+
+        /// Igual que `arm_meta_tear`, pero para la `skip`-ésima escritura de
+        /// CABECERA (principal o espejo, `HEADER_OFFSETS`) a partir de
+        /// ahora — ronda de revisión posterior a la tarea 18: sin esto, el
+        /// arnés no podía desgarrar `WriteTxn::relocate_meta_b`'s reescritura
+        /// de cabecera en absoluto, porque `arm_meta_tear` solo reconoce
+        /// escrituras de 512 B (una ranura de meta), nunca las 64 B de una
+        /// cabecera.
+        fn arm_header_tear(&self, skip: usize, prefix: usize) {
+            *self.header_tear.lock().unwrap() = Some(Tear { skip, prefix });
         }
 
         /// Reinicio tras el corte. Restaura el plato a la foto del instante
-        /// del corte (si lo hubo) y descarta cualquier escritura de meta
-        /// posterior al último `sync()` real — simula perder los búferes
-        /// del sistema operativo no vaciados a disco. Las páginas de
-        /// datos/lista de libres NO se revierten: se tratan como si
-        /// hubieran llegado al medio sin condición, que es el supuesto
+        /// del corte (si lo hubo) y descarta cualquier escritura de meta o
+        /// de cabecera posterior al último `sync()` real — simula perder
+        /// los búferes del sistema operativo no vaciados a disco. Las
+        /// páginas de datos/lista de libres NO se revierten: se tratan como
+        /// si hubieran llegado al medio sin condición, que es el supuesto
         /// PESIMISTA correcto para esta pregunta (cuanto más texto cifrado
         /// sobreviva, más material tiene un atacante para explotar un nonce
         /// repetido).
@@ -1083,9 +1118,13 @@ mod tests {
             if let Some(platter) = self.dead.lock().unwrap().take() {
                 self.inner.restore(platter);
             }
-            let saved = *self.last_synced_meta.lock().unwrap();
+            let saved_meta = *self.last_synced_meta.lock().unwrap();
             for (i, &offset) in META_OFFSETS.iter().enumerate() {
-                self.inner.write_at(offset, &saved[i]).unwrap();
+                self.inner.write_at(offset, &saved_meta[i]).unwrap();
+            }
+            let saved_header = *self.last_synced_header.lock().unwrap();
+            for (i, &offset) in HEADER_OFFSETS.iter().enumerate() {
+                self.inner.write_at(offset, &saved_header[i]).unwrap();
             }
         }
 
@@ -1106,6 +1145,47 @@ mod tests {
                 })
                 .collect()
         }
+
+        /// Toma el desgarro de meta armado si esta escritura (offset, 512 B
+        /// exactos) es una de las tres posiciones posibles Y le toca a
+        /// esta escritura en concreto (el contador `skip` ya llegó a cero).
+        fn take_meta_tear(&self, o: u64, len: usize) -> Option<(usize, usize)> {
+            let i = META_OFFSETS.iter().position(|&m| m == o && len == TEST_PAGE_SIZE as usize)?;
+            let mut tear = self.meta_tear.lock().unwrap();
+            match tear.as_mut() {
+                Some(t) if t.skip == 0 => {
+                    let prefix = t.prefix;
+                    *tear = None;
+                    Some((i, prefix))
+                }
+                Some(t) => {
+                    t.skip -= 1;
+                    None
+                }
+                None => None,
+            }
+        }
+
+        /// Igual que `take_meta_tear`, para las dos posiciones de cabecera
+        /// (64 B exactos).
+        fn take_header_tear(&self, o: u64, len: usize) -> Option<(usize, usize)> {
+            let i = HEADER_OFFSETS
+                .iter()
+                .position(|&m| m == o && len == crate::header::HEADER_SIZE)?;
+            let mut tear = self.header_tear.lock().unwrap();
+            match tear.as_mut() {
+                Some(t) if t.skip == 0 => {
+                    let prefix = t.prefix;
+                    *tear = None;
+                    Some((i, prefix))
+                }
+                Some(t) => {
+                    t.skip -= 1;
+                    None
+                }
+                None => None,
+            }
+        }
     }
 
     impl Storage for PowerLossStorage {
@@ -1116,59 +1196,60 @@ mod tests {
         fn write_at(&self, o: u64, b: &[u8]) -> Result<()> {
             if self.dead.lock().unwrap().is_some() {
                 // La máquina ya murió: esto no llega al plato (la foto de
-                // `arm_meta_tear` se restaura en el reinicio) ni lo ve
-                // nadie, así que tampoco se registra. Sigue escribiéndose
-                // en `inner` solo para que las lecturas posteriores del
-                // proceso ya muerto no fallen con un error de E/S que en la
-                // vida real nadie llegaría a ver.
+                // `arm_meta_tear`/`arm_header_tear` se restaura en el
+                // reinicio) ni lo ve nadie, así que tampoco se registra.
+                // Sigue escribiéndose en `inner` solo para que las lecturas
+                // posteriores del proceso ya muerto no fallen con un error
+                // de E/S que en la vida real nadie llegaría a ver.
                 return self.inner.write_at(o, b);
             }
 
-            let meta_slot = META_OFFSETS
-                .iter()
-                .position(|&m| m == o && b.len() == TEST_PAGE_SIZE as usize);
-            if let Some(i) = meta_slot {
-                let torn = {
-                    let mut tear = self.tear.lock().unwrap();
-                    match tear.as_mut() {
-                        Some(t) if t.skip == 0 => {
-                            let prefix = t.prefix;
-                            *tear = None;
-                            Some(prefix)
-                        }
-                        Some(t) => {
-                            t.skip -= 1;
-                            None
-                        }
-                        None => None,
-                    }
-                };
-                if let Some(prefix) = torn {
-                    self.writes.lock().unwrap().push((o, b[..prefix].to_vec()));
-                    self.inner.write_at(o, &b[..prefix])?;
-                    // Lo que sí llegó al plato es DURADERO: sobrevive al
-                    // `simulate_power_loss` posterior, a diferencia de una
-                    // escritura de meta completa sin sincronizar.
-                    let mut landed = [0u8; 512];
-                    self.inner.read_at(o, &mut landed)?;
-                    // El arnés comprueba SU PROPIA premisa: si el prefijo
-                    // elegido deja la ranura todavía legible, esta prueba no
-                    // está modelando ningún desgarro y pasaría por la razón
-                    // equivocada. Ocurre de verdad: la meta de una extensión
-                    // solo difiere de la anterior en `write_counter`
-                    // (100..108) y el CRC (108..112), así que un prefijo de
-                    // 56 bytes la deja byte a byte idéntica a lo que ya
-                    // había — un desgarro que no desgarra nada. Ver
-                    // `TORN_PREFIX`.
-                    assert!(
-                        crate::meta::Meta::decode(&landed).is_err(),
-                        "el prefijo de {prefix} bytes deja la ranura de meta en {o} todavia \
-                         legible: esta prueba no esta modelando ningun desgarro"
-                    );
-                    self.last_synced_meta.lock().unwrap()[i] = landed;
-                    *self.dead.lock().unwrap() = Some(self.inner.snapshot());
-                    return Ok(());
-                }
+            if let Some((i, prefix)) = self.take_meta_tear(o, b.len()) {
+                self.writes.lock().unwrap().push((o, b[..prefix].to_vec()));
+                self.inner.write_at(o, &b[..prefix])?;
+                // Lo que sí llegó al plato es DURADERO: sobrevive al
+                // `simulate_power_loss` posterior, a diferencia de una
+                // escritura de meta completa sin sincronizar.
+                let mut landed = [0u8; 512];
+                self.inner.read_at(o, &mut landed)?;
+                // El arnés comprueba SU PROPIA premisa: si el prefijo
+                // elegido deja la ranura todavía legible, esta prueba no
+                // está modelando ningún desgarro y pasaría por la razón
+                // equivocada. Ocurre de verdad: la meta de una extensión
+                // solo difiere de la anterior en `write_counter`
+                // (100..108) y el CRC (108..112), así que un prefijo de
+                // 56 bytes la deja byte a byte idéntica a lo que ya
+                // había — un desgarro que no desgarra nada. Ver
+                // `TORN_PREFIX`.
+                assert!(
+                    crate::meta::Meta::decode(&landed).is_err(),
+                    "el prefijo de {prefix} bytes deja la ranura de meta en {o} todavia \
+                     legible: esta prueba no esta modelando ningun desgarro"
+                );
+                self.last_synced_meta.lock().unwrap()[i] = landed;
+                *self.dead.lock().unwrap() = Some(self.inner.snapshot());
+                return Ok(());
+            }
+
+            if let Some((i, prefix)) = self.take_header_tear(o, b.len()) {
+                self.writes.lock().unwrap().push((o, b[..prefix].to_vec()));
+                self.inner.write_at(o, &b[..prefix])?;
+                let mut landed = [0u8; crate::header::HEADER_SIZE];
+                self.inner.read_at(o, &mut landed)?;
+                // Misma comprobación de premisa que la de meta, arriba:
+                // si el prefijo elegido deja la cabecera todavía legible
+                // (p. ej. 8 o 40 — ver el comentario de
+                // `a_torn_header_rewrite_...` en `tx.rs`, los bytes que no
+                // difieren nunca entre la cabecera vieja y la nueva), esta
+                // prueba no está modelando ningún desgarro.
+                assert!(
+                    crate::header::Geometry::decode(&landed).is_err(),
+                    "el prefijo de {prefix} bytes deja la cabecera en {o} todavia legible: \
+                     esta prueba no esta modelando ningun desgarro"
+                );
+                self.last_synced_header.lock().unwrap()[i] = landed;
+                *self.dead.lock().unwrap() = Some(self.inner.snapshot());
+                return Ok(());
             }
 
             if b.len() >= 8 {
@@ -1181,11 +1262,21 @@ mod tests {
             if self.dead.lock().unwrap().is_some() {
                 return Ok(());
             }
-            let mut saved = self.last_synced_meta.lock().unwrap();
-            for (i, &offset) in META_OFFSETS.iter().enumerate() {
-                let mut buf = [0u8; 512];
-                let _ = self.inner.read_at(offset, &mut buf);
-                saved[i] = buf;
+            {
+                let mut saved = self.last_synced_meta.lock().unwrap();
+                for (i, &offset) in META_OFFSETS.iter().enumerate() {
+                    let mut buf = [0u8; 512];
+                    let _ = self.inner.read_at(offset, &mut buf);
+                    saved[i] = buf;
+                }
+            }
+            {
+                let mut saved = self.last_synced_header.lock().unwrap();
+                for (i, &offset) in HEADER_OFFSETS.iter().enumerate() {
+                    let mut buf = [0u8; crate::header::HEADER_SIZE];
+                    let _ = self.inner.read_at(offset, &mut buf);
+                    saved[i] = buf;
+                }
             }
             self.inner.sync()
         }
@@ -1685,6 +1776,185 @@ mod tests {
                     audit.reused_nonces, 0,
                     "{policy:?} / desgarro en {tear_at:?}: {audit:?}"
                 );
+            }
+        }
+    }
+
+    /// Matriz de la tarea 18 (ronda de revisión posterior a la entrega):
+    /// cada política de `Sync`, con la ranura activa en A o en B antes del
+    /// commit que reubica, contra un desgarro en CADA una de las tres
+    /// escrituras que hace `relocate_meta_b` — la copia de la meta en la
+    /// posición nueva, el espejo de cabecera, y la cabecera principal — con
+    /// el prefijo de corte eligido para caer DENTRO de la región que
+    /// cambia en cada una (`TORN_PREFIX` para la meta; 44..48 o 60..64 para
+    /// cualquiera de las dos cabeceras, ver el comentario de
+    /// `a_torn_header_rewrite_does_not_permanently_brick_the_database` en
+    /// `tx.rs`).
+    ///
+    /// El arnés anterior a esta ronda no podía construir NINGUNO de estos
+    /// casos: `META_OFFSETS` no reconocía la posición final de la meta B
+    /// (4096) como una ranura de meta, y no existía ningún mecanismo para
+    /// desgarrar una cabecera (64 B) en absoluto — ver el comentario de
+    /// `PowerLossStorage`. "216 pruebas pasan" no era evidencia de nada
+    /// sobre esta tarea.
+    ///
+    /// Tres propiedades por caso:
+    /// - **ningún contador se reutiliza jamás** — el contrato de la tarea
+    ///   17, que esta reubicación no debe romper;
+    /// - **la base sigue pudiendo abrirse** — el hallazgo HIGH que el
+    ///   espejo de cabecera cierra: antes de esa corrección, cualquier
+    ///   desgarro dentro de la región 44..64 dejaba `Db::open` fallando
+    ///   para siempre;
+    /// - **el commit anterior a la reubicación sigue legible, y ninguna de
+    ///   las 200 claves que trae el commit interrumpido queda corrupta ni
+    ///   parcialmente visible** — el hallazgo BLOCKER de la recuperación de
+    ///   páginas huérfanas: si `Db::open` recuperase la página destino
+    ///   hacia la lista de libres, una escritura posterior la reutilizaría
+    ///   como dato, y una reubicación posterior le escribiría meta encima.
+    #[test]
+    fn relocation_survives_a_torn_write_at_every_cut_point_under_every_sync_policy() {
+        #[derive(Debug, Clone, Copy)]
+        enum Cut {
+            /// La copia de la meta confirmada en la posición nueva (offset
+            /// 4096): la primera escritura de meta que hace la transacción
+            /// que reubica, siempre que no haya extensión de techo de por
+            /// medio (una sesión recién creada nunca la dispara: el
+            /// contador vivo arranca muy por debajo de `COUNTER_RESERVE`).
+            MetaAtNewPosition,
+            /// El espejo de cabecera (offset 64): la primera escritura de
+            /// CABECERA de la transacción.
+            HeaderMirror(usize),
+            /// La cabecera principal (offset 0): la segunda.
+            HeaderPrimary(usize),
+        }
+
+        let cuts = [
+            Cut::MetaAtNewPosition,
+            Cut::HeaderMirror(45),
+            Cut::HeaderMirror(47),
+            Cut::HeaderMirror(61),
+            Cut::HeaderMirror(63),
+            Cut::HeaderPrimary(45),
+            Cut::HeaderPrimary(47),
+            Cut::HeaderPrimary(61),
+            Cut::HeaderPrimary(63),
+        ];
+
+        for policy in [Sync::Commit, Sync::Interval(Duration::from_secs(3600)), Sync::Never] {
+            for active_slot_b in [false, true] {
+                for &cut in &cuts {
+                    let s = Arc::new(PowerLossStorage::new());
+                    let master = [93u8; 32];
+                    let mk_opts = || Options { sync: policy, ..opts(master) };
+
+                    let db = Db::create(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
+                    let mut tx = db.begin_write().unwrap();
+                    tx.put(0x01, b"antes", b"confirmado").unwrap();
+                    tx.commit().unwrap();
+
+                    if active_slot_b {
+                        // Un commit vacio mas: `commit` siempre escribe en
+                        // `self.slot.other()`, asi que dos commits reales
+                        // dejan la ranura activa en B.
+                        db.begin_write().unwrap().commit().unwrap();
+                    }
+                    // Bajo `Sync::Never`/`Interval` largo esto puede no
+                    // estar sincronizado todavia; lo fija como duradero
+                    // para que las tres politicas partan del mismo estado.
+                    s.sync().unwrap();
+
+                    match cut {
+                        Cut::MetaAtNewPosition => s.arm_meta_tear(0, TORN_PREFIX),
+                        Cut::HeaderMirror(prefix) => s.arm_header_tear(0, prefix),
+                        Cut::HeaderPrimary(prefix) => s.arm_header_tear(1, prefix),
+                    }
+
+                    // Cruza los 4 KB: dispara `relocate_meta_b`, cuya
+                    // escritura correspondiente este arnés desgarra.
+                    let mut tx = db.begin_write().unwrap();
+                    for i in 0..200u32 {
+                        tx.put(0x02, &i.to_be_bytes(), &[0u8; 40]).unwrap();
+                    }
+                    tx.commit().unwrap();
+
+                    s.simulate_power_loss();
+
+                    let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts())
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "{policy:?} / activa={} / corte={cut:?}: la base debe seguir \
+                                 pudiendose abrir tras el corte: {e:?}",
+                                if active_slot_b { "B" } else { "A" }
+                            )
+                        });
+                    assert_eq!(
+                        db.begin_read().get(0x01, b"antes").unwrap().as_deref(),
+                        Some(b"confirmado".as_slice()),
+                        "{policy:?} / activa={} / corte={cut:?}: se perdio un commit ya duradero",
+                        if active_slot_b { "B" } else { "A" }
+                    );
+                    {
+                        let r = db.begin_read();
+                        for i in [0u32, 50, 199] {
+                            let seen = r.get(0x02, &i.to_be_bytes()).unwrap();
+                            assert!(
+                                seen.is_none() || seen.as_deref() == Some(&[0u8; 40][..]),
+                                "{policy:?} / activa={} / corte={cut:?}: clave {i} corrupta \
+                                 (ni ausente ni con su valor completo): {seen:?}",
+                                if active_slot_b { "B" } else { "A" }
+                            );
+                        }
+                    }
+
+                    // Comprobación directa del hallazgo BLOCKER (recuperación
+                    // de páginas huérfanas): un `alloc()` normal, tras esta
+                    // reapertura, no debe entregar JAMÁS la página destino de
+                    // la reubicación — sin esta comprobación explícita, un
+                    // taller de seguimiento pequeño (como el de abajo) no
+                    // necesariamente llega a agotar el resto de la lista de
+                    // libres hasta alcanzarla, y el caso pasaría por la razón
+                    // equivocada.
+                    {
+                        let mut tx = db.begin_write().unwrap();
+                        let target = tx.meta_b_relocation_target();
+                        for _ in 0..30 {
+                            let p = tx.alloc().unwrap();
+                            assert_ne!(
+                                p, target,
+                                "{policy:?} / activa={} / corte={cut:?}: la recuperacion de \
+                                 paginas huerfanas entrego la pagina destino de la reubicacion",
+                                if active_slot_b { "B" } else { "A" }
+                            );
+                        }
+                        // Se descarta sin commit: solo interesa lo que
+                        // `alloc()` está dispuesto a repartir.
+                    }
+
+                    // Una transaccion mas, para dar a `relocate_meta_b`
+                    // ocasion de reintentarse y de que la sesion siga
+                    // sellando paginas con normalidad.
+                    {
+                        let mut tx = db.begin_write().unwrap();
+                        for i in 300..320u32 {
+                            tx.put(0x03, &i.to_be_bytes(), b"tras el corte").unwrap();
+                        }
+                        tx.commit().unwrap();
+                    }
+                    drop(db);
+
+                    let audit = audit_nonces(&s.raw_writes());
+                    assert!(
+                        audit.sealed > 0,
+                        "{policy:?} / activa={} / corte={cut:?}: el auditor no vio ninguna \
+                         pagina sellada: {audit:?}",
+                        if active_slot_b { "B" } else { "A" }
+                    );
+                    assert_eq!(
+                        audit.reused_nonces, 0,
+                        "{policy:?} / activa={} / corte={cut:?}: {audit:?}",
+                        if active_slot_b { "B" } else { "A" }
+                    );
+                }
             }
         }
     }

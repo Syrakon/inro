@@ -5309,6 +5309,56 @@ mod range_accounting_tests {
         );
     }
 
+    /// Cubre el tercer término de `validate_child`
+    /// (`child == tx.meta_b_relocation_target()`) de forma aislada TANTO del
+    /// segundo (`current_meta_b_page`) COMO del cuarto (`child >=
+    /// tx.n_pages()`) — la primera versión de esta prueba (ronda de
+    /// revisión posterior a la entrega) no aislaba el cuarto: en una base
+    /// fresca `n_pages` vale `3`, así que `target` (`8`) ya caía fuera por
+    /// `child >= n_pages` sin necesitar el tercer término en absoluto —
+    /// borrarlo no cambiaba el resultado, exactamente el hallazgo LOW que
+    /// esta prueba existe para cerrar. Reservar pocas páginas a mano deja
+    /// `n_pages` en 10 (por encima de `target`) SIN reubicar de verdad
+    /// (`current_meta_b_page()` sigue en `2`, porque `relocate_meta_b` solo
+    /// corre dentro de `commit()`, que esta prueba nunca llama) — así los
+    /// dos valores que importan (`current_meta_b_page` y
+    /// `meta_b_relocation_target`) siguen siendo distintos, y `n_pages` ya
+    /// no puede enmascarar el término bajo prueba.
+    #[test]
+    fn free_subtree_rejects_a_child_at_the_relocation_target_before_any_relocation() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        for _ in 0..6 {
+            tx.alloc().unwrap();
+        }
+        let target = tx.meta_b_relocation_target();
+        assert_ne!(
+            target,
+            tx.current_meta_b_page(),
+            "esta prueba necesita que las dos posiciones difieran para aislar el termino que \
+             cubre"
+        );
+        assert!(
+            tx.n_pages() > target,
+            "esta prueba necesita n_pages > target para que 'child >= n_pages' no enmascare \
+             el termino bajo prueba"
+        );
+
+        let root = tx.alloc().unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(target);
+        rb.set_children_plain(true);
+        let root_bytes = rb.build(&[]).unwrap();
+        tx.write_page(root, &root_bytes).unwrap();
+
+        let mut budget = RangeBudget::new(tx.n_pages());
+        let err = free_subtree(&mut tx, root, 1, &mut budget).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::CellBounds, .. }),
+            "se esperaba CellBounds, se obtuvo {err:?}"
+        );
+    }
+
     /// Tarea 18, autorrevisión: una vez `relocate_meta_b` libera de verdad
     /// la posición VIEJA de la meta B (página `2`, con `page_size` de
     /// 512 B), esa página vuelve a la lista de libres y puede reciclarse
@@ -5368,6 +5418,35 @@ mod range_accounting_tests {
         let mut budget = RangeBudget::new(tx.n_pages());
         free_subtree(&mut tx, root, 1, &mut budget)
             .expect("una pagina reciclada, ya no meta, debe aceptarse como hijo legitimo");
+    }
+
+    /// Regresión real (no la mal citada) del hallazgo de fuga de
+    /// `WriteTxn::relocate_meta_b` — ver la corrección de atribución en su
+    /// comentario, `tx.rs`. A diferencia de las pruebas de contabilidad
+    /// vecinas de este módulo, aquí SÍ hay un `commit()` real de por medio
+    /// (`seeded`, que puebla el árbol dentro de la ÚNICA transacción que
+    /// después confirma), así que `relocate_meta_b` se ejecuta de verdad —
+    /// es la condición que las pruebas mal citadas nunca cumplían. Con el
+    /// `self.free` de la posición vieja revertido, esto falla con "1 página
+    /// perdida (fuga)" — comprobado a mano contra esa reversión.
+    #[test]
+    fn relocation_reclaims_the_old_meta_b_page_without_leaking_it() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let baseline = db.begin_write().unwrap().pages_in_use();
+
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..2000u32 {
+            tx.put(0x01, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
+        }
+        let root = tx.root();
+        tx.commit().unwrap();
+        assert_eq!(
+            db.begin_write().unwrap().current_meta_b_page(), 8,
+            "la reubicacion debio ocurrir para que esta prueba ejercite algo"
+        );
+
+        let mut tx = db.begin_write().unwrap();
+        assert_accounting_matches(&mut tx, root, baseline, "tras una reubicacion real (commit)");
     }
 
     /// Ronda 2 de revisión de la tarea 15, hallazgo 2: un nodo interno
