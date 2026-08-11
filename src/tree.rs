@@ -852,6 +852,216 @@ pub fn delete(tx: &mut WriteTxn, root: PageNo, key: &[u8]) -> Result<(PageNo, bo
     }
 }
 
+/// Recorrido ordenado. Mantiene la pila de descenso porque las hojas no están
+/// encadenadas: encadenarlas obligaría, en copy-on-write, a reescribir la hoja
+/// anterior cada vez que su sucesora cambia de página.
+pub struct Cursor<'a, S: PageSource> {
+    src: &'a S,
+    /// Cada nivel: página, y siguiente índice a visitar en ella.
+    stack: Vec<(PageNo, usize)>,
+    end: Vec<u8>,
+    done: bool,
+    /// Bytes a omitir del principio de cada clave que devuelve `next`.
+    ///
+    /// `Cursor` en sí no sabe nada de espacios de claves: opera sobre las
+    /// claves tal como viven en el árbol, en el rango `[from, to)` que
+    /// recibió ya con cualquier prefijo incluido (así es como
+    /// `ReadTxn::scan`, en `tx.rs`, recorta por espacio "gratis" — ver el
+    /// comentario de `scoped`). Pero el byte de espacio de claves es un
+    /// detalle interno de `scoped`: la API pública (`get`/`put`/`delete`)
+    /// recibe y devuelve claves SIN él, con `ns` como parámetro aparte, así
+    /// que un `scan` cuyas claves devueltas SÍ lo llevaran sería
+    /// inconsistente con el resto de la API — y es exactamente lo que
+    /// hacía la primera versión de este cursor: sus propias pruebas (los
+    /// casos del brief, sin ningún cambio) fallaban en el primer `cargo
+    /// test` porque comparaban contra la clave sin prefijo. `strip` es 0
+    /// para un cursor construido con `new` sobre claves crudas (como los
+    /// de las pruebas de este módulo, que no pasan por `scoped`), y 1 para
+    /// el que construye `ReadTxn::scan` vía `new_with_strip`.
+    strip: usize,
+}
+
+impl<'a, S: PageSource> Cursor<'a, S> {
+    pub fn new(src: &'a S, root: PageNo, from: &[u8], to: &[u8]) -> Result<Self> {
+        Self::new_with_strip(src, root, from, to, 0)
+    }
+
+    /// Como `new`, pero omitiendo los primeros `strip` bytes de cada clave
+    /// devuelta por `next`. Solo la usa `ReadTxn::scan` (`tx.rs`), para
+    /// recortar el byte de espacio de claves antes de devolver la clave al
+    /// llamante — ver el comentario de campo `strip`.
+    pub(crate) fn new_with_strip(
+        src: &'a S,
+        root: PageNo,
+        from: &[u8],
+        to: &[u8],
+        strip: usize,
+    ) -> Result<Self> {
+        let mut c = Self { src, stack: Vec::new(), end: to.to_vec(), done: root == 0, strip };
+        if root != 0 {
+            c.seek_from(root, from)?;
+        }
+        Ok(c)
+    }
+
+    /// Desciende hasta la primera entrada mayor o igual que `key`.
+    ///
+    /// Sigue punteros a hijos leídos del disco, igual que `descend`, así que
+    /// necesita la misma cota de profundidad: sin ella, un ciclo de páginas
+    /// corruptas lo dejaría descendiendo para siempre en vez de devolver
+    /// `TreeLoop`. `depth` cuenta la página actual, igual que en `descend` (la
+    /// raíz entra con `depth == 1`) — válido aquí porque `self.stack` se
+    /// vacía justo antes (`clear()`), así que `depth` y `self.stack.len()`
+    /// coinciden en todo momento del bucle.
+    fn seek_from(&mut self, root: PageNo, key: &[u8]) -> Result<()> {
+        self.stack.clear();
+        let mut current = root;
+        let mut depth = 0u32;
+        loop {
+            depth += 1;
+            if depth > MAX_DEPTH {
+                return Err(Error::Corrupt { page: current, kind: CorruptKind::TreeLoop });
+            }
+            let bytes = self.src.read_page(current)?;
+            let page = PageRef::parse(&bytes, current)?;
+            match page.page_type() {
+                PageType::Leaf => {
+                    let idx = match search_key(&page, key) {
+                        Ok(i) => i,
+                        Err(i) => i,
+                    };
+                    self.stack.push((current, idx));
+                    return Ok(());
+                }
+                PageType::Internal => {
+                    let idx = child_index(&page, key);
+                    self.stack.push((current, idx));
+                    current = child_at(&page, idx);
+                }
+                _ => return Err(Error::Corrupt { page: current, kind: CorruptKind::PageType }),
+            }
+        }
+    }
+
+    /// Sube por la pila hasta encontrar un nodo con hijos pendientes y vuelve
+    /// a bajar por su borde izquierdo.
+    ///
+    /// El bucle EXTERIOR (el que sube) está acotado por construcción, sin
+    /// necesitar contador: cada vuelta empieza con un `pop()` incondicional,
+    /// así que no puede dar más vueltas que elementos tenía la pila al
+    /// entrar — decrece en uno por iteración hasta vaciarse, sin importar si
+    /// los datos están corruptos.
+    ///
+    /// El bucle INTERIOR (el que baja por el borde izquierdo de un hermano)
+    /// SÍ sigue punteros a hijos leídos del disco y, como `seek_from` y
+    /// `descend`, necesita cota de profundidad — sin ella, un ciclo entre
+    /// páginas corruptas alcanzables solo desde un hermano (no desde la
+    /// posición inicial que validó `seek_from`) lo dejaría bajando para
+    /// siempre. La diferencia importante con `seek_from` es dónde EMPIEZA el
+    /// contador: aquí `depth` arranca en `self.stack.len()`, la profundidad
+    /// YA alcanzada por la pila existente, no en cero. Arrancar en cero
+    /// sería un error sutil: acotaría cada llamada a `advance_to_next_leaf`
+    /// por separado a 128 empujes, pero nada impediría que la pila total
+    /// creciera sin límite a través de MUCHAS llamadas sucesivas (cada una
+    /// saca al menos un nivel y puede volver a empujar hasta 128), porque el
+    /// contador nunca se enteraría de cuánto había ya acumulado. Arrancar en
+    /// `self.stack.len()` mantiene la invariante real que importa —
+    /// `self.stack` es un camino raíz-a-hoja y nunca debe superar
+    /// `MAX_DEPTH` niveles, exactamente lo que ya garantiza `descend` para un
+    /// único descenso— válida en todo momento de la vida del cursor, no solo
+    /// dentro de una llamada.
+    fn advance_to_next_leaf(&mut self) -> Result<bool> {
+        loop {
+            self.stack.pop();
+            let Some((page_no, idx)) = self.stack.last_mut() else {
+                return Ok(false);
+            };
+            let page_no = *page_no;
+            let bytes = self.src.read_page(page_no)?;
+            let page = PageRef::parse(&bytes, page_no)?;
+            // `extra` es el hijo con índice `n_slots`, así que hay hijo
+            // siguiente mientras el índice no lo haya superado.
+            if *idx >= page.n_slots() {
+                continue;
+            }
+            *idx += 1;
+            let mut current = child_at(&page, *idx);
+            let mut depth = self.stack.len() as u32;
+            loop {
+                depth += 1;
+                if depth > MAX_DEPTH {
+                    return Err(Error::Corrupt { page: current, kind: CorruptKind::TreeLoop });
+                }
+                let bytes = self.src.read_page(current)?;
+                let p = PageRef::parse(&bytes, current)?;
+                self.stack.push((current, 0));
+                match p.page_type() {
+                    PageType::Leaf => return Ok(true),
+                    PageType::Internal => current = child_at(&p, 0),
+                    _ => return Err(Error::Corrupt { page: current, kind: CorruptKind::PageType }),
+                }
+            }
+        }
+    }
+
+    /// `Cursor` no implementa `Iterator` a propósito: cada paso puede fallar
+    /// (E/S, corrupción — ver `MAX_DEPTH` en `seek_from` y
+    /// `advance_to_next_leaf`), y `Iterator::next` no tiene sitio para
+    /// devolver un `Err`. `Result<Option<_>>` es el patrón establecido para
+    /// iteración falible; el nombre `next` es el que fija la interfaz de
+    /// esta tarea. `should_implement_trait` confunde esto con
+    /// `Iterator::next`, que devolvería `Option<_>` sin más — deliberado,
+    /// no un descuido.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        loop {
+            if self.done {
+                return Ok(None);
+            }
+            let Some(&(leaf, idx)) = self.stack.last() else {
+                self.done = true;
+                return Ok(None);
+            };
+            let bytes = self.src.read_page(leaf)?;
+            let page = PageRef::parse(&bytes, leaf)?;
+
+            if idx >= page.n_slots() {
+                if !self.advance_to_next_leaf()? {
+                    self.done = true;
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            if let Some((_, i)) = self.stack.last_mut() {
+                *i += 1;
+            }
+
+            let key = page.key(idx);
+            // La comparación con `end` es sobre la clave COMPLETA tal como
+            // vive en el árbol (con cualquier prefijo de `scoped` incluido,
+            // porque `end` también lo lleva — ver `ReadTxn::scan`), no sobre
+            // la que se devuelve más abajo: recortar antes rompería el
+            // orden en cuanto `strip` fuera mayor que cero.
+            if key.as_slice() >= self.end.as_slice() {
+                self.done = true;
+                return Ok(None);
+            }
+            let value = match page.leaf_value(idx) {
+                LeafValue::Inline(v) => v.to_vec(),
+                LeafValue::Overflow { len, first } => read_overflow(self.src, len, first)?,
+            };
+            debug_assert!(
+                self.strip <= key.len(),
+                "strip ({}) no puede superar la longitud de la clave ({})",
+                self.strip,
+                key.len()
+            );
+            return Ok(Some((key[self.strip.min(key.len())..].to_vec(), value)));
+        }
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
@@ -2606,6 +2816,270 @@ mod overflow_tests {
         assert!(
             matches!(err, crate::Error::Corrupt { kind: CorruptKind::OverflowLoop, .. }),
             "se esperaba OverflowLoop, se obtuvo {err:?}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod cursor_tests {
+    use super::*;
+    use crate::storage::MemStorage;
+    use crate::tx::{Db, Options};
+
+    fn seeded() -> Db {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..1000u32 {
+            tx.put(0x01, alloc::format!("{i:06}").as_bytes(), &i.to_le_bytes()).unwrap();
+        }
+        tx.put(0x02, b"otro", b"espacio").unwrap();
+        tx.commit().unwrap();
+        db
+    }
+
+    #[test]
+    fn scan_visits_every_key_in_order() {
+        let db = seeded();
+        let r = db.begin_read();
+        let mut c = r.scan(0x01, b"", b"\xff\xff\xff\xff\xff\xff").unwrap();
+        let mut seen = 0u32;
+        while let Some((k, v)) = c.next().unwrap() {
+            assert_eq!(k, alloc::format!("{seen:06}").as_bytes());
+            assert_eq!(v, seen.to_le_bytes());
+            seen += 1;
+        }
+        assert_eq!(seen, 1000);
+    }
+
+    #[test]
+    fn scan_respects_the_range_bounds() {
+        let db = seeded();
+        let r = db.begin_read();
+        let mut c = r.scan(0x01, b"000100", b"000110").unwrap();
+        let mut keys = alloc::vec::Vec::new();
+        while let Some((k, _)) = c.next().unwrap() {
+            keys.push(k);
+        }
+        assert_eq!(keys.len(), 10, "el límite superior es exclusivo");
+        assert_eq!(keys[0], b"000100");
+        assert_eq!(keys[9], b"000109");
+    }
+
+    #[test]
+    fn a_scan_never_crosses_into_another_keyspace() {
+        let db = seeded();
+        let r = db.begin_read();
+        let mut c = r.scan(0x01, b"", b"\xff\xff\xff\xff\xff\xff").unwrap();
+        let mut n = 0;
+        while c.next().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 1000, "la clave del espacio 0x02 no aparece");
+    }
+
+    #[test]
+    fn get_is_scoped_by_keyspace() {
+        let db = seeded();
+        let r = db.begin_read();
+        assert_eq!(r.get(0x02, b"otro").unwrap().as_deref(), Some(b"espacio".as_slice()));
+        assert_eq!(r.get(0x01, b"otro").unwrap(), None);
+    }
+
+    // --- Auto-review: contrato falsable de la tarea 14 --------------------
+    //
+    // "Un recorrido sobre [from, to) produce exactamente las claves de ese
+    // rango, en orden ascendente, cada una una sola vez, y nunca una clave
+    // de otro espacio de claves." Las cuatro pruebas del brief ya cubren
+    // varios casos (recorrido completo, límites internos, aislamiento de
+    // espacio, `get` con espacio). Las que siguen cubren el resto de casos
+    // pedidos explícitamente por el auto-review: árbol vacío, rango vacío,
+    // coincidencia de una sola clave, cruce de un límite de hoja real
+    // (verificado con `descend`, no supuesto), y un valor de overflow leído
+    // a través del cursor.
+
+    #[test]
+    fn scan_on_an_empty_tree_yields_nothing() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let r = db.begin_read();
+        let mut c = r.scan(0x01, b"", b"\xff").unwrap();
+        assert_eq!(c.next().unwrap(), None);
+    }
+
+    /// `from == to`: el rango `[from, to)` está vacío por definición, así que
+    /// no debe visitarse ninguna clave — ni siquiera una que exista de
+    /// verdad exactamente en ese punto.
+    #[test]
+    fn scan_with_from_equal_to_to_yields_nothing() {
+        let db = seeded();
+        let r = db.begin_read();
+        assert!(r.get(0x01, b"000500").unwrap().is_some(), "la clave existe de verdad");
+        let mut c = r.scan(0x01, b"000500", b"000500").unwrap();
+        assert_eq!(c.next().unwrap(), None);
+    }
+
+    /// Rango que solo contiene una clave: `to` es el sucesor inmediato de
+    /// `from` en el espacio de claves sembrado.
+    #[test]
+    fn scan_matching_exactly_one_key() {
+        let db = seeded();
+        let r = db.begin_read();
+        let mut c = r.scan(0x01, b"000500", b"000501").unwrap();
+        assert_eq!(c.next().unwrap(), Some((b"000500".to_vec(), 500u32.to_le_bytes().to_vec())));
+        assert_eq!(c.next().unwrap(), None);
+    }
+
+    /// Localiza, entre las 1000 claves sembradas, un punto donde dos claves
+    /// consecutivas viven en hojas físicamente distintas — sin asumirlo, se
+    /// comprueba con `descend`, el mismo mecanismo que usa el árbol para
+    /// descender. Con páginas de 512 bytes y 1000 claves de ~12 bytes por
+    /// celda, ese punto existe de sobra bastante antes del final.
+    #[test]
+    fn scan_crosses_a_real_leaf_boundary_correctly() {
+        let db = seeded();
+        let r = db.begin_read();
+        let keys: alloc::vec::Vec<alloc::vec::Vec<u8>> =
+            (0..1000u32).map(|i| alloc::format!("{i:06}").into_bytes()).collect();
+
+        let boundary = (0..keys.len() - 1)
+            .find(|&i| {
+                let scoped_a = {
+                    let mut k = alloc::vec![0x01u8];
+                    k.extend_from_slice(&keys[i]);
+                    k
+                };
+                let scoped_b = {
+                    let mut k = alloc::vec![0x01u8];
+                    k.extend_from_slice(&keys[i + 1]);
+                    k
+                };
+                let (leaf_a, _) = descend(&r, r.root(), &scoped_a).unwrap().unwrap();
+                let (leaf_b, _) = descend(&r, r.root(), &scoped_b).unwrap().unwrap();
+                leaf_a != leaf_b
+            })
+            .expect("con 1000 claves en páginas de 512 bytes debe haber al menos un límite de hoja");
+
+        // Un pequeño rango a caballo entre las dos hojas: dos claves antes
+        // del límite y tres después.
+        let from_i = boundary.saturating_sub(2);
+        let to_i = core::cmp::min(boundary + 3, keys.len() - 1);
+        let mut c = r.scan(0x01, &keys[from_i], &keys[to_i]).unwrap();
+        let mut seen = alloc::vec::Vec::new();
+        while let Some((k, v)) = c.next().unwrap() {
+            seen.push((k, v));
+        }
+        let expected: alloc::vec::Vec<_> = (from_i..to_i)
+            .map(|i| (keys[i].clone(), (i as u32).to_le_bytes().to_vec()))
+            .collect();
+        assert_eq!(seen, expected, "límite de hoja en {boundary}: hojas {from_i}..{to_i}");
+    }
+
+    /// El valor de una clave puede vivir en una cadena de overflow (tarea
+    /// 13). `next` debe devolverlo completo igual que si estuviera en línea
+    /// — se ejercita explícitamente la rama `LeafValue::Overflow` de
+    /// `next`, no se asume que el camino en línea la cubre.
+    #[test]
+    fn scan_returns_a_value_stored_via_overflow() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        let big: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        tx.put(0x01, b"grande", &big).unwrap();
+        tx.put(0x01, b"pequeno", b"x").unwrap();
+        tx.put(0x01, b"zzz", b"y").unwrap();
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        let mut c = r.scan(0x01, b"", b"\xff").unwrap();
+        let mut found = alloc::collections::BTreeMap::new();
+        while let Some((k, v)) = c.next().unwrap() {
+            found.insert(k, v);
+        }
+        assert_eq!(found.len(), 3);
+        assert_eq!(found.get(b"grande".as_slice()).unwrap(), &big);
+        assert_eq!(found.get(b"pequeno".as_slice()).unwrap().as_slice(), b"x");
+        assert_eq!(found.get(b"zzz".as_slice()).unwrap().as_slice(), b"y");
+    }
+
+    /// Construye a mano dos páginas internas que se apuntan la una a la
+    /// otra, alcanzables SOLO desde un hermano (no desde el camino inicial
+    /// que valida `seek_from`), para forzar el paso por el bucle interior de
+    /// `advance_to_next_leaf`. Sin la cota de profundidad que ese bucle
+    /// necesita igual que `descend` y `seek_from`, esta prueba colgaría el
+    /// proceso en vez de terminar con `TreeLoop`.
+    #[test]
+    fn advance_to_next_leaf_returns_an_error_instead_of_looping_forever_on_a_cycle() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        let l1 = tx.alloc().unwrap();
+        let cycle_a = tx.alloc().unwrap();
+        let cycle_b = tx.alloc().unwrap();
+        let root = tx.alloc().unwrap();
+
+        let leaf =
+            PageBuilder::new(512, PageType::Leaf).build(&[(b"aa".as_slice(), CellPayload::Value(b"1"))]).unwrap();
+
+        let mut ab = PageBuilder::new(512, PageType::Internal);
+        ab.set_extra(cycle_b);
+        let pa = ab.build(&[]).unwrap();
+
+        let mut bb = PageBuilder::new(512, PageType::Internal);
+        bb.set_extra(cycle_a);
+        let pb = bb.build(&[]).unwrap();
+
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(cycle_a);
+        let rt = rb.build(&[(b"b".as_slice(), CellPayload::Child(l1))]).unwrap();
+
+        tx.write_page(l1, &leaf).unwrap();
+        tx.write_page(cycle_a, &pa).unwrap();
+        tx.write_page(cycle_b, &pb).unwrap();
+        tx.write_page(root, &rt).unwrap();
+        tx.set_root(root);
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        let mut c = Cursor::new(&r, r.root(), b"", b"\xff").unwrap();
+        // La primera clave viene del subárbol normal, sin tocar el ciclo.
+        assert_eq!(c.next().unwrap(), Some((b"aa".to_vec(), b"1".to_vec())));
+        // Agotar `l1` obliga a `advance_to_next_leaf` a subir hasta la raíz
+        // y bajar por su `extra`, que es donde vive el ciclo.
+        let err = c.next().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: CorruptKind::TreeLoop, .. }),
+            "se esperaba TreeLoop, se obtuvo {err:?}"
+        );
+    }
+
+    /// Mismo ciclo que la prueba anterior, pero alcanzable directamente
+    /// desde la raíz: ejercita la cota de `seek_from`, no la de
+    /// `advance_to_next_leaf`.
+    #[test]
+    fn seek_from_returns_an_error_instead_of_looping_forever_on_a_cycle() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        let cycle_a = tx.alloc().unwrap();
+        let cycle_b = tx.alloc().unwrap();
+
+        let mut ab = PageBuilder::new(512, PageType::Internal);
+        ab.set_extra(cycle_b);
+        let pa = ab.build(&[]).unwrap();
+
+        let mut bb = PageBuilder::new(512, PageType::Internal);
+        bb.set_extra(cycle_a);
+        let pb = bb.build(&[]).unwrap();
+
+        tx.write_page(cycle_a, &pa).unwrap();
+        tx.write_page(cycle_b, &pb).unwrap();
+        tx.set_root(cycle_a);
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        let err = match Cursor::new(&r, r.root(), b"", b"\xff") {
+            Ok(_) => panic!("se esperaba TreeLoop, el cursor se construyó sin error"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: CorruptKind::TreeLoop, .. }),
+            "se esperaba TreeLoop, se obtuvo {err:?}"
         );
     }
 }

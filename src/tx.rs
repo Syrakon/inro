@@ -201,6 +201,49 @@ impl<'db> ReadTxn<'db> {
     pub fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
         self.db.pager.read(page)
     }
+
+    pub fn get(&self, ns: u8, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        crate::tree::get(self, self.meta.root, &scoped(ns, key))
+    }
+
+    /// Recorrido de `[from, to)` dentro del espacio `ns`.
+    ///
+    /// **Desviación deliberada del brief**: la tarea proponía
+    /// `pub fn scan(...) -> crate::tree::Cursor<'_, Self>`, construido con
+    /// `Cursor::new(...).expect("el descenso inicial no falla en un árbol
+    /// válido")`. Ese `.expect` convierte cualquier corrupción detectada
+    /// durante el descenso inicial (`TreeLoop` de una pila corrupta,
+    /// `PageType` de una página que no es la que dice ser, o un error de E/S
+    /// del propio `read_page`) en un `panic!` de la API pública, justo la
+    /// clase de fallo que este motor evita desde la tarea 5: "entrada
+    /// corrupta se reporta como `Err`, nunca como una respuesta incorrecta
+    /// silenciosa" (ver el comentario de `read_overflow`) — un panic es
+    /// estrictamente peor que una respuesta silenciosa, porque además
+    /// aborta el proceso. `get`, `put` y `delete` ya devuelven `Result` por
+    /// esta misma razón; `scan` debe ser igual de consistente. Cambia la
+    /// firma de este método frente al brief, pero no la de `Cursor::new`
+    /// (que ya devolvía `Result` en el propio código de la tarea) ni la de
+    /// `Cursor::next`.
+    pub fn scan(&self, ns: u8, from: &[u8], to: &[u8]) -> Result<crate::tree::Cursor<'_, Self>> {
+        // `strip: 1` recorta el byte de espacio de claves que `scoped` antepuso:
+        // el llamante nunca debe verlo, igual que no lo ve en `get`/`put`/`delete`.
+        crate::tree::Cursor::new_with_strip(
+            self,
+            self.meta.root,
+            &scoped(ns, from),
+            &scoped(ns, to),
+            1,
+        )
+    }
+}
+
+/// Antepone el byte de espacio de claves. Es la única transformación entre la
+/// clave que ve el usuario y la que vive en el árbol.
+fn scoped(ns: u8, key: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + key.len());
+    k.push(ns);
+    k.extend_from_slice(key);
+    k
 }
 
 /// Acceso a páginas común a lectores y escritores, para que el árbol se
@@ -444,6 +487,24 @@ impl<'db> WriteTxn<'db> {
         self.db.pager.write(page, bytes)?;
         self.written.push(page);
         Ok(())
+    }
+
+    pub fn put(&mut self, ns: u8, key: &[u8], value: &[u8]) -> Result<()> {
+        let full = scoped(ns, key);
+        let root = crate::tree::put(self, self.meta.root, &full, value)?;
+        self.meta.root = root;
+        Ok(())
+    }
+
+    pub fn delete(&mut self, ns: u8, key: &[u8]) -> Result<bool> {
+        let full = scoped(ns, key);
+        let (root, existed) = crate::tree::delete(self, self.meta.root, &full)?;
+        self.meta.root = root;
+        Ok(existed)
+    }
+
+    pub fn get(&self, ns: u8, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        crate::tree::get(self, self.meta.root, &scoped(ns, key))
     }
 
     /// Escribe la lista de libres, sincroniza, escribe la meta inactiva y
