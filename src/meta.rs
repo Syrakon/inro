@@ -54,6 +54,16 @@ pub struct Meta {
     /// `decode` quien impone esa correspondencia (ver más abajo), no un
     /// invariante que este `struct` pueda hacer cumplir por construcción.
     pub wrapped_key: Option<[u8; crate::crypto::WRAPPED_KEY_LEN]>,
+    /// Techo del contador de nonce de página ya reservado de forma duradera
+    /// (tarea 17, ronda de revisión posterior a la primera entrega), bytes
+    /// 100..108 — el hueco que ya dejaba `encode` como "reservado". NO es
+    /// "el último contador usado": es "ningún contador por debajo de este
+    /// valor se ofrece jamás a una transacción futura", incluso si el
+    /// contador real usado por la última transacción fue mucho menor — ver
+    /// `Db::reserve_counters` en `tx.rs`, que es quien mantiene esa
+    /// propiedad. Sin significado en una base sin cifrar (queda en 0, sin
+    /// que nada lo lea).
+    pub write_counter: u64,
 }
 
 impl Meta {
@@ -69,10 +79,13 @@ impl Meta {
         b[29] = self.flags;
         b[30..32].copy_from_slice(&self.format_major.to_le_bytes());
         // 40..100 clave de datos envuelta (tarea 17): nonce de 12, texto
-        // cifrado de 32 y tag de 16. 100..108 reservado.
+        // cifrado de 32 y tag de 16. 100..108 techo del contador de nonce
+        // de página (tarea 17, ronda de revisión posterior a la primera
+        // entrega — ver el comentario de `write_counter`).
         if let Some(wrapped) = &self.wrapped_key {
             b[40..40 + crate::crypto::WRAPPED_KEY_LEN].copy_from_slice(wrapped);
         }
+        b[100..108].copy_from_slice(&self.write_counter.to_le_bytes());
         let crc = crc32::checksum(&b[..META_SIZE - 4]);
         b[META_SIZE - 4..META_SIZE].copy_from_slice(&crc.to_le_bytes());
         b
@@ -112,6 +125,7 @@ impl Meta {
             flags,
             format_major: u16::from_le_bytes(b[30..32].try_into().unwrap()),
             wrapped_key,
+            write_counter: u64::from_le_bytes(b[100..108].try_into().unwrap()),
         })
     }
 
@@ -171,8 +185,15 @@ mod tests {
         Meta {
             txn_id, root: 9, catalog_root: 0, freelist_head: 0, freelist_tail: 0,
             n_pages: 10, page_size_log2: 9, format_major: FORMAT_MAJOR, flags: 0,
-            wrapped_key: None,
+            wrapped_key: None, write_counter: 0,
         }
+    }
+
+    #[test]
+    fn write_counter_roundtrips() {
+        let mut m = meta(1);
+        m.write_counter = 0x0102_0304_0506_0708;
+        assert_eq!(Meta::decode(&m.encode(512)).unwrap().write_counter, m.write_counter);
     }
 
     #[test]

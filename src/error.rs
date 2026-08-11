@@ -42,6 +42,16 @@ pub enum Error {
     Full,
     /// El descifrado falló: clave incorrecta o página manipulada.
     Decrypt { page: PageNo },
+    /// Comprobación interna, no un fallo del llamante: `WriteTxn::write_page`
+    /// detectó que iba a sellar `page` con un contador de nonce que ya se
+    /// había usado dentro de esta misma transacción. Con el diseño actual
+    /// (contador monótono por transacción, reservado por adelantado —
+    /// tarea 17, ronda de revisión posterior) esto es matemáticamente
+    /// inalcanzable si el resto del motor es correcto: convierte la
+    /// invariante de unicidad del nonce, de la que depende toda la
+    /// confidencialidad del cifrado por página, de una suposición no
+    /// comprobada a algo que el propio motor verifica en cada escritura.
+    NonceReuse { page: PageNo },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

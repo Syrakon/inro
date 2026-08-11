@@ -242,11 +242,20 @@ impl Freelist {
     /// `reclaimed`), nunca la `max_txn` histórica del grupo que sostenían
     /// — esa página solo se volvió basura ahora, al leerla esta
     /// transacción, no cuando se liberaron las páginas que describía.
+    ///
+    /// `next_nonce` (tarea 17, ronda de revisión posterior a la primera
+    /// entrega) da el contador de nonce para CADA página que este `flush`
+    /// escribe — deliberadamente NO `txn`: el mismo defecto que motivó
+    /// separar el contador del `txn_id` en `WriteTxn::write_page`
+    /// (`tx.rs`) aplica aquí igual, así que `flush` recibe la misma
+    /// fuente de contadores que usa el resto de la transacción
+    /// (`Db::reserve_counters`), en vez de reinventar la suya.
     pub fn flush(
         &mut self,
         pager: &Pager,
         alloc: &mut dyn FnMut() -> Result<PageNo>,
         txn: TxnId,
+        next_nonce: &mut dyn FnMut() -> Result<u64>,
     ) -> Result<(PageNo, PageNo)> {
         // Antes de serializar hay que absorber TODO lo que `load` dejó sin
         // traer (el tramo intermedio entre `head` y `tail`): si no, esas
@@ -312,8 +321,11 @@ impl Freelist {
                 // incondicionalmente si hay clave activa) fallaría al
                 // releerla más tarde — ver el comentario de `Db::open` en
                 // `tx.rs` sobre por qué el `Pager` provisional también
-                // necesita la clave antes de leer la lista de libres.
-                pager.write_encrypted(page_no, txn, &b)?;
+                // necesita la clave antes de leer la lista de libres. El
+                // contador de nonce sale de `next_nonce`, no de `txn`: ver
+                // el comentario de este método.
+                let counter = next_nonce()?;
+                pager.write_encrypted(page_no, counter, &b)?;
 
                 if tail == 0 {
                     tail = page_no;
@@ -439,6 +451,7 @@ mod tests {
             f.push(n, 5);
         }
         let mut next = 1000u32;
+        let mut counter = 0u64;
         let (head, tail) = f
             .flush(
                 &p,
@@ -447,6 +460,10 @@ mod tests {
                     Ok(next)
                 },
                 5,
+                &mut || {
+                    counter += 1;
+                    Ok(counter)
+                },
             )
             .unwrap();
 
@@ -465,7 +482,9 @@ mod tests {
     fn flush_of_an_empty_list_writes_nothing() {
         let p = pager();
         let mut f = Freelist::empty();
-        let (head, tail) = f.flush(&p, &mut || panic!("no debe asignar"), 5).unwrap();
+        let (head, tail) = f
+            .flush(&p, &mut || panic!("no debe asignar"), 5, &mut || panic!("no debe pedir contador"))
+            .unwrap();
         assert_eq!((head, tail), (0, 0));
     }
 
@@ -477,6 +496,7 @@ mod tests {
             f.push(n, 5);
         }
         let mut next = 1000u32;
+        let mut counter = 0u64;
         let (head, tail) = f
             .flush(
                 &p,
@@ -485,6 +505,10 @@ mod tests {
                     Ok(next)
                 },
                 5,
+                &mut || {
+                    counter += 1;
+                    Ok(counter)
+                },
             )
             .unwrap();
 

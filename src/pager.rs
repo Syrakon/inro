@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use crate::crypto::Encryption;
 use crate::header::Geometry;
-use crate::{PageNo, Result, Storage, TxnId};
+use crate::{PageNo, Result, Storage};
 
 /// Entrada de caché. `used` es un contador monótono, no un reloj: sirve solo
 /// para elegir la víctima menos usada recientemente.
@@ -85,13 +85,26 @@ impl Pager {
     /// Bytes útiles de una página lógica: lo que `PageBuilder` y todo lo que
     /// construye páginas (`tree.rs`, `freelist.rs`) debe usar en vez de
     /// `geometry().page_size`. Con cifrado, veinticuatro menos: ocho de
-    /// `txn_id` en claro y dieciséis de tag (`crypto::CIPHER_PREFIX`). Sin
-    /// cifrado, coincide con el tamaño físico.
+    /// contador de nonce en claro y dieciséis de tag (`crypto::CIPHER_PREFIX`).
+    /// Sin cifrado, coincide con el tamaño físico.
     pub fn logical_page_size(&self) -> u32 {
         match &self.encryption {
             Some(_) => self.geometry.page_size - crate::crypto::CIPHER_PREFIX as u32,
             None => self.geometry.page_size,
         }
+    }
+
+    /// Si esta base tiene cifrado por página activo. `Db::begin_write`
+    /// (`tx.rs`, tarea 17, ronda de revisión posterior a la primera
+    /// entrega) la usa para saltarse por completo la reserva duradera de
+    /// contadores de nonce (`Db::reserve_counters`) cuando no hace falta:
+    /// sin cifrado, ningún contador se usa nunca (`write_encrypted` con
+    /// `self.encryption == None` ignora el que se le pase), así que
+    /// reservarlo sería una escritura+sincronización de meta por cada
+    /// transacción sin ningún beneficio — justo el coste que este método
+    /// existe para evitar en el caso común (bases sin cifrar).
+    pub fn is_encrypted(&self) -> bool {
+        self.encryption.is_some()
     }
 
     fn offset(&self, page_no: PageNo) -> u64 {
@@ -197,25 +210,30 @@ impl Pager {
     /// tamaño, así que el resultado, una vez sellado, mide exactamente
     /// `geometry().page_size` — lo que `write` exige.
     ///
-    /// `txn` es la transacción que hace esta escritura: entra en la
-    /// derivación del nonce junto con `page_no` (ver `crypto::seal`). Su
-    /// unicidad — la invariante de la que depende TODA la confidencialidad
-    /// de este esquema — es responsabilidad de quien llama: una página no
-    /// debe escribirse dos veces dentro de la misma transacción. El diseño
-    /// de copia en escritura del motor lo cumple por construcción (una
-    /// página sucia se escribe una sola vez, al confirmar); `Pager` no
-    /// tiene forma de comprobarlo por sí mismo.
-    pub fn write_encrypted(&self, page_no: PageNo, txn: TxnId, plain: &[u8]) -> Result<()> {
+    /// `counter` es el contador de nonce de ESTA escritura concreta — NO el
+    /// `txn_id` de la transacción que la hace. Entra en la derivación del
+    /// nonce junto con `page_no` (ver `crypto::seal`). Su unicidad — la
+    /// invariante de la que depende TODA la confidencialidad de este
+    /// esquema — es responsabilidad de quien llama (`WriteTxn::write_page`,
+    /// `Freelist::flush`, ambos en `tx.rs`/`freelist.rs`, vía
+    /// `Db::reserve_counters`): un mismo par `(page_no, counter)` no debe
+    /// pasar nunca dos veces por esta función. `Pager` no tiene forma de
+    /// comprobarlo por sí mismo — no es una precondición vacía: la primera
+    /// versión de este esquema usaba `txn_id` aquí, que SÍ podía repetirse
+    /// dentro de una transacción (`WriteTxn::alloc` recicla `own_free`,
+    /// tarea 12) y de hecho lo hacía en cualquier lote de más de un puñado
+    /// de escrituras — ver el comentario de `nonce` en `crypto.rs`.
+    pub fn write_encrypted(&self, page_no: PageNo, counter: u64, plain: &[u8]) -> Result<()> {
         match &self.encryption {
             None => self.write(page_no, plain),
-            Some(enc) => self.seal_and_write(enc, page_no, txn, plain),
+            Some(enc) => self.seal_and_write(enc, page_no, counter, plain),
         }
     }
 
     #[cfg(feature = "encryption")]
-    fn seal_and_write(&self, enc: &Encryption, page_no: PageNo, txn: TxnId, plain: &[u8]) -> Result<()> {
+    fn seal_and_write(&self, enc: &Encryption, page_no: PageNo, counter: u64, plain: &[u8]) -> Result<()> {
         let mut raw = vec![0u8; self.geometry.page_size as usize];
-        crate::crypto::seal(enc, page_no, txn, plain, &mut raw)?;
+        crate::crypto::seal(enc, page_no, counter, plain, &mut raw)?;
         self.write(page_no, &raw)
     }
 
@@ -224,7 +242,7 @@ impl Pager {
     /// que falla alto en vez de escribir `plain` sin cifrar bajo la
     /// apariencia de que sí se cifró.
     #[cfg(not(feature = "encryption"))]
-    fn seal_and_write(&self, _enc: &Encryption, _page_no: PageNo, _txn: TxnId, _plain: &[u8]) -> Result<()> {
+    fn seal_and_write(&self, _enc: &Encryption, _page_no: PageNo, _counter: u64, _plain: &[u8]) -> Result<()> {
         Err(crate::Error::BadFormat)
     }
 
