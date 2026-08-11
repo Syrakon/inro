@@ -1,5 +1,5 @@
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -250,6 +250,25 @@ pub struct WriteTxn<'db> {
     /// confirmada. Mientras sea `false`, `Drop` deshace cualquier cambio que
     /// esta transacción le haya hecho a la lista de libres persistente.
     committed: bool,
+    /// Todas las páginas que ESTA transacción ha asignado alguna vez, sin
+    /// importar de dónde salieron (lista de libres persistente o extensión
+    /// de fichero). `free` la consulta para decidir si una página liberada
+    /// va al conjunto propio (`own_free`, reciclable de inmediato) o a la
+    /// lista de libres persistente (protegida hasta el commit, ver
+    /// `alloc`). `BTreeSet`, no un escaneo lineal: un lote de miles de
+    /// operaciones asigna y libera del orden de miles de páginas, y una
+    /// comprobación de pertenencia por página convertiría esa carga en
+    /// cuadrática si fuera O(n).
+    self_allocated: BTreeSet<PageNo>,
+    /// Páginas que esta transacción asignó y ya liberó ella misma: nunca
+    /// llegaron a formar parte del árbol confirmado, así que son
+    /// reciclables de inmediato, sin esperar al commit. `alloc` las
+    /// consume antes de tocar la lista de libres persistente. Puro LIFO
+    /// (siempre se saca la última que se metió) y acotado por lo que esta
+    /// transacción llega a asignar, así que un `Vec` con `push`/`pop`
+    /// basta — no hace falta orden ni pertenencia sobre este conjunto, eso
+    /// ya lo resuelve `self_allocated`.
+    own_free: Vec<PageNo>,
 }
 
 impl Db {
@@ -270,6 +289,8 @@ impl Db {
             written: Vec::new(),
             pre_freelist,
             committed: false,
+            self_allocated: BTreeSet::new(),
+            own_free: Vec::new(),
         })
     }
 }
@@ -325,40 +346,74 @@ impl<'db> WriteTxn<'db> {
 
     /// Toma una página libre reutilizable o extiende el fichero.
     ///
-    /// El límite de reciclado no es solo el lector vivo más antiguo: la meta
-    /// confirmada es, ella misma, un lector implícito hasta que ESTA
-    /// transacción confirme. Sin este suelo, liberar en la transacción N una
-    /// página que todavía pertenece al árbol confirmado en N-1 y reciclarla
-    /// dentro de la misma N — exactamente cuando `oldest_reader` devuelve
-    /// `None` porque no hay ningún lector real, así que la comprobación de
-    /// `Freelist::pop` no protege nada — deja la meta N-1 apuntando a una
-    /// página que esta misma transacción ya sobrescribió. Si N nunca llega a
-    /// confirmar, la recuperación monta desde N-1 y esa página es basura:
-    /// corrompe el árbol YA confirmado, no solo la transacción abortada.
+    /// Dos fuentes, en orden. Primero el conjunto propio (`own_free`):
+    /// páginas que esta misma transacción asignó y ya liberó ella misma.
+    /// Nunca llegaron a formar parte del árbol confirmado — la meta vieja
+    /// no las referencia — así que reutilizarlas no puede dañar nada tras
+    /// un corte, y no hace falta esperar a ningún commit. Esta distinción
+    /// no es un refinamiento opcional: el camino de inserción copy-on-write
+    /// libera el camino raíz→hoja en cada `put`, así que un lote de mil
+    /// registros asigna del orden de cuatro mil páginas y libera casi
+    /// todas dentro de la misma transacción. Sin reciclarlas de inmediato,
+    /// el fichero crecería unos 16 MB por lote con páginas de 4 KB — en un
+    /// motor cuyo objetivo es justo el mínimo consumo de disco.
+    ///
+    /// Si `own_free` está vacío, la lista de libres persistente, con la
+    /// meta confirmada contando como lector — el más importante: si esta
+    /// transacción no llega a confirmar, la recuperación monta por ella,
+    /// así que hay un lector implícito en el último commit hasta que esta
+    /// acabe. Sin ese suelo, una página liberada por esta transacción pero
+    /// todavía viva en el árbol confirmado en N-1 se reutilizaría en
+    /// cuanto no hay lectores reales, el escritor la sobrescribiría, y un
+    /// corte antes del commit dejaría la meta N-1 apuntando a basura.
     /// `WriteTxn::Drop` no lo repara — deshace la lista de libres en
-    /// memoria, no lo que ya se escribió en disco — y un corte de corriente
-    /// nunca llega a ejecutar `Drop`. `min` con el lector real más antiguo
-    /// (si lo hay) conserva ese límite tal cual: la meta confirmada nunca es
-    /// más reciente que cualquier lector real vivo.
+    /// memoria, no lo que ya se escribió en disco — y un corte de
+    /// corriente nunca llega a ejecutar `Drop`. `min` con el lector real
+    /// más antiguo (si lo hay) conserva ese límite tal cual: la meta
+    /// confirmada nunca es más reciente que cualquier lector real vivo.
+    ///
+    /// Cualquier página que salga de aquí, sea cual sea la fuente, se
+    /// registra en `self_allocated`: en cuanto esta transacción la posee,
+    /// liberarla de nuevo (dentro de la misma transacción) es siempre
+    /// seguro y debe ir a `own_free`, no a la lista persistente — ver
+    /// `free`.
     pub fn alloc(&mut self) -> Result<PageNo> {
+        if let Some(p) = self.own_free.pop() {
+            return Ok(p);
+        }
+
         let committed_txn = self.db.committed.read().unwrap().0.txn_id;
         let oldest = Some(match self.db.oldest_reader() {
             Some(r) => core::cmp::min(r, committed_txn),
             None => committed_txn,
         });
         let pager = &self.db.pager;
-        if let Some(p) = self.state().freelist.pop_refill(pager, oldest)? {
-            return Ok(p);
-        }
-        let p = self.meta.n_pages;
-        self.meta.n_pages = p.checked_add(1).ok_or(Error::Full)?;
+        let p = if let Some(p) = self.state().freelist.pop_refill(pager, oldest)? {
+            p
+        } else {
+            let p = self.meta.n_pages;
+            self.meta.n_pages = p.checked_add(1).ok_or(Error::Full)?;
+            p
+        };
+        self.self_allocated.insert(p);
         Ok(p)
     }
 
     /// Marca `page` como libre a partir de esta transacción.
+    ///
+    /// Si la asignó esta misma transacción (`self_allocated`), va al
+    /// conjunto propio y vuelve a estar disponible de inmediato: nunca la
+    /// vio la meta confirmada, así que no hay nada que proteger. Si venía
+    /// de antes de esta transacción — del árbol confirmado — va a la lista
+    /// de libres persistente etiquetada con esta transacción y no se
+    /// reutiliza hasta que el commit la haga durable (ver `alloc`).
     pub fn free(&mut self, page: PageNo) {
-        let txn = self.meta.txn_id;
-        self.state().freelist.push(page, txn);
+        if self.self_allocated.contains(&page) {
+            self.own_free.push(page);
+        } else {
+            let txn = self.meta.txn_id;
+            self.state().freelist.push(page, txn);
+        }
     }
 
     pub fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
@@ -377,6 +432,26 @@ impl<'db> WriteTxn<'db> {
     pub fn commit(mut self) -> Result<()> {
         let mut n_pages = self.meta.n_pages;
         let txn_id = self.meta.txn_id;
+        {
+            // Lo que quede en el conjunto propio al llegar aquí son páginas
+            // que esta transacción asignó y liberó, pero que nadie volvió a
+            // pedir antes de confirmar. `own_free` es puramente de esta
+            // transacción — nunca se sirve a otra ni sobrevive a un aborto
+            // — así que si no se vuelca aquí a la lista de libres
+            // persistente antes de serializarla, estas páginas no quedan
+            // referenciadas por NADA tras el commit: ni por el árbol nuevo
+            // (ya no las usa) ni por la lista de libres (nunca se enteró de
+            // ellas) ni por la meta vieja (las liberó esta misma
+            // transacción). Fuga silenciosa, no corrupción — pero fuga al
+            // fin. Se etiquetan con `txn_id`, igual que cualquier otra
+            // página que libera esta transacción: la próxima que las pida
+            // pasa por la misma comprobación de la meta confirmada que el
+            // resto de la lista de libres.
+            let state = self.guard.as_mut().expect("estado presente");
+            for page in self.own_free.drain(..) {
+                state.freelist.push(page, txn_id);
+            }
+        }
         {
             let pager = &self.db.pager;
             // La lista de libres se escribe extendiendo el fichero, nunca
