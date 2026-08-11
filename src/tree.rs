@@ -1315,6 +1315,36 @@ mod delete_invariant_tests {
         Db::create(Box::new(MemStorage::new()), Options::default()).unwrap()
     }
 
+    /// Cota de profundidad: como `descend` e `insert_rec`, `delete_rec` sigue
+    /// punteros a hijos leídos del disco, así que un ciclo de páginas
+    /// corruptas debe devolver `TreeLoop` en vez de desbordar la pila. Mismo
+    /// árbol de dos nodos internos con `extra` cruzado que usa la prueba
+    /// análoga de `put_tests` para `insert_rec`.
+    #[test]
+    fn delete_rec_returns_an_error_instead_of_looping_forever_on_a_cycle() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let a = tx.alloc().unwrap();
+        let b = tx.alloc().unwrap();
+
+        let mut ab = PageBuilder::new(512, PageType::Internal);
+        ab.set_extra(b);
+        let pa = ab.build(&[]).unwrap();
+
+        let mut bb = PageBuilder::new(512, PageType::Internal);
+        bb.set_extra(a);
+        let pb = bb.build(&[]).unwrap();
+
+        tx.write_page(a, &pa).unwrap();
+        tx.write_page(b, &pb).unwrap();
+
+        let err = delete(&mut tx, a, b"cualquiera").unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::TreeLoop, .. }),
+            "se esperaba TreeLoop, se obtuvo {err:?}"
+        );
+    }
+
     #[test]
     fn deleting_the_first_key_of_a_leaf_keeps_the_rest_readable() {
         let db = db();
