@@ -257,9 +257,36 @@ impl Db {
         // camino común que sí importa mantener a coste constante — ver
         // `open_costs_the_same_on_a_small_and_a_large_file`, que sigue
         // midiendo el camino SIN reparación).
+        //
+        // **Oportunista, nunca de carga (regresión hallada tras la entrega
+        // de esta ronda, corregida aquí).** La base ya es plenamente
+        // usable con la geometría que se acaba de leer del espejo — no
+        // hace falta nada más para abrir. La primera versión de esto
+        // propagaba el error de `write`/`sync` con `?`, así que un medio de
+        // solo lectura (o cualquier fallo de E/S en esa escritura, sector
+        // dañado en la posición de la principal incluido) convertía una
+        // apertura que antes funcionaba — sin reparación, esta ruta nunca
+        // escribía nada — en un `Err` que le niega la base entera a quien
+        // llama, aunque el fichero sea perfectamente legible y el espejo ya
+        // haya dado una geometría válida. Un motor que se niega a abrir un
+        // fichero legible porque no puede REPARARLO es peor que el defecto
+        // que la reparación soluciona (gastar la redundancia sin
+        // devolverla, ver más arriba). Si falla, el fichero se queda en el
+        // mismo estado degradado de una sola copia legible en el que ya
+        // estaba un instante antes — ni mejor ni peor que no haber
+        // intentado nada — y la reparación se reintenta en la próxima
+        // apertura, con las mismas condiciones.
+        //
+        // No se registra el fallo en ningún sitio: este crate no tiene
+        // ninguna facilidad de log y añadir una solo para este caso sería
+        // una mecánica nueva por una señal sin nadie que la consuma —
+        // `Db::open` ya devuelve `Ok`, que es toda la información que
+        // quien llama puede accionar (la base abrió), y el propio diseño
+        // ya garantiza convergencia eventual (se reintenta sola) sin que
+        // ninguna parte del motor necesite saber que el intento anterior
+        // falló para seguir funcionando.
         if used_mirror {
-            geometry.write(storage.as_ref())?;
-            storage.sync()?;
+            let _ = geometry.write(storage.as_ref()).and_then(|()| storage.sync());
         }
         let (meta, slot) = Meta::load(storage.as_ref(), &geometry)?;
         // Se desenvuelve ANTES de construir el `Pager` provisional que lee
@@ -2741,6 +2768,88 @@ mod tests {
             assert_eq!(
                 db3.begin_read().get(0x01, b"antes").unwrap().as_deref(),
                 Some(b"confirmado".as_slice())
+            );
+        }
+
+        /// Envuelve un medio ya construido y hace que TODA escritura falle
+        /// — modela un medio de solo lectura (o cualquier fallo de E/S
+        /// persistente en la escritura de reparación, sector dañado
+        /// incluido). Las lecturas funcionan con normalidad: `Db::open`
+        /// tiene que poder terminar sin errores de E/S artificiales fuera
+        /// de la escritura de reparación misma, que es lo único que esta
+        /// prueba quiere que falle.
+        struct ReadOnlyStorage(Arc<MemStorage>);
+        impl Storage for ReadOnlyStorage {
+            fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> {
+                self.0.read_at(o, b)
+            }
+            fn write_at(&self, _o: u64, _b: &[u8]) -> Result<()> {
+                Err(Error::Io(crate::IoError::PermissionDenied))
+            }
+            fn sync(&self) -> Result<()> {
+                self.0.sync()
+            }
+            fn len(&self) -> Result<u64> {
+                self.0.len()
+            }
+        }
+
+        /// Regresión hallada en revisión sobre la reparación de arriba: la
+        /// primera versión propagaba con `?` el error de la escritura o el
+        /// `sync` de reparación. Sobre un medio de solo lectura con la
+        /// principal dañada, eso convertía una apertura que antes
+        /// funcionaba — sin reparación, `Db::open` nunca escribía nada —
+        /// en un `Err` que le niega la base entera a quien llama, aunque
+        /// el fichero sea perfectamente legible y el espejo ya diera una
+        /// geometría válida. La reparación es oportunista, no de carga: un
+        /// fallo suyo debe dejar el fichero en el mismo estado degradado
+        /// de una sola copia legible en el que ya estaba, y abrir de
+        /// todos modos.
+        #[test]
+        fn a_read_only_medium_with_a_damaged_primary_still_opens() {
+            let crash = Arc::new(TearSecondHeaderWrite {
+                inner: MemStorage::new(),
+                header_writes: std::sync::atomic::AtomicU64::new(0),
+                prefix: 45,
+                dead: AtomicBool::new(false),
+            });
+            let db = Db::create(Box::new(ArcTearHeader(Arc::clone(&crash))), Options::default())
+                .unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"antes", b"confirmado").unwrap();
+            tx.commit().unwrap();
+
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..200u32 {
+                tx.put(0x02, &i.to_be_bytes(), &[0u8; 40]).unwrap();
+            }
+            let _ = tx.commit();
+
+            let recovered = MemStorage::new();
+            recovered.restore(crash.inner.snapshot());
+            let recovered = Arc::new(recovered);
+
+            // Premisa: la principal, tal cual quedó del corte, no
+            // decodifica sola — igual que en
+            // `reopening_after_a_torn_primary_repairs_it_from_the_mirror`.
+            let mut primary_before = [0u8; crate::header::HEADER_SIZE];
+            recovered.read_at(0, &mut primary_before).unwrap();
+            assert!(
+                Geometry::decode(&primary_before).is_err(),
+                "la premisa de esta prueba es que la principal, sin reparar, no decodifica"
+            );
+
+            let db = Db::open(Box::new(ReadOnlyStorage(Arc::clone(&recovered))), Options::default())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "un medio de solo lectura con la principal danada debe abrir igual, \
+                         usando el espejo, sin que el fallo de la reparacion se propague: {e:?}"
+                    )
+                });
+            assert_eq!(
+                db.begin_read().get(0x01, b"antes").unwrap().as_deref(),
+                Some(b"confirmado".as_slice()),
+                "la base debe ser utilizable aunque la reparacion no pudiera escribirse"
             );
         }
 

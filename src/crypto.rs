@@ -1874,6 +1874,21 @@ mod tests {
     ///   páginas huérfanas: si `Db::open` recuperase la página destino
     ///   hacia la lista de libres, una escritura posterior la reutilizaría
     ///   como dato, y una reubicación posterior le escribiría meta encima.
+    ///
+    /// **Registro de una intermitencia (2026-08-11), sin perseguir:** esta
+    /// prueba falló UNA vez en una corrida de la suite completa con
+    /// `--features encryption`, y no se repitió en cuatro intentos
+    /// posteriores bajo las mismas condiciones. Es anterior a esta ronda —
+    /// ya estaba presente en `33a7962` ("fix: cierra fuga de reubicacion y
+    /// cabecera desgarrada"), la corrección del hallazgo HIGH que esta
+    /// misma matriz verifica — así que no es una regresión de este cambio.
+    /// No se investigó más allá de esto: podría ser un problema de orden
+    /// del arnés (estado compartido entre casos de la matriz, o entre
+    /// pruebas del mismo binario) o una carrera real que la matriz roza sin
+    /// aislarla todavía. Quien la vuelva a ver debería anotar aquí la
+    /// política de `Sync`, la ranura activa y el punto de corte concretos
+    /// (el mensaje de `assert` los incluye) en vez de volver a partir de
+    /// cero.
     #[test]
     fn relocation_survives_a_torn_write_at_every_cut_point_under_every_sync_policy() {
         #[derive(Debug, Clone, Copy)]
