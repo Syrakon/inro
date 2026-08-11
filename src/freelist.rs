@@ -3,7 +3,7 @@ use alloc::vec;
 
 use crate::page::{PageRef, PageType, PAGE_HEADER_SIZE};
 use crate::pager::Pager;
-use crate::{crc32, PageNo, Result, TxnId};
+use crate::{crc32, CorruptKind, Error, PageNo, Result, TxnId};
 
 pub const FREELIST_HEADER: usize = 32;
 
@@ -12,76 +12,154 @@ pub const FREELIST_HEADER: usize = 32;
 struct Group {
     max_txn: TxnId,
     pages: VecDeque<PageNo>,
+    /// Marca el grupo que `load` trajo directamente desde `tail`, sin pasar
+    /// por la cadena de `next`. Ver el guard en `pop`.
+    is_preloaded_tail: bool,
 }
 
-/// Cola de páginas libres. En memoria solo viven los grupos de los extremos;
-/// los intermedios se leen bajo demanda al vaciarse la cabeza.
+/// Decodifica una página de lista de libres ya leída: valida el tipo y
+/// limita `count` al máximo que cabe físicamente en la página. Común a
+/// `fill_from_disk` y a la carga directa de `tail` en `load`, para no
+/// duplicar (y arriesgar desincronizar) la comprobación de límites.
+fn decode_freelist_page(bytes: &[u8], page_no: PageNo) -> Result<(TxnId, VecDeque<PageNo>, PageNo)> {
+    let p = PageRef::parse(bytes, page_no)?;
+    if p.page_type() != PageType::Freelist {
+        return Err(Error::Corrupt { page: page_no, kind: CorruptKind::PageType });
+    }
+    let max_txn = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
+    let count = u16::from_le_bytes(bytes[28..30].try_into().unwrap()) as usize;
+    // `count` viene de disco y puede ser hostil o estar corrupto. Sin este
+    // límite, el bucle de abajo indexaría más allá de la página (con
+    // `count` de hasta 65535, hasta 262140 bytes) y entraría en pánico en
+    // vez de devolver un error: la tarea 5 fijó que la entrada corrupta
+    // produce `Err(Corrupt)`, nunca un pánico, y `PageRef::parse` no puede
+    // protegerlo por sí solo porque `count` no forma parte de su modelo de
+    // página — vive en el hueco específico del formato de lista de libres.
+    let max_count = bytes.len().saturating_sub(FREELIST_HEADER) / 4;
+    if count > max_count {
+        return Err(Error::Corrupt { page: page_no, kind: CorruptKind::CellBounds });
+    }
+    let mut pages = VecDeque::with_capacity(count);
+    for i in 0..count {
+        let at = FREELIST_HEADER + 4 * i;
+        pages.push_back(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()));
+    }
+    Ok((max_txn, pages, p.extra()))
+}
+
+/// Cola de páginas libres. En memoria solo viven los grupos de los extremos
+/// (cabeza y cola); los intermedios se leen bajo demanda al vaciarse la
+/// cabeza (`pop_refill`) o, en bloque, al hacer `flush`.
 pub struct Freelist {
     groups: VecDeque<Group>,
-    /// Primera página en disco que aún no se ha traído a `groups`.
+    /// Primera página en disco que aún no se ha traído a `groups`, o 0 si
+    /// no queda ninguna: el punto exacto de la cadena hasta el que ya se ha
+    /// avanzado. `0` también antes de la primera carga.
     next_on_disk: PageNo,
-    /// Páginas de lista de libres ya leídas y consumidas por `fill_from_disk`:
-    /// quedan libres ellas mismas, pero no se ofrecen a `pop` hasta el
-    /// próximo `flush`. Intercalarlas directamente en el grupo que acaban de
-    /// producir (liberado en la misma transacción que las suyas) rompería el
-    /// orden FIFO cuando un grupo original ocupa varias páginas físicas: el
-    /// número de la página contenedora aparecería antes de que el siguiente
-    /// trozo del mismo grupo lógico se hubiera servido.
-    reclaimed: VecDeque<(TxnId, PageNo)>,
+    /// Página `tail` ya cargada aparte por `load`; sirve para que
+    /// `fill_from_disk` sepa cuándo su recorrido hacia la cola ha
+    /// alcanzado terreno ya conocido y debe detenerse sin releerla. `0` si
+    /// `load` nunca cargó una cola aparte (lista vacía, de una sola
+    /// página, o `Freelist` construido con `empty()`).
+    tail_page: PageNo,
+    /// Páginas de lista de libres ya leídas y consumidas: quedan libres
+    /// ellas mismas, pero no se ofrecen a `pop` hasta el próximo `flush`,
+    /// que las etiqueta con la transacción que hace ese `flush` (ver
+    /// `flush`) — nunca con el `max_txn` histórico del grupo que sostenían,
+    /// porque esa página solo se volvió basura ahora, al leerla esta
+    /// transacción. Intercalarlas directamente en el grupo que acaban de
+    /// producir rompería además el orden FIFO cuando un grupo original
+    /// ocupa varias páginas físicas.
+    reclaimed: VecDeque<PageNo>,
+    /// Saltos dados por `fill_from_disk` en la vida de este `Freelist`:
+    /// cota defensiva contra ciclos que no sean el caso trivial de una
+    /// página que se referencia a sí misma (ver su comprobación).
+    hops: u32,
     dirty: bool,
 }
 
 impl Freelist {
     pub fn empty() -> Self {
-        Self { groups: VecDeque::new(), next_on_disk: 0, reclaimed: VecDeque::new(), dirty: false }
+        Self {
+            groups: VecDeque::new(),
+            next_on_disk: 0,
+            tail_page: 0,
+            reclaimed: VecDeque::new(),
+            hops: 0,
+            dirty: false,
+        }
     }
 
-    /// Carga la cola entera en memoria, siguiendo la cadena desde `head`
-    /// hasta agotarla. Es la forma más simple de reconstruir el estado
-    /// completo (usada aquí y por el arranque); el acceso incremental
-    /// durante una transacción, que no necesita traer más que la cabeza,
-    /// pasa por `pop_refill`.
-    pub fn load(pager: &Pager, head: PageNo, _tail: PageNo) -> Result<Self> {
+    /// Carga perezosa: solo trae a memoria la página `head` (de donde salen
+    /// los `pop`) y, si es distinta, la página `tail` (donde aterrizan los
+    /// `push`) — como mucho dos páginas físicas, sin que el consumo de RAM
+    /// dependa de cuántas páginas libres haya en total. El tramo
+    /// intermedio, si lo hay, se trae bajo demanda a través de
+    /// `pop_refill`, o en bloque al hacer `flush` (que necesita absorberlo
+    /// entero para no perderlo).
+    pub fn load(pager: &Pager, head: PageNo, tail: PageNo) -> Result<Self> {
         let mut f = Self::empty();
+        if head == 0 {
+            return Ok(f);
+        }
+        if head != tail {
+            f.tail_page = tail;
+        }
         f.next_on_disk = head;
-        while f.fill_from_disk(pager)? {}
+        f.fill_from_disk(pager)?;
+        if head != tail {
+            let bytes = pager.read(tail)?;
+            let (max_txn, pages, _next) = decode_freelist_page(&bytes, tail)?;
+            f.groups.push_back(Group { max_txn, pages, is_preloaded_tail: true });
+            f.reclaimed.push_back(tail);
+            f.dirty = true;
+        }
         Ok(f)
     }
 
-    /// Trae el siguiente grupo de disco, si queda alguno.
+    /// Trae el siguiente tramo de disco, si queda alguno.
     fn fill_from_disk(&mut self, pager: &Pager) -> Result<bool> {
         if self.next_on_disk == 0 {
             return Ok(false);
         }
-        let page_no = self.next_on_disk;
-        let bytes = pager.read(page_no)?;
-        let p = PageRef::parse(&bytes, page_no)?;
-        if p.page_type() != PageType::Freelist {
-            return Err(crate::Error::Corrupt {
-                page: page_no,
-                kind: crate::CorruptKind::PageType,
-            });
+        if self.next_on_disk == self.tail_page {
+            // La cola ya se cargó aparte en `load`: no hay nada más que
+            // traer entre lo último resuelto y ella.
+            self.next_on_disk = 0;
+            return Ok(false);
         }
-        let max_txn = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
-        let count = u16::from_le_bytes(bytes[28..30].try_into().unwrap()) as usize;
-        let mut pages = VecDeque::with_capacity(count);
-        for i in 0..count {
-            let at = FREELIST_HEADER + 4 * i;
-            pages.push_back(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()));
+        let page_no = self.next_on_disk;
+
+        // Cota defensiva contra ciclos: una cadena bien formada visita cada
+        // página física a lo sumo una vez, así que no puede necesitar más
+        // saltos que páginas tiene el fichero. Superarla prueba un ciclo
+        // aunque no sea el caso trivial de una página que apunta a sí
+        // misma (comprobado más abajo aparte, porque ese es más barato de
+        // detectar en cuanto se da, sin esperar a agotar la cota).
+        self.hops += 1;
+        if u64::from(self.hops) > u64::from(pager.file_pages()?) {
+            return Err(Error::Corrupt { page: page_no, kind: CorruptKind::FreelistLoop });
         }
 
-        let next = p.extra();
-        if next == self.next_on_disk {
-            return Err(crate::Error::Corrupt {
-                page: page_no,
-                kind: crate::CorruptKind::FreelistLoop,
-            });
+        let bytes = pager.read(page_no)?;
+        let (max_txn, pages, next) = decode_freelist_page(&bytes, page_no)?;
+        if next == page_no {
+            return Err(Error::Corrupt { page: page_no, kind: CorruptKind::FreelistLoop });
         }
         self.next_on_disk = next;
-        self.groups.push_back(Group { max_txn, pages });
+
+        let group = Group { max_txn, pages, is_preloaded_tail: false };
+        // Si la cola ya está precargada en algún punto de `groups`, este
+        // tramo intermedio debe insertarse justo delante de ella para
+        // conservar el orden cronológico: al final podría haber pushes de
+        // esta misma transacción, más recientes que la cola.
+        match self.groups.iter().position(|g| g.is_preloaded_tail) {
+            Some(i) => self.groups.insert(i, group),
+            None => self.groups.push_back(group),
+        }
         // La página que acaba de leerse queda libre ella misma en cuanto se
         // consume su contenido; ver el campo `reclaimed`.
-        self.reclaimed.push_back((max_txn, page_no));
+        self.reclaimed.push_back(page_no);
         self.dirty = true;
         Ok(true)
     }
@@ -94,7 +172,7 @@ impl Freelist {
             _ => {
                 let mut pages = VecDeque::new();
                 pages.push_back(page);
-                self.groups.push_back(Group { max_txn: txn, pages });
+                self.groups.push_back(Group { max_txn: txn, pages, is_preloaded_tail: false });
             }
         }
     }
@@ -109,6 +187,15 @@ impl Freelist {
             {
                 return None;
             }
+            // Si el grupo al frente es la cola precargada por `load` y
+            // todavía queda tramo intermedio sin resolver en disco
+            // (`next_on_disk != 0`), no se sirve: sería adelantar
+            // contenido más reciente por delante de páginas más antiguas
+            // que aún no se han traído. `pop` no tiene `pager` para
+            // resolverlo — se lo deja a `pop_refill`.
+            if g.is_preloaded_tail && self.next_on_disk != 0 {
+                return None;
+            }
             let g = self.groups.front_mut()?;
             if let Some(p) = g.pages.pop_front() {
                 self.dirty = true;
@@ -118,7 +205,13 @@ impl Freelist {
         }
     }
 
-    /// Igual que `pop`, pero trae grupos de disco si los de memoria se agotan.
+    /// Igual que `pop`, pero trae tramos de disco si los de memoria se
+    /// agotan o si el único grupo servible es la cola precargada con tramo
+    /// intermedio aún pendiente (ver el guard de `pop`). Un
+    /// `fill_from_disk` que no trae nada nuevo no siempre significa "no
+    /// queda nada": puede significar solo que acaba de resolverse ese
+    /// tramo pendiente, así que hace falta un último intento de `pop`
+    /// antes de rendirse.
     pub fn pop_refill(
         &mut self,
         pager: &Pager,
@@ -129,24 +222,40 @@ impl Freelist {
                 return Ok(Some(p));
             }
             if !self.fill_from_disk(pager)? {
-                return Ok(None);
+                return Ok(self.pop(oldest_reader));
             }
         }
     }
 
-    /// Escribe la cola a disco y devuelve `(head, tail)` para la meta-página.
-    /// `alloc` asigna páginas nuevas; se le pide una por cada página física
-    /// que hace falta para serializar los grupos actuales.
+    /// Escribe la cola a disco y devuelve `(head, tail)` para la
+    /// meta-página. `alloc` asigna páginas nuevas; se le pide una por cada
+    /// página física que hace falta para serializar los grupos actuales.
+    /// `txn` es la transacción que hace este `flush`: es la que se anota a
+    /// las páginas de lista de libres que se reciclan a sí mismas (ver
+    /// `reclaimed`), nunca la `max_txn` histórica del grupo que sostenían
+    /// — esa página solo se volvió basura ahora, al leerla esta
+    /// transacción, no cuando se liberaron las páginas que describía.
     pub fn flush(
         &mut self,
         pager: &Pager,
         alloc: &mut dyn FnMut() -> Result<PageNo>,
+        txn: TxnId,
     ) -> Result<(PageNo, PageNo)> {
-        // Las páginas de lista de libres consumidas desde el último `load`
-        // se incorporan aquí, antes de serializar: es la única vía por la
-        // que vuelven a quedar disponibles para `pop`, y hacerlo antes de
-        // fijar `capacity`/escribir asegura que este `flush` ya las cuenta.
-        while let Some((txn, page)) = self.reclaimed.pop_front() {
+        // Antes de serializar hay que absorber TODO lo que `load` dejó sin
+        // traer (el tramo intermedio entre `head` y `tail`): si no, esas
+        // páginas quedarían huérfanas, porque el `tail` que las cierra va
+        // a reescribirse con una página nueva y nada más las referenciaría.
+        // Es trabajo proporcional al tamaño de la lista, pero ocurre solo
+        // una vez por commit, no durante toda la transacción — la garantía
+        // de RAM acotada es sobre esto último, no sobre este cierre puntual.
+        while self.fill_from_disk(pager)? {}
+
+        // Las páginas de lista de libres consumidas (por `load` o por el
+        // drenaje de arriba) se incorporan aquí, antes de serializar: es la
+        // única vía por la que vuelven a quedar disponibles para `pop`, y
+        // hacerlo antes de fijar `capacity`/escribir asegura que este
+        // `flush` ya las cuenta.
+        while let Some(page) = self.reclaimed.pop_front() {
             self.push(page, txn);
         }
 
@@ -155,11 +264,11 @@ impl Freelist {
 
         // Se escribe de la cola hacia la cabeza para poder enlazar cada página
         // con la siguiente, que ya tiene número asignado. Dentro de un mismo
-        // grupo, los trozos también se escriben en ese orden (el último
-        // trozo empujado, o sea el más reciente, primero) para que el trozo
-        // más antiguo termine ocupando el extremo `head`: si no, al releer
-        // desde `head` se serviría primero el contenido más nuevo del grupo,
-        // invirtiendo el orden FIFO con el que se empujó.
+        // grupo, los trozos también se escriben en ese orden (el trozo más
+        // reciente primero) para que el trozo más antiguo termine ocupando
+        // el extremo `head`: si no, al releer desde `head` se serviría
+        // primero el contenido más nuevo del grupo, invirtiendo el orden
+        // FIFO con el que se empujó.
         let mut next: PageNo = self.next_on_disk;
         let mut tail: PageNo = 0;
         let mut head: PageNo = 0;
@@ -200,6 +309,16 @@ impl Freelist {
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
+
+    /// Páginas libres materializadas en memoria ahora mismo (no cuenta lo
+    /// que sigue sin cargar en disco, referenciado por `next_on_disk`).
+    pub fn len(&self) -> usize {
+        self.groups.iter().map(|g| g.pages.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -215,6 +334,35 @@ mod tests {
             db_id: [0; 16], created_unix: 0, meta_a_page: 1, meta_b_page: 8,
         };
         Pager::new(Box::new(MemStorage::new()), g, 8)
+    }
+
+    /// Escribe a mano una página de lista de libres cruda, para construir
+    /// escenarios (ciclos, `count` fuera de rango) que `flush` nunca
+    /// produciría por sí solo.
+    fn write_raw_freelist_page(
+        p: &Pager,
+        page_no: PageNo,
+        max_txn: TxnId,
+        entries: &[PageNo],
+        next: PageNo,
+    ) {
+        let page_size = p.geometry().page_size as usize;
+        let mut b = vec![0u8; page_size];
+        b[0] = PageType::Freelist as u8;
+        b[4..6].copy_from_slice(&(PAGE_HEADER_SIZE as u16).to_le_bytes());
+        b[6..8].copy_from_slice(&(page_size as u16).to_le_bytes());
+        b[12..16].copy_from_slice(&next.to_le_bytes());
+        b[20..28].copy_from_slice(&max_txn.to_le_bytes());
+        b[28..30].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (i, &e) in entries.iter().enumerate() {
+            let at = FREELIST_HEADER + 4 * i;
+            b[at..at + 4].copy_from_slice(&e.to_le_bytes());
+        }
+        let mut h = crc32::Hasher::new();
+        h.update(&b[..8]);
+        h.update(&b[12..]);
+        b[8..12].copy_from_slice(&h.finish().to_le_bytes());
+        p.write(page_no, &b).unwrap();
     }
 
     #[test]
@@ -254,24 +402,110 @@ mod tests {
         }
         let mut next = 1000u32;
         let (head, tail) = f
-            .flush(&p, &mut || {
-                next += 1;
-                Ok(next)
-            })
+            .flush(
+                &p,
+                &mut || {
+                    next += 1;
+                    Ok(next)
+                },
+                5,
+            )
             .unwrap();
 
         let mut g = Freelist::load(&p, head, tail).unwrap();
         for n in 100..400u32 {
-            assert_eq!(g.pop(None), Some(n), "orden preservado tras el viaje a disco");
+            assert_eq!(
+                g.pop_refill(&p, None).unwrap(),
+                Some(n),
+                "orden preservado tras el viaje a disco"
+            );
         }
-        assert_eq!(g.pop(None), None);
+        assert_eq!(g.pop_refill(&p, None).unwrap(), None);
     }
 
     #[test]
     fn flush_of_an_empty_list_writes_nothing() {
         let p = pager();
         let mut f = Freelist::empty();
-        let (head, tail) = f.flush(&p, &mut || panic!("no debe asignar")).unwrap();
+        let (head, tail) = f.flush(&p, &mut || panic!("no debe asignar"), 5).unwrap();
         assert_eq!((head, tail), (0, 0));
+    }
+
+    #[test]
+    fn load_does_not_materialise_the_whole_chain() {
+        let p = pager();
+        let mut f = Freelist::empty();
+        for n in 100..400u32 {
+            f.push(n, 5);
+        }
+        let mut next = 1000u32;
+        let (head, tail) = f
+            .flush(
+                &p,
+                &mut || {
+                    next += 1;
+                    Ok(next)
+                },
+                5,
+            )
+            .unwrap();
+
+        let g = Freelist::load(&p, head, tail).unwrap();
+        assert!(
+            g.len() < 300,
+            "load materializó {} páginas: la cadena entera cabe en RAM y no debería",
+            g.len()
+        );
+    }
+
+    #[test]
+    fn detects_a_multi_page_cycle_not_just_a_direct_self_loop() {
+        let p = pager();
+        // Cabeza real (1) con contenido, que apunta a un ciclo entre 2 y 3
+        // que nunca llega a ninguna cola: 1 -> 2 -> 3 -> 2 -> 3 -> ...
+        write_raw_freelist_page(&p, 1, 5, &[100], 2);
+        write_raw_freelist_page(&p, 2, 5, &[200], 3);
+        write_raw_freelist_page(&p, 3, 5, &[300], 2);
+
+        let mut f = Freelist::empty();
+        f.next_on_disk = 1;
+        let mut result = Ok(true);
+        for _ in 0..20 {
+            result = f.fill_from_disk(&p);
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(
+            matches!(result, Err(Error::Corrupt { kind: CorruptKind::FreelistLoop, .. })),
+            "un ciclo de varias páginas debe cortar con FreelistLoop, no crecer sin límite: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn rejects_an_oversized_count_instead_of_panicking() {
+        let p = pager();
+        // Página armada a mano, sin pasar por `write_raw_freelist_page`,
+        // con un `count` que desbordaría la página (page_size 512,
+        // capacidad real 120 entradas).
+        let mut b = vec![0u8; 512];
+        b[0] = PageType::Freelist as u8;
+        b[4..6].copy_from_slice(&(PAGE_HEADER_SIZE as u16).to_le_bytes());
+        b[6..8].copy_from_slice(&512u16.to_le_bytes());
+        b[20..28].copy_from_slice(&5u64.to_le_bytes());
+        b[28..30].copy_from_slice(&60000u16.to_le_bytes());
+        let mut h = crc32::Hasher::new();
+        h.update(&b[..8]);
+        h.update(&b[12..]);
+        b[8..12].copy_from_slice(&h.finish().to_le_bytes());
+        p.write(1, &b).unwrap();
+
+        let mut f = Freelist::empty();
+        f.next_on_disk = 1;
+        assert_eq!(
+            f.fill_from_disk(&p),
+            Err(Error::Corrupt { page: 1, kind: CorruptKind::CellBounds })
+        );
     }
 }
