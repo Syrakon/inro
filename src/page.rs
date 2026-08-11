@@ -163,6 +163,151 @@ impl<'a> PageRef<'a> {
         }
         Err(lo)
     }
+
+    /// Valor de la celda `i`. Solo válido en páginas hoja.
+    pub fn value(&self, i: usize) -> &'a [u8] {
+        let off = self.slot(i);
+        let (suffix_len, n1) = varint::read(&self.bytes[off..]).expect("validado en parse");
+        let after = off + n1 + suffix_len as usize;
+        let (value_len, n2) = varint::read(&self.bytes[after..]).expect("validado en parse");
+        &self.bytes[after + n2..after + n2 + value_len as usize]
+    }
+
+    /// Hijo izquierdo del separador `i`. Solo válido en nodos internos.
+    pub fn child(&self, i: usize) -> PageNo {
+        let off = self.slot(i);
+        let (suffix_len, n1) = varint::read(&self.bytes[off..]).expect("validado en parse");
+        let at = off + n1 + suffix_len as usize;
+        u32::from_le_bytes(self.bytes[at..at + 4].try_into().unwrap())
+    }
+
+    /// Clave completa de la celda `i`, reconstruida como prefijo más sufijo.
+    /// Asigna: usar solo donde haga falta la clave entera, no en el descenso.
+    pub fn key(&self, i: usize) -> alloc::vec::Vec<u8> {
+        let mut k = alloc::vec::Vec::with_capacity(self.prefix().len() + self.suffix(i).len());
+        k.extend_from_slice(self.prefix());
+        k.extend_from_slice(self.suffix(i));
+        k
+    }
+}
+
+/// Carga útil de una celda, según el tipo de página.
+#[derive(Debug, Clone, Copy)]
+pub enum CellPayload<'a> {
+    Value(&'a [u8]),
+    Child(PageNo),
+}
+
+/// Prefijo común más largo de un conjunto de claves ya ordenado.
+/// Con las claves ordenadas basta comparar la primera y la última.
+pub fn common_prefix(keys: &[&[u8]]) -> usize {
+    let (Some(first), Some(last)) = (keys.first(), keys.last()) else {
+        return 0;
+    };
+    first
+        .iter()
+        .zip(last.iter())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+pub struct PageBuilder {
+    page_size: usize,
+    page_type: PageType,
+    extra: u32,
+    flags: u8,
+}
+
+impl PageBuilder {
+    pub fn new(page_size: u32, page_type: PageType) -> Self {
+        Self { page_size: page_size as usize, page_type, extra: 0, flags: 0 }
+    }
+
+    pub fn set_extra(&mut self, extra: u32) -> &mut Self {
+        self.extra = extra;
+        self
+    }
+
+    /// Construye la página a partir de entradas **ya ordenadas por clave**.
+    /// Devuelve `None` si no caben: es la señal de dividir, no un error.
+    pub fn build(&self, entries: &[(&[u8], CellPayload)]) -> Option<alloc::vec::Vec<u8>> {
+        let keys: alloc::vec::Vec<&[u8]> = entries.iter().map(|(k, _)| *k).collect();
+        let prefix_len = common_prefix(&keys);
+
+        let mut b = alloc::vec![0u8; self.page_size];
+        let slots_at = PAGE_HEADER_SIZE + prefix_len;
+        let free_start = slots_at + 2 * entries.len();
+        // `free_start`, `cell_start` y cada offset de slot se serializan en un
+        // campo de 2 bytes (u16): el mayor valor representable es 65535, uno
+        // menos que `MAX_PAGE_SIZE` (65536). Sin esta comprobación, una página
+        // vacía del tamaño máximo dejaría `cursor` en exactamente 65536 y
+        // `cursor as u16` truncaría en silencio a 0, produciendo una página
+        // que `parse` rechazaría: justo lo que este constructor debe evitar.
+        if free_start > self.page_size || free_start > u16::MAX as usize {
+            return None;
+        }
+        if let Some(first) = keys.first() {
+            b[PAGE_HEADER_SIZE..slots_at].copy_from_slice(&first[..prefix_len]);
+        }
+
+        // Las celdas crecen desde el final de la página hacia el hueco libre.
+        let mut cursor = self.page_size;
+        let mut tmp = [0u8; 10];
+        for (i, (key, payload)) in entries.iter().enumerate() {
+            let suffix = &key[prefix_len..];
+            let n1 = varint::write(&mut tmp, suffix.len() as u64);
+            let body_len = match payload {
+                CellPayload::Value(v) => varint::len(v.len() as u64) + v.len(),
+                CellPayload::Child(_) => 4,
+            };
+            let cell_len = n1 + suffix.len() + body_len;
+            if cursor.checked_sub(cell_len)? < free_start {
+                return None;
+            }
+            cursor -= cell_len;
+
+            let mut at = cursor;
+            b[at..at + n1].copy_from_slice(&tmp[..n1]);
+            at += n1;
+            b[at..at + suffix.len()].copy_from_slice(suffix);
+            at += suffix.len();
+            match payload {
+                CellPayload::Value(v) => {
+                    let n2 = varint::write(&mut tmp, v.len() as u64);
+                    b[at..at + n2].copy_from_slice(&tmp[..n2]);
+                    at += n2;
+                    b[at..at + v.len()].copy_from_slice(v);
+                }
+                CellPayload::Child(c) => {
+                    b[at..at + 4].copy_from_slice(&c.to_le_bytes());
+                }
+            }
+            let slot = slots_at + 2 * i;
+            b[slot..slot + 2].copy_from_slice(&(cursor as u16).to_le_bytes());
+        }
+
+        // Mismo límite de representación que `free_start`, aplicado a
+        // `cursor` una vez terminado el bucle: es el valor que se guardará
+        // como `cell_start`.
+        if cursor > u16::MAX as usize {
+            return None;
+        }
+
+        b[0] = self.page_type as u8;
+        b[1] = self.flags;
+        b[2..4].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+        b[4..6].copy_from_slice(&(free_start as u16).to_le_bytes());
+        b[6..8].copy_from_slice(&(cursor as u16).to_le_bytes());
+        b[12..16].copy_from_slice(&self.extra.to_le_bytes());
+        b[16..18].copy_from_slice(&(prefix_len as u16).to_le_bytes());
+
+        let mut h = crc32::Hasher::new();
+        h.update(&b[..8]);
+        h.update(&b[12..]);
+        b[8..12].copy_from_slice(&h.finish().to_le_bytes());
+
+        Some(b)
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +427,94 @@ mod tests {
         h.update(&b[12..]);
         let crc = h.finish();
         b[8..12].copy_from_slice(&crc.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn common_prefix_of_shared_keys() {
+        assert_eq!(common_prefix(&[b"abcd".as_slice(), b"abce", b"abzz"]), 2);
+        assert_eq!(common_prefix(&[b"abc".as_slice(), b"abc"]), 3);
+        assert_eq!(common_prefix(&[b"x".as_slice(), b"y"]), 0);
+        assert_eq!(common_prefix(&[b"solo".as_slice()]), 4);
+        assert_eq!(common_prefix(&[]), 0);
+    }
+
+    #[test]
+    fn built_leaf_page_reads_back_identical() {
+        let entries: Vec<(&[u8], CellPayload)> = alloc::vec![
+            (b"logs/0001".as_slice(), CellPayload::Value(b"uno")),
+            (b"logs/0002".as_slice(), CellPayload::Value(b"dos")),
+            (b"logs/0003".as_slice(), CellPayload::Value(b"tres")),
+        ];
+        let raw = PageBuilder::new(512, PageType::Leaf).build(&entries).unwrap();
+        let p = PageRef::parse(&raw, 1).unwrap();
+        assert_eq!(p.prefix(), b"logs/000");
+        assert_eq!(p.n_slots(), 3);
+        assert_eq!(p.search(b"2"), Ok(1));
+    }
+
+    #[test]
+    fn built_internal_page_keeps_children_and_rightmost() {
+        let entries: Vec<(&[u8], CellPayload)> = alloc::vec![
+            (b"m".as_slice(), CellPayload::Child(10)),
+            (b"t".as_slice(), CellPayload::Child(11)),
+        ];
+        let mut b = PageBuilder::new(512, PageType::Internal);
+        b.set_extra(12);
+        let raw = b.build(&entries).unwrap();
+        let p = PageRef::parse(&raw, 1).unwrap();
+        assert_eq!(p.extra(), 12);
+        assert_eq!(p.child(0), 10);
+        assert_eq!(p.child(1), 11);
+    }
+
+    #[test]
+    fn build_returns_none_when_entries_do_not_fit() {
+        let big = alloc::vec![0u8; 400];
+        let entries: Vec<(&[u8], CellPayload)> = alloc::vec![
+            (b"a".as_slice(), CellPayload::Value(&big)),
+            (b"b".as_slice(), CellPayload::Value(&big)),
+        ];
+        assert!(PageBuilder::new(512, PageType::Leaf).build(&entries).is_none());
+    }
+
+    #[test]
+    fn a_single_key_page_stores_the_whole_key_as_prefix() {
+        let entries: Vec<(&[u8], CellPayload)> =
+            alloc::vec![(b"clave".as_slice(), CellPayload::Value(b"v"))];
+        let raw = PageBuilder::new(512, PageType::Leaf).build(&entries).unwrap();
+        let p = PageRef::parse(&raw, 1).unwrap();
+        assert_eq!(p.prefix(), b"clave");
+        assert_eq!(p.suffix(0), b"");
+        assert_eq!(p.value(0), b"v");
+    }
+
+    /// Página vacía al tamaño máximo de página: `cursor` terminaría el
+    /// bucle exactamente en `page_size` (65536), que no cabe en el campo
+    /// `cell_start` de 2 bytes. Antes de la comprobación de límite, `build`
+    /// serializaba esto como 0 y producía una página que `PageRef::parse`
+    /// rechazaba: una ruptura del contrato build/parse.
+    #[test]
+    fn build_refuses_a_page_whose_offsets_would_not_fit_in_u16() {
+        let entries: Vec<(&[u8], CellPayload)> = Vec::new();
+        assert!(PageBuilder::new(65536, PageType::Leaf).build(&entries).is_none());
+    }
+
+    /// El mismo tamaño máximo con contenido real sí debe construirse y
+    /// releerse sin problema: el límite anterior no debe alcanzarse en el
+    /// caso normal.
+    #[test]
+    fn build_at_max_page_size_with_entries_round_trips() {
+        let entries: Vec<(&[u8], CellPayload)> =
+            alloc::vec![(b"k".as_slice(), CellPayload::Value(b"v"))];
+        let raw = PageBuilder::new(65536, PageType::Leaf).build(&entries).unwrap();
+        let p = PageRef::parse(&raw, 1).unwrap();
+        assert_eq!(p.n_slots(), 1);
+        assert_eq!(p.value(0), b"v");
     }
 }
