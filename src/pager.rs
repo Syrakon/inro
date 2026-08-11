@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::header::Geometry;
@@ -24,6 +25,15 @@ pub struct Pager {
     storage: Box<dyn Storage>,
     geometry: Geometry,
     cache: Mutex<Cache>,
+    /// Número de llamadas a `read` desde la creación del `Pager`. Cuenta
+    /// TODA llamada, acierto de caché o no: lo que la tarea 15 necesita
+    /// medir es cuántas veces el código del árbol PIDE una página durante
+    /// un recorrido (el coste que `delete_range` promete mantener
+    /// proporcional a las páginas internas), no cuántas de esas peticiones
+    /// tuvieron que llegar de verdad al medio de almacenamiento — eso ya lo
+    /// mide `MemStorage::read_count`, a una capa de distancia, y con otro
+    /// propósito (el coste de `Db::open` en `tx.rs`).
+    reads: AtomicU64,
 }
 
 struct Cache {
@@ -42,6 +52,7 @@ impl Pager {
                 budget: cache_pages,
                 tick: 0,
             }),
+            reads: AtomicU64::new(0),
         }
     }
 
@@ -72,6 +83,7 @@ impl Pager {
     /// rompe si algún código futuro empieza a leer una meta-página a
     /// través de `Pager::read`.
     pub fn read(&self, page_no: PageNo) -> Result<Arc<[u8]>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         {
             let mut c = self.cache.lock().unwrap();
             c.tick += 1;
@@ -137,6 +149,14 @@ impl Pager {
     #[cfg(test)]
     pub fn cached_pages(&self) -> usize {
         self.cache.lock().unwrap().entries.len()
+    }
+
+    /// Cuenta de páginas leídas expuesta a `Db::pages_read` (`tx.rs`), para
+    /// la prueba de coste de la tarea 15
+    /// (`it_reads_far_fewer_pages_than_it_frees`).
+    #[cfg(test)]
+    pub fn pages_read(&self) -> u64 {
+        self.reads.load(Ordering::Relaxed)
     }
 
     /// Solo para pruebas: si no se pudiera espiar qué páginas concretas

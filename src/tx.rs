@@ -183,6 +183,16 @@ impl Db {
     fn oldest_reader(&self) -> Option<TxnId> {
         self.readers.lock().unwrap().keys().next().copied()
     }
+
+    /// Páginas leídas por el `Pager` desde que se abrió esta base. Solo
+    /// para pruebas: expone `Pager::pages_read` (ver su comentario) para la
+    /// prueba de coste de la tarea 15
+    /// (`it_reads_far_fewer_pages_than_it_frees`), que necesita contar
+    /// páginas, no medir tiempo.
+    #[cfg(test)]
+    pub fn pages_read(&self) -> u64 {
+        self.pager.pages_read()
+    }
 }
 
 impl<'db> ReadTxn<'db> {
@@ -387,6 +397,20 @@ impl<'db> WriteTxn<'db> {
         self.db.pager.geometry().page_size
     }
 
+    /// Total de páginas que ha llegado a tener el fichero hasta ahora
+    /// (vivas o libres). Cota superior del número de páginas DISTINTAS
+    /// alcanzables desde cualquier raíz de un árbol legítimo: en un árbol
+    /// propiamente dicho — sin aliasing, cada página con un único padre —
+    /// nunca hace falta visitar más páginas internas de las que existen en
+    /// el fichero. `free_subtree` y `delete_range_rec` (`tree.rs`, tarea
+    /// 15) la usan para acotar su trabajo total frente a un DAG corrupto
+    /// que comparte hijos entre nodos distintos: ver `RangeBudget` ahí para
+    /// el razonamiento completo de por qué esta cota concreta no rechaza
+    /// nunca un recorrido legítimo, por grande que sea.
+    pub(crate) fn n_pages(&self) -> u32 {
+        self.meta.n_pages
+    }
+
     /// Páginas en uso ahora mismo: asignadas menos libres. Solo para
     /// pruebas, para poder afirmar sobre liberaciones (p. ej. que borrar o
     /// reemplazar un valor de overflow libera de verdad su cadena vieja).
@@ -501,6 +525,21 @@ impl<'db> WriteTxn<'db> {
         let (root, existed) = crate::tree::delete(self, self.meta.root, &full)?;
         self.meta.root = root;
         Ok(existed)
+    }
+
+    /// Borra todas las claves de `[from, to)` dentro del espacio `ns`.
+    ///
+    /// Es la operación que hace viable la poda diaria por retención: los
+    /// números de página de las hojas viven en sus nodos padre, así que
+    /// `delete_range` (`tree.rs`) nunca las lee — vuelca sus punteros a la
+    /// lista de libres en bloque y desengancha el subárbol entero. El coste
+    /// es proporcional al número de páginas internas, no al de entradas
+    /// borradas.
+    pub fn delete_range(&mut self, ns: u8, from: &[u8], to: &[u8]) -> Result<()> {
+        let (a, b) = (scoped(ns, from), scoped(ns, to));
+        let root = crate::tree::delete_range(self, self.meta.root, &a, &b)?;
+        self.meta.root = root;
+        Ok(())
     }
 
     pub fn get(&self, ns: u8, key: &[u8]) -> Result<Option<Vec<u8>>> {

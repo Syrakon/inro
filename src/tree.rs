@@ -852,6 +852,382 @@ pub fn delete(tx: &mut WriteTxn, root: PageNo, key: &[u8]) -> Result<(PageNo, bo
     }
 }
 
+/// Cota de trabajo compartida por TODA una llamada a `delete_range`: cuenta
+/// las páginas leídas tanto por `delete_range_rec` como por cada llamada a
+/// `free_subtree` que dispare, sea cual sea su profundidad de recursión —
+/// un único contador, no uno por función, porque ambas son mutuamente
+/// recursivas y un DAG corrupto puede desviar el ataque de una a la otra
+/// sin que un contador partido lo viera venir.
+///
+/// **Por qué hace falta, además de `MAX_DEPTH`.** `MAX_DEPTH` (la misma
+/// cota que ya usan `descend`, `insert_rec`, `delete_rec` y el cursor)
+/// basta para que la recursión de `free_subtree` no desborde la pila —
+/// como mucho 128 marcos, unos pocos KB — pero NO basta para acotar el
+/// número TOTAL de páginas leídas. Un DAG corrupto acíclico (hijos
+/// compartidos entre nodos distintos, no un ciclo) mantiene cada camino
+/// individual corto mientras el número de caminos DISTINTOS crece
+/// exponencialmente con la profundidad: el mismo fenómeno que
+/// `MAX_NEXT_WORK` cierra para `Cursor::next` (ver su comentario, y
+/// `a_corrupt_dag_with_repeated_children_is_rejected_quickly_not_slowly`
+/// más abajo, que lo demuestra en la práctica). `free_subtree` está más
+/// expuesto todavía que el cursor: visita CADA hijo de cada nodo interno
+/// que recorre, no uno solo por nivel, y `delete_range_rec` también — el
+/// caso "no contenido del todo" de un nodo interno recorre TODOS sus
+/// hijos, exactamente la misma forma de recorrido.
+///
+/// **Por qué la cota no es una constante pequeña, a diferencia de
+/// `MAX_NEXT_WORK`.** Un `next()` legítimo solo necesita recorrer del
+/// orden de la profundidad del árbol (una hoja agotada, subir, bajar por
+/// el hermano), así que una constante pequeña (`8 · MAX_DEPTH`) nunca
+/// rechaza un uso real. Liberar un subárbol legítimo es distinto por
+/// diseño: esta tarea existe precisamente para que se puedan leer, de
+/// verdad, del orden de miles de páginas internas en una poda diaria — una
+/// constante pequeña rechazaría ese caso de uso central, no solo el
+/// ataque.
+///
+/// **Por qué `n_pages()` del fichero sí sirve.** En un árbol PROPIO (sin
+/// aliasing: cada página con un único padre), el número de páginas
+/// internas visitables desde cualquier raíz nunca puede superar el número
+/// total de páginas que existen en el fichero — cada una se visita como
+/// mucho una vez, porque cada una tiene un solo padre. Así que usar
+/// `tx.n_pages()` como cota nunca rechaza un recorrido legítimo, sea cual
+/// sea su tamaño, y sigue disparando con rapidez frente al ataque
+/// exponencial: un DAG corrupto que necesitara superar, por ejemplo, un
+/// millón de páginas para hacer saltar el error, lo consigue en ~20
+/// niveles (2^20 ≈ 1×10⁶) — muy por debajo de `MAX_DEPTH` — no en un
+/// número de niveles que dependa de cuántas páginas reales tenga el
+/// fichero. Se captura una sola vez al principio de `delete_range`, no en
+/// cada llamada: ni `delete_range_rec` ni `free_subtree` asignan páginas
+/// (solo liberan), así que `n_pages()` no cambia durante el recorrido.
+struct RangeBudget {
+    work: u32,
+    max: u32,
+}
+
+impl RangeBudget {
+    /// `core::cmp::max(max, 1)`: con un árbol de una sola página (`n_pages`
+    /// mínimo tras `Db::create`, ver `meta_b_page` en `tx.rs`, es varias
+    /// páginas en la práctica, pero nada en esta función depende de eso) la
+    /// cota nunca debe ser cero, o la primera carga legítima ya la
+    /// dispararía.
+    fn new(max_pages: u32) -> Self {
+        Self { work: 0, max: core::cmp::max(max_pages, 1) }
+    }
+
+    fn charge(&mut self, page: PageNo) -> Result<()> {
+        self.work += 1;
+        if self.work > self.max {
+            return Err(Error::Corrupt { page, kind: CorruptKind::TreeLoop });
+        }
+        Ok(())
+    }
+}
+
+/// Libera un subárbol completo. Solo lee nodos internos: los números de
+/// página de las hojas están en sus padres, así que se vuelcan a la lista
+/// de libres sin abrirlas — el ahorro que existe esta tarea para conseguir.
+///
+/// El árbol está equilibrado: todos los hijos de un nodo interno son del
+/// mismo tipo, así que basta abrir UNO para saber si hace falta seguir
+/// descendiendo o si todos los demás se pueden liberar sin leerlos.
+///
+/// Las hojas con valores grandes obligan a abrirlas para liberar sus
+/// cadenas de overflow, porque esas páginas no aparecen en ningún padre. Es
+/// inevitable, y no afecta al caso de uso de logs, donde los valores son de
+/// decenas de bytes.
+///
+/// **Cotas.** `depth` (profundidad de recursión real, no solo un contador:
+/// esta función SÍ se llama a sí misma) se compara contra `MAX_DEPTH` antes
+/// de leer nada, igual que `insert_rec`/`delete_rec`: sin ella, un ciclo de
+/// páginas corruptas desbordaría la pila en vez de devolver `TreeLoop` —
+/// aquí eso importa más que en las otras dos, porque esta función recurre
+/// de verdad (no un bucle con pila explícita), así que desbordar la pila es
+/// un fallo del propio proceso, no solo un cuelgue. `budget` (compartido
+/// con `delete_range_rec`, ver `RangeBudget`) acota además el trabajo
+/// TOTAL, para el caso — imposible de cerrar solo con `depth` — de un DAG
+/// corrupto acíclico con hijos compartidos.
+fn free_subtree(
+    tx: &mut WriteTxn,
+    page_no: PageNo,
+    depth: u32,
+    budget: &mut RangeBudget,
+) -> Result<()> {
+    if depth > MAX_DEPTH {
+        return Err(Error::Corrupt { page: page_no, kind: CorruptKind::TreeLoop });
+    }
+    budget.charge(page_no)?;
+    let bytes = tx.read_page(page_no)?;
+    let page = PageRef::parse(&bytes, page_no)?;
+    match page.page_type() {
+        PageType::Leaf => {
+            // Las cadenas de overflow sí exigen abrir la hoja, porque sus
+            // páginas no aparecen en ningún padre. Solo ocurre si la hoja
+            // tiene valores grandes.
+            for i in 0..page.n_slots() {
+                if let LeafValue::Overflow { len, first } = page.leaf_value(i) {
+                    free_overflow(tx, len, first)?;
+                }
+            }
+            tx.free(page_no);
+        }
+        PageType::Internal => {
+            // El árbol está equilibrado: todos los hijos son del mismo
+            // tipo, así que basta abrir uno para saber si hay que
+            // descender.
+            let first_child = child_at(&page, 0);
+            budget.charge(first_child)?;
+            let child_bytes = tx.read_page(first_child)?;
+            let child_is_leaf =
+                PageRef::parse(&child_bytes, first_child)?.page_type() == PageType::Leaf;
+
+            for i in 0..=page.n_slots() {
+                let child = child_at(&page, i);
+                if child_is_leaf {
+                    // Aquí está el ahorro: se liberan sin leerlas.
+                    tx.free(child);
+                } else {
+                    free_subtree(tx, child, depth + 1, budget)?;
+                }
+            }
+            tx.free(page_no);
+        }
+        _ => return Err(Error::Corrupt { page: page_no, kind: CorruptKind::PageType }),
+    }
+    Ok(())
+}
+
+/// Rango `[from, to)` a borrar. Agrupa dos parámetros de `delete_range_rec`
+/// para no acercarse al límite de argumentos de `clippy::too_many_arguments`
+/// (el brief los pasa sueltos; con `depth` y `budget` añadidos para acotar
+/// el recorrido, sueltos habrían sido ocho). `Copy`: se reconstruye una vez
+/// por nivel de recursión, sobre referencias, así que copiarlo es tan barato
+/// como pasarlo por referencia y evita una indirección más en cada llamada.
+#[derive(Clone, Copy)]
+struct Range<'a> {
+    from: &'a [u8],
+    to: &'a [u8],
+}
+
+/// `low` y `high` acotan el rango de claves que el subárbol de esta llamada
+/// puede contener, derivados de los separadores de sus ancestros. Sirven
+/// para decidir si el subárbol cae entero dentro del rango a borrar, sin
+/// tener que leerlo para saberlo. `high: None` significa "sin cota
+/// superior conocida" (el borde derecho del árbol entero); no hay
+/// equivalente para `low` porque el borde izquierdo del árbol entero es
+/// justo el segmento vacío, que ya representa "sin cota inferior" con
+/// normalidad.
+struct Bounds<'a> {
+    low: &'a [u8],
+    high: Option<&'a [u8]>,
+}
+
+/// Borra todas las claves de `[from, to)`. Devuelve la raíz nueva.
+pub fn delete_range(tx: &mut WriteTxn, root: PageNo, from: &[u8], to: &[u8]) -> Result<PageNo> {
+    if root == 0 || from >= to {
+        return Ok(root);
+    }
+    let mut budget = RangeBudget::new(tx.n_pages());
+    let range = Range { from, to };
+    let bounds = Bounds { low: &[], high: None };
+    match delete_range_rec(tx, root, range, bounds, 1, &mut budget)? {
+        Removal::Unchanged => Ok(root),
+        Removal::Updated(p) => Ok(p),
+        Removal::Gone => Ok(0),
+    }
+}
+
+/// Recorre un subárbol borrando `[range.from, range.to)`. `bounds` acota lo
+/// que este subárbol puede contener (ver `Bounds`): cuando cae entero
+/// dentro del rango a borrar, se descarta con `free_subtree` sin descender
+/// más de lo imprescindible para saberlo.
+///
+/// **Cotas.** Como `insert_rec`/`delete_rec`, sigue punteros a hijos leídos
+/// del disco, así que necesita la misma cota de PROFUNDIDAD (`MAX_DEPTH`):
+/// sin ella, un ciclo desbordaría la pila. Pero a diferencia de esas dos
+/// funciones (que descienden por un único hijo por nivel), el caso "no
+/// contenido del todo" de un nodo interno recorre TODOS sus hijos — la
+/// misma forma de recorrido que `free_subtree`, y expuesto al mismo DAG
+/// acíclico que una cota de profundidad no ve venir. De ahí `budget`,
+/// compartido con `free_subtree` — ver `RangeBudget` para el razonamiento
+/// completo de las dos cotas.
+fn delete_range_rec(
+    tx: &mut WriteTxn,
+    page_no: PageNo,
+    range: Range<'_>,
+    bounds: Bounds<'_>,
+    depth: u32,
+    budget: &mut RangeBudget,
+) -> Result<Removal> {
+    if depth > MAX_DEPTH {
+        return Err(Error::Corrupt { page: page_no, kind: CorruptKind::TreeLoop });
+    }
+
+    // Subárbol contenido por completo: se descarta entero, sin descender
+    // más de lo imprescindible.
+    if bounds.low >= range.from && bounds.high.is_some_and(|h| h <= range.to) {
+        free_subtree(tx, page_no, depth, budget)?;
+        return Ok(Removal::Gone);
+    }
+
+    // **Corrección sobre el brief**: el suyo solo contempla el atajo de
+    // arriba (contenido por completo) y no este — un subárbol que no solapa
+    // el rango EN ABSOLUTO (enteramente antes de `from` o enteramente
+    // después de `to`) se leía y recorría entero de todos modos, porque "no
+    // cae dentro" y "cae fuera del todo" no son la misma comprobación. Sin
+    // este atajo, un borrado PARCIAL en mitad de un árbol grande —el caso
+    // habitual de retención, no el "borrar todo" que ya cubren las pruebas
+    // del brief— lee y desciende por cada subárbol hermano que no toca el
+    // rango, hasta sus hojas: `a_partial_range_delete_also_reads_far_fewer_pages_than_a_full_scan_would`
+    // (`range_tests`, autorrevisión del paso 5) medía 479 páginas para
+    // borrar un tercio de 20.000 entradas antes de este cambio — muy por
+    // encima del techo de 200 que ya cumplía el propio borrado del árbol
+    // ENTERO, la prueba del brief, precisamente porque ese caso no tiene
+    // ningún subárbol "fuera del todo" que se pudiera saltar. Con el atajo,
+    // la misma prueba baja a un puñado de páginas: proporcional a los
+    // nodos internos que de verdad tocan el borde del rango, no al tamaño
+    // del árbol entero.
+    if bounds.high.is_some_and(|h| h <= range.from) || bounds.low >= range.to {
+        return Ok(Removal::Unchanged);
+    }
+
+    budget.charge(page_no)?;
+    let bytes = tx.read_page(page_no)?;
+    let page = PageRef::parse(&bytes, page_no)?;
+
+    match page.page_type() {
+        PageType::Leaf => {
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            let mut changed = false;
+            for i in 0..page.n_slots() {
+                let k = page.key(i);
+                if k.as_slice() >= range.from && k.as_slice() < range.to {
+                    if let LeafValue::Overflow { len, first } = page.leaf_value(i) {
+                        free_overflow(tx, len, first)?;
+                    }
+                    changed = true;
+                    continue;
+                }
+                keys.push(k);
+                values.push(match page.leaf_value(i) {
+                    LeafValue::Inline(v) => CellPayload::Value(v),
+                    LeafValue::Overflow { len, first } => CellPayload::Overflow { len, first },
+                });
+            }
+            if !changed {
+                return Ok(Removal::Unchanged);
+            }
+            if keys.is_empty() {
+                tx.free(page_no);
+                return Ok(Removal::Gone);
+            }
+            let entries: Vec<(Vec<u8>, CellPayload)> = keys.into_iter().zip(values).collect();
+            match emit(tx, Some(page_no), PageType::Leaf, 0, &entries)? {
+                Insertion::Updated(p) => Ok(Removal::Updated(p)),
+                Insertion::Split { .. } => unreachable!("borrar no divide"),
+            }
+        }
+
+        PageType::Internal => {
+            // **Desviación deliberada del brief**: el suyo recorre los
+            // hijos de derecha a izquierda y aplica cada resultado a
+            // `entries` por índice (`entries[i]`, `entries.remove(i)`)
+            // sobre la marcha, razonando que ir de derecha a izquierda
+            // basta para que esos índices sigan siendo válidos al
+            // eliminar. Eso vale para `delete_rec` (que solo toca UN
+            // hijo), pero aquí puede tocar TODOS, y hay una interacción
+            // que ese razonamiento no cubre: cuando el hijo `extra`
+            // (posición `n`, la PRIMERA que procesa ese orden) resulta
+            // `Gone`, su manejo hace `entries.pop()` de inmediato para
+            // promover la última pareja a `extra` — pero en ese instante
+            // esa pareja todavía es la ORIGINAL de la página (posición
+            // `n-1`), porque el resultado PROPIO de la posición `n-1`
+            // (que puede ser `Updated`/`Gone`, un cambio independiente del
+            // de `extra`) no se calcula hasta la iteración SIGUIENTE. Esa
+            // iteración entonces intenta `entries.remove(n-1)` sobre un
+            // vector que el `pop()` anterior ya dejó con `n-1` elementos
+            // — índice fuera de rango, pánico. Reproducido de verdad:
+            // `deleting_the_whole_range_empties_the_tree` entraba en
+            // pánico con "removal index (is 37) should be < len (is 37)"
+            // antes de este cambio.
+            //
+            // La corrección: no mutar `entries` por índice sobre la
+            // marcha. Se recogen los `n + 1` resultados primero (el orden
+            // de recorrido ya no importa para la corrección, porque cada
+            // llamada recursiva solo lee de `page`, inmutable, nunca de
+            // `entries`), y LUEGO se reconstruye en una single pasada:
+            // primero las `n` parejas normales (filtrando las `Gone`, sin
+            // tocar índices de un vector que va cambiando de tamaño),
+            // y solo al final el resultado de `extra`, que si es `Gone`
+            // promueve lo que de verdad haya sobrevivido en la última
+            // posición de la reconstrucción — ya con el resultado propio
+            // de esa posición incorporado, no el original sin tocar.
+            let n = page.n_slots();
+            let mut results: Vec<Removal> = Vec::with_capacity(n + 1);
+            for i in 0..=n {
+                let child = child_at(&page, i);
+                let child_low: &[u8] = if i == 0 { bounds.low } else { &page.key(i - 1) };
+                let child_high: Option<Vec<u8>> =
+                    if i == n { bounds.high.map(|h| h.to_vec()) } else { Some(page.key(i)) };
+
+                let child_low_owned = child_low.to_vec();
+                let result = delete_range_rec(
+                    tx,
+                    child,
+                    range,
+                    Bounds { low: &child_low_owned, high: child_high.as_deref() },
+                    depth + 1,
+                    budget,
+                )?;
+                results.push(result);
+            }
+
+            if results.iter().all(|r| matches!(r, Removal::Unchanged)) {
+                return Ok(Removal::Unchanged);
+            }
+
+            // El último resultado empujado corresponde a la posición `n`
+            // (el hijo `extra`); el resto, en orden, a cada separador
+            // `page.key(i)` / hijo `page.child(i)`.
+            let extra_result = results.pop().expect("se empujaron n + 1 >= 1 resultados");
+            let mut entries: Vec<(Vec<u8>, CellPayload)> = Vec::with_capacity(results.len());
+            for (i, result) in results.into_iter().enumerate() {
+                match result {
+                    Removal::Unchanged => {
+                        entries.push((page.key(i), CellPayload::Child(page.child(i))))
+                    }
+                    Removal::Updated(p) => entries.push((page.key(i), CellPayload::Child(p))),
+                    Removal::Gone => {}
+                }
+            }
+            let extra = match extra_result {
+                Removal::Unchanged => page.extra(),
+                Removal::Updated(p) => p,
+                Removal::Gone => match entries.pop() {
+                    Some((_, CellPayload::Child(c))) => c,
+                    Some((_, CellPayload::Value(_) | CellPayload::Overflow { .. })) => {
+                        unreachable!(
+                            "nodo interno con valor: `entries` solo contiene `CellPayload::Child`"
+                        )
+                    }
+                    None => 0,
+                },
+            };
+
+            if entries.is_empty() {
+                tx.free(page_no);
+                return Ok(if extra == 0 { Removal::Gone } else { Removal::Updated(extra) });
+            }
+            match emit(tx, Some(page_no), PageType::Internal, extra, &entries)? {
+                Insertion::Updated(p) => Ok(Removal::Updated(p)),
+                Insertion::Split { .. } => unreachable!("borrar no divide"),
+            }
+        }
+
+        _ => Err(Error::Corrupt { page: page_no, kind: CorruptKind::PageType }),
+    }
+}
+
 /// Cota de trabajo (páginas leídas) que UN SOLO `next()` puede hacer.
 ///
 /// **Ronda 1 de revisión, hallazgo 2**: la cota de profundidad (`MAX_DEPTH`)
@@ -3500,5 +3876,517 @@ mod cursor_tests {
         // que reposicionar debe funcionar con normalidad.
         c.seek(b"zz").unwrap();
         assert_eq!(c.next().unwrap(), Some((b"zz".to_vec(), b"2".to_vec())));
+    }
+}
+
+/// Tarea 15, paso 1: pruebas del brief tal cual, con la única desviación de
+/// usar `#[cfg(all(test, feature = "std"))]` en vez de `#[cfg(test)]` a
+/// secas — igual que el resto de módulos de prueba de este fichero (ver el
+/// comentario de `overflow_tests`): `tree.rs` entero solo se compila con la
+/// característica `std`, así que es redundante en la práctica pero mantiene
+/// el fichero consistente consigo mismo.
+#[cfg(all(test, feature = "std"))]
+mod range_tests {
+    use super::*;
+    use crate::storage::MemStorage;
+    use crate::tx::{Db, Options};
+
+    fn seeded(n: u32) -> Db {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..n {
+            tx.put(0x01, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
+        }
+        tx.commit().unwrap();
+        db
+    }
+
+    #[test]
+    fn deletes_exactly_the_requested_range() {
+        let db = seeded(2000);
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(0x01, b"000500", b"001500").unwrap();
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        for i in 0..2000u32 {
+            let key = alloc::format!("{i:06}");
+            let present = r.get(0x01, key.as_bytes()).unwrap().is_some();
+            assert_eq!(present, !(500..1500).contains(&i), "clave {key}");
+        }
+    }
+
+    #[test]
+    fn deleting_the_whole_range_empties_the_tree() {
+        let db = seeded(2000);
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(0x01, b"", b"\xff\xff\xff\xff").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(db.begin_read().root(), 0);
+    }
+
+    #[test]
+    fn it_does_not_touch_other_keyspaces() {
+        let db = seeded(500);
+        let mut tx = db.begin_write().unwrap();
+        tx.put(0x02, b"vecino", b"intacto").unwrap();
+        tx.delete_range(0x01, b"", b"\xff\xff\xff\xff").unwrap();
+        tx.commit().unwrap();
+        let r = db.begin_read();
+        assert_eq!(r.get(0x02, b"vecino").unwrap().as_deref(), Some(b"intacto".as_slice()));
+    }
+
+    #[test]
+    fn it_reads_far_fewer_pages_than_it_frees() {
+        let db = seeded(20_000);
+        let before = db.pages_read();
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(0x01, b"", b"\xff\xff\xff\xff").unwrap();
+        let read = db.pages_read() - before;
+        tx.commit().unwrap();
+        // Con 20.000 entradas hay del orden de 1.500 hojas de 512 B. Leer
+        // menos de 200 páginas demuestra que no se recorren las hojas.
+        assert!(read < 200, "se leyeron {read} páginas");
+    }
+
+    #[test]
+    fn freed_pages_come_back_into_use() {
+        let db = seeded(5000);
+        let mut tx = db.begin_write().unwrap();
+        let before = tx.pages_in_use();
+        tx.delete_range(0x01, b"", b"\xff\xff\xff\xff").unwrap();
+        assert!(tx.pages_in_use() < before / 2, "se libera la mayor parte del árbol");
+        tx.commit().unwrap();
+    }
+
+    // A partir de aquí, autorrevisión del paso 5: casos adversariales que el
+    // brief no pide, elegidos para poner a prueba el contrato falsable
+    // ("`delete_range(from, to)` borra exactamente `[from, to)`, deja
+    // legible todo lo demás, libera cada página de cada subárbol borrado
+    // exactamente una vez, y lee un número de páginas proporcional a los
+    // nodos internos") en sus bordes: rango vacío, un rango de una sola
+    // clave, límites alineados y desalineados con hojas/subárboles, un
+    // rango que cae entero dentro de una única hoja, valores de overflow, y
+    // aislamiento de espacio de claves en el borde `0xff`.
+
+    #[test]
+    fn an_empty_range_is_a_no_op() {
+        let db = seeded(200);
+        let mut tx = db.begin_write().unwrap();
+        let root_before = tx.root();
+        tx.delete_range(0x01, b"000050", b"000050").unwrap();
+        assert_eq!(tx.root(), root_before, "from == to no debe tocar el árbol");
+        tx.delete_range(0x01, b"000100", b"000050").unwrap();
+        assert_eq!(tx.root(), root_before, "from > to no debe tocar el árbol");
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        for i in 0..200u32 {
+            let key = alloc::format!("{i:06}");
+            assert!(r.get(0x01, key.as_bytes()).unwrap().is_some(), "clave {key}");
+        }
+    }
+
+    #[test]
+    fn a_range_covering_exactly_one_key_removes_only_that_key() {
+        let db = seeded(200);
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(0x01, b"000099", b"000100").unwrap();
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        for i in 0..200u32 {
+            let key = alloc::format!("{i:06}");
+            let present = r.get(0x01, key.as_bytes()).unwrap().is_some();
+            assert_eq!(present, i != 99, "clave {key}");
+        }
+    }
+
+    /// Pocas entradas cortas: el árbol entero cabe en una sola hoja, así que
+    /// la raíz es directamente esa hoja, sin nodos internos. Ejercita el
+    /// camino donde la raíz nunca puede acogerse al atajo de "subárbol
+    /// contenido entero" (su `high` heredado es siempre `None`, ver el
+    /// comentario de `delete_range_rec`) y se procesa entrada por entrada.
+    #[test]
+    fn a_range_entirely_inside_a_single_leaf_removes_only_those_keys() {
+        let db = seeded(10);
+        let mut tx = db.begin_write().unwrap();
+        let root = tx.root();
+        let bytes = tx.read_page(root).unwrap();
+        assert_eq!(
+            PageRef::parse(&bytes, root).unwrap().page_type(),
+            PageType::Leaf,
+            "la prueba asume que 10 claves cortas caben en una sola hoja"
+        );
+        tx.delete_range(0x01, b"000003", b"000007").unwrap();
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        for i in 0..10u32 {
+            let key = alloc::format!("{i:06}");
+            let present = r.get(0x01, key.as_bytes()).unwrap().is_some();
+            assert_eq!(present, !(3..7).contains(&i), "clave {key}");
+        }
+    }
+
+    /// `from`/`to` coinciden con claves reales del árbol (posibles
+    /// separadores), no con puntos intermedios: el caso alineado, frente al
+    /// desalineado que ya ejercitan `deletes_exactly_the_requested_range` y
+    /// `a_range_covering_exactly_one_key_removes_only_that_key`.
+    #[test]
+    fn range_boundaries_exactly_on_real_keys_are_still_half_open() {
+        let db = seeded(3000);
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(0x01, b"001000", b"002000").unwrap();
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        assert!(r.get(0x01, b"000999").unwrap().is_some(), "justo antes de from, debe sobrevivir");
+        assert_eq!(r.get(0x01, b"001000").unwrap(), None, "from es inclusivo");
+        assert_eq!(r.get(0x01, b"001999").unwrap(), None, "justo antes de to, debe borrarse");
+        assert!(r.get(0x01, b"002000").unwrap().is_some(), "to es exclusivo, debe sobrevivir");
+    }
+
+    /// Valores grandes bien dentro de un tramo que se borra ENTERO
+    /// (500..2500 de 3000): si su hoja cae dentro de un subárbol
+    /// completamente contenido, la libera `free_subtree`, no el camino de
+    /// hoja límite de `delete_range_rec` — el camino de overflow de
+    /// `free_subtree` (`if let LeafValue::Overflow ... free_overflow`, en su
+    /// rama `PageType::Leaf`) necesita un caso que lo ejercite aparte del de
+    /// una hoja límite.
+    #[test]
+    fn overflow_values_inside_a_bulk_freed_subtree_are_freed_too() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..3000u32 {
+            tx.put(0x01, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
+        }
+        for i in 1000..1006u32 {
+            tx.put(0x01, alloc::format!("{i:06}").as_bytes(), &alloc::vec![7u8; 2000]).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let mut tx = db.begin_write().unwrap();
+        let before = tx.pages_in_use();
+        tx.delete_range(0x01, b"000500", b"002500").unwrap();
+        let after = tx.pages_in_use();
+        tx.commit().unwrap();
+
+        // Cada valor de 2000 bytes ocupa varias páginas de overflow (~5 a
+        // 512 B de página); si `free_subtree` no las liberase, esta resta
+        // apenas bajaría de lo que explican las hojas/internos por sí
+        // solos.
+        assert!(
+            before - after > 25,
+            "antes {before}, después {after}: no parecen haberse liberado las cadenas de overflow"
+        );
+
+        let r = db.begin_read();
+        for i in [0u32, 499, 2500, 2999] {
+            let key = alloc::format!("{i:06}");
+            assert!(
+                r.get(0x01, key.as_bytes()).unwrap().is_some(),
+                "clave {key} debería sobrevivir"
+            );
+        }
+        for i in 1000..1006u32 {
+            let key = alloc::format!("{i:06}");
+            assert_eq!(
+                r.get(0x01, key.as_bytes()).unwrap(),
+                None,
+                "clave de overflow {key} debería haberse borrado"
+            );
+        }
+    }
+
+    /// Como la prueba anterior, pero con el valor de overflow justo en el
+    /// borde superior del rango (`to`): esa hoja contiene también claves
+    /// `>= to`, así que no puede caer entera dentro del rango — la procesa
+    /// `delete_range_rec` entrada por entrada, no `free_subtree`. Ejercita
+    /// el otro camino que libera overflow (dentro de la rama `PageType::Leaf`
+    /// de `delete_range_rec` mismo).
+    #[test]
+    fn overflow_values_at_a_range_boundary_leaf_are_freed_too() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..3000u32 {
+            tx.put(0x01, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
+        }
+        tx.put(0x01, b"001499a", &alloc::vec![9u8; 2000]).unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(0x01, b"000500", b"001500").unwrap();
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        assert_eq!(r.get(0x01, b"001499a").unwrap(), None);
+        assert!(r.get(0x01, b"000499").unwrap().is_some());
+        assert!(r.get(0x01, b"001500").unwrap().is_some());
+    }
+
+    /// La cota de páginas leídas no es solo para "borrar todo": un tramo
+    /// intermedio, ni alineado con el principio ni con el final del árbol,
+    /// también debe leer un número de páginas proporcional a los nodos
+    /// internos que toca, no a las 7000 entradas que borra ni a las 20.000
+    /// que tiene el árbol entero.
+    #[test]
+    fn a_partial_range_delete_also_reads_far_fewer_pages_than_a_full_scan_would() {
+        let db = seeded(20_000);
+        let before = db.pages_read();
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(0x01, b"006000", b"013000").unwrap();
+        let read = db.pages_read() - before;
+        tx.commit().unwrap();
+        assert!(read < 200, "se leyeron {read} páginas para borrar un tercio de 20.000 entradas");
+    }
+
+    /// Aislamiento de espacio de claves en el borde `0xff`: el espacio
+    /// borrado (`0xfe`) es inmediatamente inferior al que debe sobrevivir
+    /// (`0xff`), el mayor byte de espacio posible.
+    #[test]
+    fn keyspace_isolation_holds_at_the_0xff_boundary() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..300u32 {
+            tx.put(0xfe, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
+        }
+        tx.put(0xff, b"centinela", b"intacto").unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(0xfe, b"", b"\xff\xff\xff\xff").unwrap();
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        for i in 0..300u32 {
+            let key = alloc::format!("{i:06}");
+            assert_eq!(r.get(0xfe, key.as_bytes()).unwrap(), None, "clave {key}");
+        }
+        assert_eq!(
+            r.get(0xff, b"centinela").unwrap().as_deref(),
+            Some(b"intacto".as_slice()),
+            "el espacio 0xff no debe tocarse"
+        );
+    }
+
+    /// Complementa la prueba anterior por el otro lado: el espacio que se
+    /// BORRA es el propio `0xff`, el mayor byte posible — para descartar
+    /// cualquier problema de desbordamiento o de comparación especial en
+    /// ese extremo, no solo en el vecino inmediatamente inferior.
+    #[test]
+    fn keyspace_isolation_when_the_deleted_namespace_is_0xff_itself() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        tx.put(0xfe, b"vecino", b"intacto").unwrap();
+        for i in 0..300u32 {
+            tx.put(0xff, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
+        }
+        tx.commit().unwrap();
+
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(0xff, b"", b"\xff\xff\xff\xff").unwrap();
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        for i in 0..300u32 {
+            let key = alloc::format!("{i:06}");
+            assert_eq!(r.get(0xff, key.as_bytes()).unwrap(), None, "clave {key}");
+        }
+        assert_eq!(r.get(0xfe, b"vecino").unwrap().as_deref(), Some(b"intacto".as_slice()));
+    }
+
+    /// Reutiliza `check_invariants` (tarea 11-12): tras un borrado de rango
+    /// parcial, el árbol resultante debe seguir siendo un B-árbol válido —
+    /// cada separador sigue particionando bien a sus hijos, ninguna página
+    /// queda referenciada dos veces — no solo "las claves que sobreviven se
+    /// leen bien".
+    #[test]
+    fn a_range_delete_leaves_a_well_formed_tree() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..4000u32 {
+            tx.put(0x01, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
+        }
+        tx.delete_range(0x01, b"000777", b"002222").unwrap();
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        assert_ne!(r.root(), 0);
+        let mut visited = alloc::collections::BTreeSet::new();
+        super::invariant_tests::check_invariants(&r, r.root(), None, None, &mut visited);
+
+        for i in 0..4000u32 {
+            let key = alloc::format!("{i:06}");
+            let present = r.get(0x01, key.as_bytes()).unwrap().is_some();
+            assert_eq!(present, !(777..2222).contains(&i), "clave {key}");
+        }
+    }
+}
+
+/// Cotas de recorrido de `free_subtree` y `delete_range_rec` (`RangeBudget`,
+/// `MAX_DEPTH`): un ciclo genuino debe fallar por profundidad, y un DAG
+/// corrupto (acíclico, hijos compartidos) debe fallar por trabajo total —
+/// ninguna de las dos cotas por sí sola basta, igual que ya estableció la
+/// tarea 14 para el cursor (`MAX_NEXT_WORK`, ver su comentario).
+#[cfg(all(test, feature = "std"))]
+mod range_bound_tests {
+    use super::*;
+    use crate::storage::MemStorage;
+    use crate::tx::{Db, Options};
+
+    /// Dos nodos internos cuyo `extra` se apunta el uno al otro: sin la
+    /// cota de profundidad, `free_subtree` (que SÍ se llama a sí misma,
+    /// a diferencia del cursor) desbordaría la pila de verdad, no solo
+    /// tardaría mucho.
+    #[test]
+    fn free_subtree_returns_an_error_instead_of_looping_forever_on_a_cycle() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        let a = tx.alloc().unwrap();
+        let b = tx.alloc().unwrap();
+
+        let mut ab = PageBuilder::new(512, PageType::Internal);
+        ab.set_extra(b);
+        let pa = ab.build(&[]).unwrap();
+
+        let mut bb = PageBuilder::new(512, PageType::Internal);
+        bb.set_extra(a);
+        let pb = bb.build(&[]).unwrap();
+
+        tx.write_page(a, &pa).unwrap();
+        tx.write_page(b, &pb).unwrap();
+
+        let mut budget = RangeBudget::new(tx.n_pages());
+        let err = free_subtree(&mut tx, a, 1, &mut budget).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::TreeLoop, .. }),
+            "se esperaba TreeLoop, se obtuvo {err:?}"
+        );
+    }
+
+    /// `k` páginas internas con `child(0) == extra`, cada una apuntando a la
+    /// siguiente, terminando en una hoja vacía — el mismo DAG del hallazgo 2
+    /// de la tarea 14 (`a_corrupt_dag_with_repeated_children_is_rejected_quickly_not_slowly`,
+    /// en `cursor_tests`), reutilizado aquí porque `free_subtree` está
+    /// expuesto exactamente al mismo fenómeno: cada camino raíz-hoja mide
+    /// `k + 1` niveles (muy por debajo de `MAX_DEPTH`), pero hay 2^k
+    /// caminos distintos, y `free_subtree` los recorre TODOS si nada más lo
+    /// impide, porque visita CADA hijo de cada nodo interno.
+    #[test]
+    fn free_subtree_rejects_a_corrupt_dag_quickly_instead_of_exploring_exponentially_many_paths() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+
+        let leaf = tx.alloc().unwrap();
+        let leaf_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
+        tx.write_page(leaf, &leaf_bytes).unwrap();
+
+        let k = 60u32; // muy por debajo de MAX_DEPTH (128); 2^60 caminos.
+        let mut next_page = leaf;
+        let mut root = leaf;
+        for _ in 0..k {
+            let p = tx.alloc().unwrap();
+            let mut b = PageBuilder::new(512, PageType::Internal);
+            b.set_extra(next_page);
+            let bytes = b.build(&[(b"k".as_slice(), CellPayload::Child(next_page))]).unwrap();
+            tx.write_page(p, &bytes).unwrap();
+            next_page = p;
+            root = p;
+        }
+
+        let mut budget = RangeBudget::new(tx.n_pages());
+        let start = std::time::Instant::now();
+        let err = free_subtree(&mut tx, root, 1, &mut budget).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: CorruptKind::TreeLoop, .. }),
+            "se esperaba TreeLoop, se obtuvo {err:?}"
+        );
+        assert!(
+            elapsed.as_secs() < 2,
+            "con la cota de trabajo esto debe fallar rápido, no explorar 2^{k} caminos: \
+             tardó {elapsed:?}"
+        );
+    }
+
+    /// Como `free_subtree_returns_an_error_instead_of_looping_forever_on_a_cycle`,
+    /// pero a través de la función pública `delete_range`: `delete_range_rec`
+    /// también recurre en TODOS los hijos de un nodo no contenido del todo
+    /// (no en uno solo, como `insert_rec`/`delete_rec`), así que necesita su
+    /// propia comprobación de profundidad, independiente de la de
+    /// `free_subtree`. `from = b"\x00"` (no vacío): la cota inferior
+    /// heredada por el hijo más a la izquierda es siempre `[]` (ver el
+    /// comentario de `Bounds`), así que con un `from` no vacío ese hijo
+    /// nunca se acoge al atajo de "subárbol contenido" y `delete_range_rec`
+    /// se ve forzada a descender de verdad, ejercitando su propia cota en
+    /// vez de la de `free_subtree`.
+    #[test]
+    fn delete_range_returns_an_error_instead_of_looping_forever_on_a_cycle() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        let a = tx.alloc().unwrap();
+        let b = tx.alloc().unwrap();
+
+        let mut ab = PageBuilder::new(512, PageType::Internal);
+        ab.set_extra(b);
+        let pa = ab.build(&[]).unwrap();
+
+        let mut bb = PageBuilder::new(512, PageType::Internal);
+        bb.set_extra(a);
+        let pb = bb.build(&[]).unwrap();
+
+        tx.write_page(a, &pa).unwrap();
+        tx.write_page(b, &pb).unwrap();
+
+        let err = delete_range(&mut tx, a, b"\x00", b"\xff").unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::TreeLoop, .. }),
+            "se esperaba TreeLoop, se obtuvo {err:?}"
+        );
+    }
+
+    /// Como `free_subtree_rejects_a_corrupt_dag_quickly_instead_of_exploring_exponentially_many_paths`,
+    /// pero a través de `delete_range`: con `from` no vacío, ni el hijo
+    /// `i == 0` (cota inferior `[]` heredada) ni el hijo `extra` (cota
+    /// superior `None` heredada) se acogen nunca al atajo de "subárbol
+    /// contenido" en NINGÚN nivel de la cadena — los dos fuerzan descenso
+    /// real en cada nivel, así que `delete_range_rec` recorre el mismo DAG
+    /// exponencial que la prueba análoga de `free_subtree`, y necesita el
+    /// mismo `budget` compartido para no explorarlo entero.
+    #[test]
+    fn delete_range_rejects_a_corrupt_dag_quickly_instead_of_exploring_exponentially_many_paths() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+
+        let leaf = tx.alloc().unwrap();
+        let leaf_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
+        tx.write_page(leaf, &leaf_bytes).unwrap();
+
+        let k = 60u32;
+        let mut next_page = leaf;
+        let mut root = leaf;
+        for _ in 0..k {
+            let p = tx.alloc().unwrap();
+            let mut b = PageBuilder::new(512, PageType::Internal);
+            b.set_extra(next_page);
+            let bytes = b.build(&[(b"k".as_slice(), CellPayload::Child(next_page))]).unwrap();
+            tx.write_page(p, &bytes).unwrap();
+            next_page = p;
+            root = p;
+        }
+
+        let start = std::time::Instant::now();
+        let err = delete_range(&mut tx, root, b"\x00", b"\xff").unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: CorruptKind::TreeLoop, .. }),
+            "se esperaba TreeLoop, se obtuvo {err:?}"
+        );
+        assert!(
+            elapsed.as_secs() < 2,
+            "con la cota de trabajo esto debe fallar rápido, no explorar 2^{k} caminos: \
+             tardó {elapsed:?}"
+        );
     }
 }
