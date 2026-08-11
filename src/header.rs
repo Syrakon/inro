@@ -5,7 +5,13 @@ pub const MAGIC: &[u8; 8] = b"INRO\0DB\x01";
 pub const FORMAT_MAJOR: u16 = 1;
 
 pub const MIN_PAGE_SIZE: u32 = 512;
-pub const MAX_PAGE_SIZE: u32 = 65_536;
+/// 32 KB, no 64 KB. El campo `cell_start` de la cabecera de página es `u16` y no
+/// puede expresar 65536, así que una página sin celdas a ese tamaño se truncaría a
+/// cero y `parse` la rechazaría — lo que dejaría inservibles las páginas de lista de
+/// libres y de overflow, que siempre escriben `cell_start = page_size`. Bajar el
+/// máximo elimina la clase entera de fallo sin tocar el formato, y no cuesta nada:
+/// el motor usa 512 B por defecto y 4 KB en los tiers grandes.
+pub const MAX_PAGE_SIZE: u32 = 32_768;
 
 /// Cifrado activo. Fijo en la creación: activarlo después exigiría reescribir
 /// todas las páginas.
@@ -38,8 +44,8 @@ impl Geometry {
             self.page_size
         );
         debug_assert!(
-            (9..=16).contains(&self.page_size.trailing_zeros()),
-            "page_size {} fuera del rango admitido de 512 B a 64 KB",
+            (9..=15).contains(&self.page_size.trailing_zeros()),
+            "page_size {} fuera del rango admitido de 512 B a 32 KB",
             self.page_size
         );
         let mut b = [0u8; HEADER_SIZE];
@@ -74,7 +80,7 @@ impl Geometry {
             return Err(Error::VersionTooNew { found: format_major, supported: FORMAT_MAJOR });
         }
         let log2 = b[12] as u32;
-        if !(9..=16).contains(&log2) {
+        if !(9..=15).contains(&log2) {
             return Err(Error::BadFormat);
         }
         Ok(Self {
@@ -126,7 +132,7 @@ mod tests {
     #[test]
     fn roundtrip_at_max_page_size() {
         let mut g = sample();
-        g.page_size = MAX_PAGE_SIZE; // 65_536 (log2 = 16)
+        g.page_size = MAX_PAGE_SIZE; // 32_768 (log2 = 15)
         assert_eq!(Geometry::decode(&g.encode()).unwrap(), g);
     }
 
@@ -168,7 +174,7 @@ mod tests {
 
     #[test]
     fn rejects_an_impossible_page_size() {
-        for log2 in [0u8, 8, 17] {
+        for log2 in [0u8, 8, 16] {
             let mut bytes = sample().encode();
             bytes[12] = log2;
             fix_crc(&mut bytes);
