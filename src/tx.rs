@@ -324,8 +324,28 @@ impl<'db> WriteTxn<'db> {
     }
 
     /// Toma una página libre reutilizable o extiende el fichero.
+    ///
+    /// El límite de reciclado no es solo el lector vivo más antiguo: la meta
+    /// confirmada es, ella misma, un lector implícito hasta que ESTA
+    /// transacción confirme. Sin este suelo, liberar en la transacción N una
+    /// página que todavía pertenece al árbol confirmado en N-1 y reciclarla
+    /// dentro de la misma N — exactamente cuando `oldest_reader` devuelve
+    /// `None` porque no hay ningún lector real, así que la comprobación de
+    /// `Freelist::pop` no protege nada — deja la meta N-1 apuntando a una
+    /// página que esta misma transacción ya sobrescribió. Si N nunca llega a
+    /// confirmar, la recuperación monta desde N-1 y esa página es basura:
+    /// corrompe el árbol YA confirmado, no solo la transacción abortada.
+    /// `WriteTxn::Drop` no lo repara — deshace la lista de libres en
+    /// memoria, no lo que ya se escribió en disco — y un corte de corriente
+    /// nunca llega a ejecutar `Drop`. `min` con el lector real más antiguo
+    /// (si lo hay) conserva ese límite tal cual: la meta confirmada nunca es
+    /// más reciente que cualquier lector real vivo.
     pub fn alloc(&mut self) -> Result<PageNo> {
-        let oldest = self.db.oldest_reader();
+        let committed_txn = self.db.committed.read().unwrap().0.txn_id;
+        let oldest = Some(match self.db.oldest_reader() {
+            Some(r) => core::cmp::min(r, committed_txn),
+            None => committed_txn,
+        });
         let pager = &self.db.pager;
         if let Some(p) = self.state().freelist.pop_refill(pager, oldest)? {
             return Ok(p);
@@ -628,5 +648,44 @@ mod tests {
         let q = tx.alloc().unwrap();
         assert_eq!(q, p, "p se perdió: el abort no debió dejarla fuera de la lista de libres para siempre");
         tx.commit().unwrap();
+    }
+
+    /// Regresión del hallazgo 1 de la revisión de la tarea 12: sin lectores
+    /// vivos, `free` seguido de `alloc` dentro de la MISMA transacción sin
+    /// confirmar reciclaba una página que todavía pertenece al árbol
+    /// confirmado — la meta confirmada actúa como un lector implícito que
+    /// `oldest_reader` por sí solo no representa. Comprueba las dos mitades
+    /// del contrato: que `alloc` no entrega esa página, y que abortar la
+    /// transacción (sin `commit`) no deja ningún byte en disco distinto de
+    /// como estaba.
+    #[test]
+    fn freeing_a_committed_page_is_not_reused_within_the_same_uncommitted_transaction() {
+        let (s, db) = fresh();
+        let mut tx = db.begin_write().unwrap();
+        let p = tx.alloc().unwrap();
+        tx.write_page(p, &alloc::vec![7u8; 512]).unwrap();
+        tx.set_root(p);
+        tx.commit().unwrap();
+
+        let before = s.snapshot();
+
+        {
+            let mut tx = db.begin_write().unwrap();
+            tx.free(p);
+            let q = tx.alloc().unwrap();
+            assert_ne!(
+                q, p,
+                "p sigue vivo en el árbol confirmado: reciclarla ya, sin que esta transacción \
+                 haya confirmado, dejaría la meta confirmada apuntando a basura si hay un corte \
+                 antes del commit"
+            );
+            // se descarta sin commit: ni `q` ni el free() de `p` deben tocar disco.
+        }
+
+        let after = s.snapshot();
+        assert_eq!(
+            before, after,
+            "abortar sin commit no debe cambiar ni un byte del fichero ya confirmado"
+        );
     }
 }
