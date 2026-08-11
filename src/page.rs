@@ -230,7 +230,21 @@ impl PageBuilder {
 
     /// Construye la página a partir de entradas **ya ordenadas por clave**.
     /// Devuelve `None` si no caben: es la señal de dividir, no un error.
+    ///
+    /// Precondición no verificada en release: `entries` debe venir ordenado
+    /// por clave y sin duplicados. Si no lo está, `&key[prefix_len..]` puede
+    /// entrar en pánico más abajo con un slice fuera de rango, porque
+    /// `prefix_len` se deriva solo de la primera y la última clave (ver
+    /// `common_prefix`) y una clave intermedia puede ser más corta que ese
+    /// prefijo.
     pub fn build(&self, entries: &[(&[u8], CellPayload)]) -> Option<alloc::vec::Vec<u8>> {
+        debug_assert!(
+            entries.windows(2).all(|w| w[0].0 < w[1].0),
+            "las entradas de PageBuilder::build deben venir ordenadas por clave y sin \
+             duplicados: la entrada en el índice {} no es mayor que la anterior",
+            entries.windows(2).position(|w| w[0].0 >= w[1].0).map_or(0, |i| i + 1)
+        );
+
         let keys: alloc::vec::Vec<&[u8]> = entries.iter().map(|(k, _)| *k).collect();
         let prefix_len = common_prefix(&keys);
 
@@ -238,11 +252,12 @@ impl PageBuilder {
         let slots_at = PAGE_HEADER_SIZE + prefix_len;
         let free_start = slots_at + 2 * entries.len();
         // `free_start`, `cell_start` y cada offset de slot se serializan en un
-        // campo de 2 bytes (u16): el mayor valor representable es 65535, uno
-        // menos que `MAX_PAGE_SIZE` (65536). Sin esta comprobación, una página
-        // vacía del tamaño máximo dejaría `cursor` en exactamente 65536 y
-        // `cursor as u16` truncaría en silencio a 0, produciendo una página
-        // que `parse` rechazaría: justo lo que este constructor debe evitar.
+        // campo de 2 bytes (u16): el mayor valor representable es 65535.
+        // `PageBuilder` no conoce `header::MAX_PAGE_SIZE` (32 KB desde que se
+        // eligió justo para evitar esto) — esta comprobación es defensa en
+        // profundidad: sin ella, una página vacía a `page_size == 65536`
+        // dejaría `cursor` en exactamente 65536 y `cursor as u16` truncaría
+        // en silencio a 0, produciendo una página que `parse` rechazaría.
         if free_start > self.page_size || free_start > u16::MAX as usize {
             return None;
         }
@@ -473,6 +488,21 @@ mod builder_tests {
         assert_eq!(p.child(1), 11);
     }
 
+    /// Precondición de `build`: entradas ordenadas y sin duplicados. Con
+    /// `debug_assertions` activas (perfil de pruebas por defecto), pasar
+    /// entradas desordenadas debe entrar en pánico en vez de seguir hasta el
+    /// slice fuera de rango de `&key[prefix_len..]`.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no es mayor que la anterior")]
+    fn build_panics_on_unsorted_entries_in_debug() {
+        let entries: Vec<(&[u8], CellPayload)> = alloc::vec![
+            (b"b".as_slice(), CellPayload::Value(b"1")),
+            (b"a".as_slice(), CellPayload::Value(b"2")),
+        ];
+        let _ = PageBuilder::new(512, PageType::Leaf).build(&entries);
+    }
+
     #[test]
     fn build_returns_none_when_entries_do_not_fit() {
         let big = alloc::vec![0u8; 400];
@@ -494,22 +524,28 @@ mod builder_tests {
         assert_eq!(p.value(0), b"v");
     }
 
-    /// Página vacía al tamaño máximo de página: `cursor` terminaría el
-    /// bucle exactamente en `page_size` (65536), que no cabe en el campo
+    /// `PageBuilder` no conoce `header::MAX_PAGE_SIZE` (32 KB): acepta
+    /// cualquier `u32` como `page_size`, así que su propia comprobación de
+    /// límite de `u16` es defensa en profundidad, no solo un reflejo del
+    /// límite actual de `Geometry`. A `page_size == 65536` una página vacía
+    /// dejaría `cursor` en exactamente 65536, que no cabe en el campo
     /// `cell_start` de 2 bytes. Antes de la comprobación de límite, `build`
     /// serializaba esto como 0 y producía una página que `PageRef::parse`
-    /// rechazaba: una ruptura del contrato build/parse.
+    /// rechazaba: una ruptura del contrato build/parse. `Geometry` ya no
+    /// deja llegar a este `page_size` por la vía normal (tarea 6, cambio
+    /// posterior que bajó `MAX_PAGE_SIZE` a 32 KB), pero `build` debe seguir
+    /// rechazándolo si algún llamante lo pasara de todos modos.
     #[test]
     fn build_refuses_a_page_whose_offsets_would_not_fit_in_u16() {
         let entries: Vec<(&[u8], CellPayload)> = Vec::new();
         assert!(PageBuilder::new(65536, PageType::Leaf).build(&entries).is_none());
     }
 
-    /// El mismo tamaño máximo con contenido real sí debe construirse y
+    /// El mismo límite de `u16` con contenido real sí debe construirse y
     /// releerse sin problema: el límite anterior no debe alcanzarse en el
     /// caso normal.
     #[test]
-    fn build_at_max_page_size_with_entries_round_trips() {
+    fn build_at_the_u16_offset_boundary_with_entries_round_trips() {
         let entries: Vec<(&[u8], CellPayload)> =
             alloc::vec![(b"k".as_slice(), CellPayload::Value(b"v"))];
         let raw = PageBuilder::new(65536, PageType::Leaf).build(&entries).unwrap();
