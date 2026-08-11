@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use crate::crypto::Encryption;
 use crate::header::Geometry;
@@ -24,7 +24,14 @@ struct Entry {
 /// medio de almacenamiento y se delega el cacheo al sistema operativo.
 pub struct Pager {
     storage: Box<dyn Storage>,
-    geometry: Geometry,
+    /// `RwLock`, no un campo plano (tarea 18): la reubicación de la meta B
+    /// necesita cambiarlo en caliente (`set_geometry`, más abajo) desde
+    /// `WriteTxn`, que solo tiene `&Db` — nunca `&mut` — así que la mutación
+    /// tiene que vivir detrás de una interior. `Geometry` es `Copy` de 48
+    /// bytes: se lee una vez por operación (`geometry()` devuelve una copia,
+    /// no una referencia) y el coste de esa copia es irrelevante frente a
+    /// una lectura de página.
+    geometry: RwLock<Geometry>,
     cache: Mutex<Cache>,
     /// Número de llamadas a `read` desde la creación del `Pager`. Cuenta
     /// TODA llamada, acierto de caché o no: lo que la tarea 15 necesita
@@ -57,7 +64,7 @@ impl Pager {
     pub fn new(storage: Box<dyn Storage>, geometry: Geometry, cache_pages: usize) -> Self {
         Self {
             storage,
-            geometry,
+            geometry: RwLock::new(geometry),
             cache: Mutex::new(Cache {
                 entries: Vec::with_capacity(cache_pages),
                 budget: cache_pages,
@@ -78,8 +85,15 @@ impl Pager {
         self
     }
 
-    pub fn geometry(&self) -> &Geometry {
-        &self.geometry
+    /// Copia de la geometría actual. Antes de la tarea 18 devolvía `&Geometry`
+    /// — la geometría era fija desde `Pager::new` hasta el `Drop`, así que una
+    /// referencia prestada del campo era válida durante toda la vida del
+    /// `Pager`. Ya no: la reubicación de la meta B (`set_geometry`, más abajo)
+    /// puede cambiarla en caliente, así que una referencia prestada dejaría
+    /// de reflejar la geometría vigente en cuanto esa mutación ocurriera. Una
+    /// copia no tiene ese problema.
+    pub fn geometry(&self) -> Geometry {
+        *self.geometry.read().unwrap()
     }
 
     /// Bytes útiles de una página lógica: lo que `PageBuilder` y todo lo que
@@ -89,8 +103,8 @@ impl Pager {
     /// Sin cifrado, coincide con el tamaño físico.
     pub fn logical_page_size(&self) -> u32 {
         match &self.encryption {
-            Some(_) => self.geometry.page_size - crate::crypto::CIPHER_PREFIX as u32,
-            None => self.geometry.page_size,
+            Some(_) => self.geometry().page_size - crate::crypto::CIPHER_PREFIX as u32,
+            None => self.geometry().page_size,
         }
     }
 
@@ -109,7 +123,7 @@ impl Pager {
     }
 
     fn offset(&self, page_no: PageNo) -> u64 {
-        page_no as u64 * self.geometry.page_size as u64
+        page_no as u64 * self.geometry().page_size as u64
     }
 
     /// `read` libera el cerrojo de la caché entre comprobar el fallo y
@@ -142,7 +156,12 @@ impl Pager {
             }
         }
 
-        let mut buf = vec![0u8; self.geometry.page_size as usize];
+        // Una sola lectura de la geometría para toda la llamada, en vez de
+        // volver a tomar el cerrojo por cada campo que hace falta: barato de
+        // sobra (una copia de 48 bytes), pero no hay motivo para pagarlo dos
+        // veces.
+        let page_size = self.geometry().page_size;
+        let mut buf = vec![0u8; page_size as usize];
         self.storage.read_at(self.offset(page_no), &mut buf)?;
 
         // Descifrar, si procede, ANTES de cachear: la caché guarda texto
@@ -196,7 +215,7 @@ impl Pager {
     /// lectores —, no `Pager`, que no la comprueba. De ella depende que
     /// `read` (ver su documentación) nunca publique una entrada obsoleta.
     pub fn write(&self, page_no: PageNo, bytes: &[u8]) -> Result<()> {
-        debug_assert_eq!(bytes.len(), self.geometry.page_size as usize);
+        debug_assert_eq!(bytes.len(), self.geometry().page_size as usize);
         self.storage.write_at(self.offset(page_no), bytes)?;
         // Invalidar en vez de actualizar: una página reescrita puede además
         // haber cambiado de dueño tras pasar por la lista de libres, y servir
@@ -234,7 +253,7 @@ impl Pager {
 
     #[cfg(feature = "encryption")]
     fn seal_and_write(&self, enc: &Encryption, page_no: PageNo, counter: u64, plain: &[u8]) -> Result<()> {
-        let mut raw = vec![0u8; self.geometry.page_size as usize];
+        let mut raw = vec![0u8; self.geometry().page_size as usize];
         crate::crypto::seal(enc, page_no, counter, plain, &mut raw)?;
         self.write(page_no, &raw)
     }
@@ -271,7 +290,31 @@ impl Pager {
     /// las que dejó una transacción interrumpida.
     pub fn file_pages(&self) -> Result<u32> {
         let len = self.storage.len()?;
-        Ok((len / self.geometry.page_size as u64) as u32)
+        Ok((len / self.geometry().page_size as u64) as u32)
+    }
+
+    /// Acceso directo al medio, sin pasar por la caché ni la geometría
+    /// cacheada. Lo necesita la reubicación de la meta B (tarea 18,
+    /// `WriteTxn::relocate_meta_b` en `tx.rs`), que reescribe la cabecera —
+    /// la única operación del motor que lo hace, y por tanto la única que
+    /// necesita este acceso: la cabecera vive en la página `0`, pero
+    /// escribirla a través de `write` la trataría como una página cifrada
+    /// más y la sellaría con `write_encrypted`, cuando la cabecera nunca
+    /// pasa por el cifrado por página (`header::Geometry::write` escribe
+    /// bytes en claro directamente).
+    pub fn storage(&self) -> &dyn Storage {
+        self.storage.as_ref()
+    }
+
+    /// Actualiza la geometría en caliente tras mover la meta B (tarea 18).
+    /// `&self`, no `&mut self`: `WriteTxn` solo tiene `&Db`, nunca `&mut Db`
+    /// (ver el comentario del campo `geometry`, arriba), así que la mutación
+    /// tiene que pasar por el `RwLock` en vez de por un préstamo exclusivo
+    /// normal. El tamaño de página no cambia nunca — fijo al crear la base
+    /// (ver `WriteTxn::page_size`) — así que la caché, que no depende de él
+    /// más que a través de esta misma geometría, sigue siendo válida.
+    pub fn set_geometry(&self, geometry: Geometry) {
+        *self.geometry.write().unwrap() = geometry;
     }
 
     /// Devuelve el medio de almacenamiento, descartando la caché. Se usa al

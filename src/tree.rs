@@ -1081,24 +1081,73 @@ impl RangeBudget {
 /// hijo `== 0` o `>= n_pages` es, sin ambigüedad, corrupción.
 ///
 /// **Ronda 2 de revisión de la tarea 15, hallazgo 1 — clase todavía
-/// abierta.** La comprobación original solo rechazaba `0`, pero `1..=
-/// meta_b_page` (la ranura de meta A en la página `1`, la ranura de meta B
-/// en `meta_b_page`, y el hueco reservado entre medias si `page_size` es
-/// menor que 4 KB) son EXACTAMENTE tan inválidas como la `0` — ninguna es
-/// una página de nodo legítima, por la misma razón (`alloc` nunca las
-/// reparte). Confirmado de punta a punta con `extra == 1` (la ranura de
-/// meta A): `free_subtree` la volcaba a la lista de libres sin más, y tras
-/// el commit `alloc()` volvía a repartir la página `1` — la siguiente
-/// escritura destruye esa ranura de meta, mismo desenlace que con la `0`,
-/// una página más allá. La cota correcta es `child <= meta_b_page`, no
-/// `child == 0`: `meta_b_page` es la página reservada más alta (se lee de
-/// la geometría del `Pager` vía `WriteTxn::last_reserved_page`, no se fija
-/// a un número, porque se mueve cuando el fichero crece más allá de 4 KB
-/// de `page_size` — ver `meta_b_page` en `tx.rs`). Como `meta_b_page` es
-/// siempre `>= 2` (`max(2, 4096 / page_size)`), esta comprobación ya cubre
-/// `child == 0` sin necesitar las dos por separado.
+/// abierta.** La comprobación original solo rechazaba `0`, pero `1..=2`
+/// (la ranura de meta A en la página `1`, la ranura de meta B en su
+/// posición inicial, la `2`) son EXACTAMENTE tan inválidas como la `0` —
+/// ninguna es una página de nodo legítima, por la misma razón (`alloc`
+/// nunca las reparte). Confirmado de punta a punta con `extra == 1` (la
+/// ranura de meta A): `free_subtree` la volcaba a la lista de libres sin
+/// más, y tras el commit `alloc()` volvía a repartir la página `1` — la
+/// siguiente escritura destruye esa ranura de meta, mismo desenlace que con
+/// la `0`, una página más allá.
+///
+/// **Tarea 18 — dos rondas de corrección propias, las dos con hallazgos
+/// caros porque cada una "arregla" la ronda anterior de forma incompleta.**
+///
+/// Primer intento: comparar contra `meta_b_page` LEÍDO DE LA GEOMETRÍA
+/// (`WriteTxn::last_reserved_page` de entonces), sin cambiar nada más —
+/// razonable mientras esa página era estática de por vida, pero
+/// `relocate_meta_b` la mueve de `INITIAL_META_B_PAGE` (`2`) a
+/// `final_meta_b_page` una vez el fichero crece más allá de 4 KB, y las
+/// páginas `3..final_meta_b_page` (con `page_size` de 512 B, la `3` a la
+/// `7`) SÍ son datos legítimos del árbol mientras tanto — `alloc` las
+/// reparte con toda normalidad; la única página que de verdad nunca reparte
+/// es el DESTINO final (ver `skip_meta_b_target` en `tx.rs`). Comparar
+/// contra el `meta_b_page` dinámico como un ÚNICO umbral (`child <=
+/// meta_b_page`) rechazaba, tras cada reubicación real, cualquier hijo
+/// legítimo `3..=7` que el árbol hubiera asignado ANTES de que la
+/// reubicación ocurriera — confirmado de punta a punta: catorce pruebas con
+/// árboles de miles de entradas fallaron con `Corrupt { kind: CellBounds }`
+/// al introducir la reubicación, todas leyendo una página que la propia
+/// prueba acababa de escribir como nodo válido unas líneas antes.
+///
+/// Segundo intento: separar el prefijo fijo (`0..=2`, con el `2` como
+/// CONSTANTE — `WriteTxn::last_reserved_page` de esa versión— no leído de la
+/// geometría) de la página destino suelta (`WriteTxn::meta_b_relocation_target`,
+/// siempre excluida). Arregla el hallazgo anterior, pero introduce uno
+/// nuevo: `relocate_meta_b` también libera de verdad la posición VIEJA una
+/// vez completa la reubicación (`self.free`, ver su comentario en `tx.rs`)
+/// — sin eso, esa página se perdía para siempre, un hallazgo propio de la
+/// contabilidad de fugas de este mismo módulo — así que la `2` SÍ vuelve a
+/// ser un hijo legítimo después de reubicar, y una constante fija la
+/// rechaza para siempre incluso reciclada. Confirmado de punta a punta con
+/// árboles lo bastante grandes como para que la meta B reubicada se
+/// reciclara y volviera a usarse
+/// (`an_overflow_value_ever_written_costs_its_node_the_fast_path_permanently`,
+/// `it_does_not_touch_other_keyspaces`).
+///
+/// **La cota correcta son TRES comprobaciones, no dos**, porque en ningún
+/// punto de la vida del fichero hay más que dos páginas con algún papel de
+/// meta B (la inicial y la final, nunca las dos con el mismo papel a la
+/// vez) pero una de ellas cambia de estado:
+/// - el prefijo fijo `0..=1` (`WriteTxn::last_reserved_page`) — la cabecera
+///   y la meta A, que no cambian jamás;
+/// - la página de la meta B AHORA MISMO (`WriteTxn::current_meta_b_page`,
+///   de verdad dinámica: `INITIAL_META_B_PAGE` antes de reubicar, el
+///   destino después) — cubre la inicial mientras todavía cumple ese papel,
+///   y dejar de cubrirla en cuanto `relocate_meta_b` la libera es
+///   precisamente lo que la vuelve a aceptar como hijo legítimo;
+/// - la página destino de la reubicación (`WriteTxn::meta_b_relocation_target`,
+///   siempre excluida, ANTES de que la reubicación ocurra de verdad
+///   también) — sin ella, un hijo corrupto apuntando al destino se aceptaría
+///   mientras `current_meta_b_page` todavía vale la inicial, justo el hueco
+///   que el primer intento de esta ronda no cerraba.
 fn validate_child(tx: &WriteTxn, page_no: PageNo, child: PageNo) -> Result<()> {
-    if child <= tx.last_reserved_page() || child >= tx.n_pages() {
+    if child <= tx.last_reserved_page()
+        || child == tx.current_meta_b_page()
+        || child == tx.meta_b_relocation_target()
+        || child >= tx.n_pages()
+    {
         return Err(Error::Corrupt { page: page_no, kind: CorruptKind::CellBounds });
     }
     Ok(())
@@ -5258,6 +5307,67 @@ mod range_accounting_tests {
             matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::CellBounds, .. }),
             "se esperaba CellBounds, se obtuvo {err:?}"
         );
+    }
+
+    /// Tarea 18, autorrevisión: una vez `relocate_meta_b` libera de verdad
+    /// la posición VIEJA de la meta B (página `2`, con `page_size` de
+    /// 512 B), esa página vuelve a la lista de libres y puede reciclarse
+    /// como cualquier otra — `validate_child` NO debe seguir rechazándola
+    /// para siempre. Construida para fallar contra la versión de
+    /// `validate_child` que solo comprobaba el prefijo fijo `0..=1` y el
+    /// destino final, sin la comprobación dinámica de
+    /// `current_meta_b_page` — sin ella, la página `2` reciclada se
+    /// rechazaba como si siguiera siendo meta, y CUALQUIER `delete_range`/
+    /// poda posterior a la primera reubicación de una base cuya página `2`
+    /// hubiera llegado a reciclarse fallaría con `Corrupt` sobre datos
+    /// perfectamente legítimos.
+    #[test]
+    fn free_subtree_accepts_a_child_at_the_old_meta_b_page_once_it_has_been_recycled() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+
+        // Cruza los 4 KB (mismo patrón que
+        // `freelist_serialization_never_hands_out_the_meta_b_relocation_target_either`
+        // en `tx.rs`): cinco páginas a mano dejan `n_pages` en 8, y una
+        // sexta (que `skip_meta_b_target` desvía a la 9) lo empuja a 10 —
+        // dispara `relocate_meta_b`, que libera la página `2`.
+        let mut pages = alloc::vec::Vec::new();
+        for _ in 0..5 {
+            let p = tx.alloc().unwrap();
+            tx.write_page(p, &alloc::vec![1u8; 512]).unwrap();
+            pages.push(p);
+        }
+        tx.set_root(pages[0]);
+        let last = tx.alloc().unwrap();
+        tx.write_page(last, &alloc::vec![1u8; 512]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            db.begin_write().unwrap().current_meta_b_page(), 8,
+            "la reubicacion debio ocurrir"
+        );
+
+        // La página `2` vieja debe estar libre ahora: el siguiente `alloc`
+        // la recicla en vez de extender el fichero.
+        let mut tx = db.begin_write().unwrap();
+        let recycled = tx.alloc().unwrap();
+        assert_eq!(recycled, 2, "la pagina vieja de la meta B debio reciclarse, no extenderse");
+
+        // La escribe como una hoja legítima y la cuelga de un nodo interno
+        // — exactamente el papel que `validate_child` tiene que aceptar
+        // ahora que ya no es meta.
+        let leaf_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
+        tx.write_page(recycled, &leaf_bytes).unwrap();
+
+        let root = tx.alloc().unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(recycled);
+        rb.set_children_plain(true);
+        let root_bytes = rb.build(&[]).unwrap();
+        tx.write_page(root, &root_bytes).unwrap();
+
+        let mut budget = RangeBudget::new(tx.n_pages());
+        free_subtree(&mut tx, root, 1, &mut budget)
+            .expect("una pagina reciclada, ya no meta, debe aceptarse como hijo legitimo");
     }
 
     /// Ronda 2 de revisión de la tarea 15, hallazgo 2: un nodo interno

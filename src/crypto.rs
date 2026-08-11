@@ -385,15 +385,37 @@ mod tests {
     type PhysWrite = (u64, Vec<u8>);
 
     /// Todas las pruebas de este módulo usan `Options::default()`
-    /// (`page_size` 512, meta A en la página 1, meta B en la 8) — ver
-    /// `opts_with`.
+    /// (`page_size` 512, meta A siempre en la página 1, meta B en la 2
+    /// hasta que `relocate_meta_b` la traslada a la 8 — ver `opts_with` y
+    /// `is_meta_offset`, justo abajo).
     const TEST_PAGE_SIZE: u64 = 512;
 
-    /// Primera página que no es cabecera ni ranura de meta: la primera que
-    /// puede pasar por `write_encrypted`. Misma fórmula que `meta_b_page`
-    /// en `tx.rs`.
-    fn first_data_page() -> u64 {
-        core::cmp::max(2, 4096 / TEST_PAGE_SIZE) + 1
+    /// Offsets que corresponden a una ranura de meta EN CUALQUIERA de sus
+    /// posiciones posibles (tarea 18): la meta B vive en la página `2`
+    /// hasta que el fichero crece más allá de 4 KB, y en su destino final
+    /// —la `8`, con `TEST_PAGE_SIZE` de 512 B; misma fórmula que
+    /// `WriteTxn::final_meta_b_page` en `tx.rs`— desde entonces. Nunca las
+    /// dos posiciones a la vez, pero sí las dos en algún momento de la vida
+    /// del fichero si la prueba llega a cruzar los 4 KB, así que las dos
+    /// cuentan siempre — no solo la que esté activa ahora mismo.
+    ///
+    /// Antes de esta ronda (autorrevisión de la tarea 18) esto era un
+    /// simple SUELO (`first_data_page`, la primera página que ya no podía
+    /// ser meta): válido mientras la meta B era estática desde la
+    /// creación, pero con la reubicación las páginas `3..8` son datos
+    /// legítimos DESDE EL PRINCIPIO, así que un suelo en la `9` las
+    /// contaba erróneamente como "todavía no hay datos" — el auditor de
+    /// nonces veía cero páginas selladas en una base que sí las tenía
+    /// (`every_sync_policy_survives_a_torn_meta_write_at_every_point`). Ni
+    /// la meta A ni la B pasan nunca por `write_encrypted` (ver el
+    /// comentario de `wrap_key`), así que la comprobación correcta es
+    /// justo la contraria: excluir estos offsets concretos, no poner un
+    /// suelo.
+    fn is_meta_offset(o: u64) -> bool {
+        let meta_a = TEST_PAGE_SIZE;
+        let meta_b_initial = 2 * TEST_PAGE_SIZE;
+        let meta_b_final = core::cmp::max(2, 4096 / TEST_PAGE_SIZE) * TEST_PAGE_SIZE;
+        o == meta_a || o == meta_b_initial || o == meta_b_final
     }
 
     /// `(página, contador, texto cifrado)` de cada escritura que de verdad
@@ -402,10 +424,9 @@ mod tests {
     /// par `(página, contador)` ES el nonce, leído del fichero igual que lo
     /// leería un atacante.
     fn sealed_writes(writes: &[PhysWrite]) -> Vec<(PageNo, u64, &[u8])> {
-        let floor = first_data_page() * TEST_PAGE_SIZE;
         writes
             .iter()
-            .filter(|(o, b)| *o >= floor && b.len() == TEST_PAGE_SIZE as usize)
+            .filter(|(o, b)| *o > 0 && !is_meta_offset(*o) && b.len() == TEST_PAGE_SIZE as usize)
             .map(|(o, b)| {
                 let page = (*o / TEST_PAGE_SIZE) as PageNo;
                 let counter = u64::from_le_bytes(b[..8].try_into().unwrap());
@@ -561,16 +582,14 @@ mod tests {
         /// produce, a propósito, un `(offset, primeros 8 bytes)` repetido
         /// por transacción que NO es un fallo de seguridad — no hay ningún
         /// nonce de por medio — pero sí lo detectaría un `dedup` que no
-        /// distinguiera meta de datos. Las páginas de datos/lista de libres
-        /// —las que sí pasan por `write_encrypted`— empiezan en la primera
-        /// página no reservada (`meta_b_page + 1`; con `Options::default()`,
-        /// página 9 a 512 B por página), la misma fórmula que usa
-        /// `Db::create` (`tx.rs`) para `meta.n_pages` inicial.
+        /// distinguiera meta de datos. `is_meta_offset` (tarea 18,
+        /// autorrevisión: sustituye el suelo `meta_b_page + 1` de antes,
+        /// que asumía la meta B estática desde la creación — ver su
+        /// comentario) excluye las ranuras de meta EN CUALQUIERA de sus
+        /// posiciones posibles, no solo las páginas por debajo de un suelo
+        /// fijo.
         fn encrypted_page_nonces(&self) -> Vec<(u64, [u8; 8])> {
-            let page_size = 512u64;
-            let meta_b_page = core::cmp::max(2, 4096 / page_size);
-            let first_data_page_offset = (meta_b_page + 1) * page_size;
-            self.nonces().into_iter().filter(|(offset, _)| *offset >= first_data_page_offset).collect()
+            self.nonces().into_iter().filter(|(offset, _)| *offset > 0 && !is_meta_offset(*offset)).collect()
         }
     }
 
@@ -913,7 +932,10 @@ mod tests {
         // artificialmente bajo, recalculando el CRC, para que la próxima
         // transacción agote el techo enseguida.
         let mut bytes = s.snapshot();
-        for meta_page in [1usize, 8usize] {
+        // 2, no 8 (tarea 18): la meta B vive en la página 2 desde la
+        // creación, y ninguna de estas dos pruebas hace crecer el fichero
+        // lo bastante como para que se haya reubicado a la 8 todavía.
+        for meta_page in [1usize, 2usize] {
             let base = meta_page * 512;
             bytes[base + 100..base + 108].copy_from_slice(&3u64.to_le_bytes());
             let crc = crate::crc32::checksum(&bytes[base..base + crate::meta::META_SIZE - 4]);
@@ -957,8 +979,20 @@ mod tests {
     /// comprobar directamente que nada se reutiliza tras el "corte".
     ///
     /// Asume `Options::default()` (`page_size` 512, `meta_a_page` 1,
-    /// `meta_b_page` 8) — las mismas que usa `opts()` — para saber dónde
+    /// `meta_b_page` 2) — las mismas que usa `opts()` — para saber dónde
     /// viven las dos ranuras sin tener que leer la cabecera primero.
+    ///
+    /// **Asume además que ninguna prueba de este módulo hace crecer el
+    /// fichero más allá de 4 KB** (tarea 18: a partir de ahí,
+    /// `relocate_meta_b` trasladaría la meta B a la página 8, y
+    /// `META_OFFSETS` —fijo desde la construcción— dejaría de reconocer sus
+    /// escrituras como escrituras de meta). Cierto para las cuatro pruebas
+    /// que usan esta estructura hoy: como mucho una decena de `put`s de
+    /// valores diminutos por sesión. Si una prueba futura necesitara cruzar
+    /// ese umbral con este arnés, `META_OFFSETS` tendría que crecer a un
+    /// tercer offset (la posición final) y `last_synced_meta` a tres
+    /// ranuras, no dos — ninguna prueba de hoy lo necesita, así que no se
+    /// construye sin un caso de uso real que lo ejercite.
     struct PowerLossStorage {
         inner: MemStorage,
         writes: Mutex<Vec<PhysWrite>>,
@@ -977,7 +1011,11 @@ mod tests {
         prefix: usize,
     }
 
-    const META_OFFSETS: [u64; 2] = [512, 4096];
+    // 1024, no 4096 (tarea 18): la meta B vive en la página 2 desde la
+    // creación, no en la 8 — ver el comentario de `PowerLossStorage`, justo
+    // arriba, sobre por qué un valor fijo sigue siendo correcto para las
+    // pruebas de este módulo.
+    const META_OFFSETS: [u64; 2] = [512, 1024];
 
     /// Cuántos bytes de una escritura de meta desgarrada llegan al plato.
     /// 104 no es arbitrario: cae DENTRO de `write_counter` (bytes 100..108)
@@ -1056,12 +1094,11 @@ mod tests {
         }
 
         fn encrypted_page_nonces(&self) -> Vec<(u64, [u8; 8])> {
-            let floor = first_data_page() * TEST_PAGE_SIZE;
             self.writes
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(o, _)| *o >= floor)
+                .filter(|(o, _)| *o > 0 && !is_meta_offset(*o))
                 .map(|(o, b)| {
                     let mut first8 = [0u8; 8];
                     first8.copy_from_slice(&b[..8]);
@@ -1241,7 +1278,10 @@ mod tests {
             bytes_snapshot.resize(len, 0);
             s.read_at(0, &mut bytes_snapshot).unwrap();
         }
-        for meta_page in [1usize, 8usize] {
+        // 2, no 8 (tarea 18): la meta B vive en la página 2 desde la
+        // creación, y ninguna de estas dos pruebas hace crecer el fichero
+        // lo bastante como para que se haya reubicado a la 8 todavía.
+        for meta_page in [1usize, 2usize] {
             let base = meta_page * 512;
             bytes_snapshot[base + 100..base + 108].copy_from_slice(&3u64.to_le_bytes());
             let crc = crate::crc32::checksum(&bytes_snapshot[base..base + crate::meta::META_SIZE - 4]);
@@ -1318,13 +1358,26 @@ mod tests {
     /// con su propio `fsync`, en CADA `begin_write`. Con el diseño
     /// corregido el contador viaja de balde en la meta que el commit YA
     /// iba a escribir, así que no debería haber ninguna diferencia.
+    ///
+    /// `page_size: 4096` en las dos bases (tarea 18, autorrevisión): con el
+    /// tamaño de página por defecto (512 B), 500 transacciones bastan para
+    /// cruzar los 4 KB y disparar `relocate_meta_b` — una vez, con sus dos
+    /// `fsync` incondicionales propios — en AMBAS bases por igual (no tiene
+    /// nada que ver con el cifrado), lo que subía las dos medias a 2,004 y
+    /// hacía fallar la comparación exacta contra 2,0 sin que hubiera ninguna
+    /// diferencia real entre cifrada y sin cifrar. Con páginas de 4 KB la
+    /// meta B ya nace en su posición definitiva (ver
+    /// `page_sizes_of_four_kilobytes_or_more_never_relocate` en `tx.rs`) y
+    /// la reubicación nunca se dispara, así que esta sonda vuelve a medir
+    /// solo lo que dice medir.
     #[test]
     fn encrypted_transactions_sync_no_more_per_transaction_than_unencrypted_ones() {
         const N: u64 = 500;
 
         let unenc = Arc::new(SyncCountingStorage::new());
         {
-            let db = Db::create(Box::new(ArcSyncCounting(Arc::clone(&unenc))), Options::default()).unwrap();
+            let opts = Options { page_size: 4096, ..Options::default() };
+            let db = Db::create(Box::new(ArcSyncCounting(Arc::clone(&unenc))), opts).unwrap();
             for i in 0..N as u32 {
                 let mut tx = db.begin_write().unwrap();
                 tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
@@ -1334,7 +1387,8 @@ mod tests {
 
         let enc = Arc::new(SyncCountingStorage::new());
         {
-            let db = Db::create(Box::new(ArcSyncCounting(Arc::clone(&enc))), opts([61; 32])).unwrap();
+            let opts = Options { page_size: 4096, ..opts([61; 32]) };
+            let db = Db::create(Box::new(ArcSyncCounting(Arc::clone(&enc))), opts).unwrap();
             for i in 0..N as u32 {
                 let mut tx = db.begin_write().unwrap();
                 tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
@@ -1367,11 +1421,22 @@ mod tests {
     /// CONSTANTE POR SESIÓN y no por transacción: la diferencia contra la
     /// base sin cifrar tiene que ser la misma con 100 transacciones que con
     /// 500.
+    ///
+    /// `page_size: 4096` (tarea 18, autorrevisión, mismo motivo que la sonda
+    /// 4 de aquí arriba): con 512 B, tanto la corrida de 100 como la de 500
+    /// transacciones cruzan los 4 KB y disparan `relocate_meta_b` una vez,
+    /// EN LAS DOS BASES por igual (cifrada y sin cifrar) — un coste real,
+    /// pero ajeno al cifrado, que esta prueba no está midiendo. Con páginas
+    /// de 4 KB la meta B ya nace en su posición definitiva y la reubicación
+    /// nunca se dispara.
     #[test]
     fn a_reopened_encrypted_database_pays_its_extension_once_per_session() {
         fn syncs_after_reopen(n: u64, encrypted: bool) -> u64 {
             let s = Arc::new(SyncCountingStorage::new());
-            let mk_opts = || if encrypted { opts([62; 32]) } else { Options::default() };
+            let mk_opts = || {
+                let base = if encrypted { opts([62; 32]) } else { Options::default() };
+                Options { page_size: 4096, ..base }
+            };
             {
                 let db =
                     Db::create(Box::new(ArcSyncCounting(Arc::clone(&s))), mk_opts()).unwrap();

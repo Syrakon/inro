@@ -146,12 +146,14 @@ struct WriterState {
     n_pages_floor: u32,
 }
 
-/// Página de la meta B: debe caer en un sector físico de 4 KB distinto al de
-/// la meta A, que vive en la página 1. Con páginas de 4 KB o más, la página 2
-/// ya está en otro sector.
-fn meta_b_page(page_size: u32) -> PageNo {
-    core::cmp::max(2, 4096 / page_size)
-}
+/// Página de la meta B al crear la base (tarea 18). Siempre la página 2, sin
+/// importar `page_size`: es el suelo de 1,5 KB (cabecera + meta A + meta B,
+/// tres páginas). Con páginas de 4 KB o más eso YA cae en un sector físico
+/// distinto al de la meta A (página 1) — ver `WriteTxn::final_meta_b_page` —
+/// así que esas bases nunca reubican. Con páginas más pequeñas comparte
+/// sector con la meta A hasta que el fichero crece más allá de 4 KB, momento
+/// en el que `WriteTxn::relocate_meta_b` la traslada a su sitio definitivo.
+const INITIAL_META_B_PAGE: PageNo = 2;
 
 impl Db {
     pub fn create(storage: Box<dyn Storage>, opts: Options) -> Result<Self> {
@@ -160,7 +162,6 @@ impl Db {
         {
             return Err(Error::BadFormat);
         }
-        let meta_b = meta_b_page(opts.page_size);
         // Fijo en la creación (ver `header::FLAG_ENCRYPTED`): activar el
         // cifrado más tarde exigiría reescribir todas las páginas ya
         // existentes, así que la decisión se toma aquí y no se revisita.
@@ -173,7 +174,7 @@ impl Db {
             db_id: db_id(),
             created_unix: now_unix(),
             meta_a_page: 1,
-            meta_b_page: meta_b,
+            meta_b_page: INITIAL_META_B_PAGE,
         };
         geometry.write(storage.as_ref())?;
 
@@ -183,7 +184,7 @@ impl Db {
             catalog_root: 0,
             freelist_head: 0,
             freelist_tail: 0,
-            n_pages: meta_b + 1,
+            n_pages: INITIAL_META_B_PAGE + 1,
             page_size_log2: opts.page_size.trailing_zeros() as u8,
             format_major: FORMAT_MAJOR,
             flags,
@@ -836,7 +837,7 @@ impl Db {
         let (committed_meta, committed_slot) = *self.committed.read().unwrap();
         let mut extension = committed_meta;
         extension.write_counter = ceiling;
-        let geometry = *self.pager.geometry();
+        let geometry = self.pager.geometry();
 
         // Primero la INACTIVA: mientras se escribe, la activa sigue siendo
         // el registro válido del último commit.
@@ -949,6 +950,50 @@ impl<'db> WriteTxn<'db> {
         self.db.pager.logical_page_size()
     }
 
+    /// Página destino definitiva de la meta B (tarea 18): el primer offset
+    /// que cae en un sector físico de 4 KB distinto al de la meta A, que
+    /// vive en la página 1. Con páginas de 4 KB o más, la página 2 (donde
+    /// vive la meta B desde `Db::create`, ver `INITIAL_META_B_PAGE`) ya está
+    /// en otro sector, así que esas bases nunca reubican: `relocate_meta_b`
+    /// devuelve enseguida al ver que la geometría ya coincide con esto.
+    fn final_meta_b_page(page_size: u32) -> PageNo {
+        core::cmp::max(2, 4096 / page_size)
+    }
+
+    /// Salta la página destino final de la meta B (`final_meta_b_page`) si
+    /// una extensión de fichero está a punto de entregarla como página de
+    /// datos.
+    ///
+    /// **Sin esto, una reubicación exitosa —sin ningún corte de
+    /// corriente— corrompería datos en vivo.** Sondeado con dos pruebas
+    /// deliberadas, una por cada sitio que extiende el fichero
+    /// (`allocation_never_hands_out_the_meta_b_relocation_target` y
+    /// `freelist_serialization_never_hands_out_the_meta_b_relocation_target_either`,
+    /// en `relocation_tests`, más abajo): antes de este salto, con páginas
+    /// de 512 B la página 8 es una página de datos como cualquier otra
+    /// mientras el fichero es pequeño — nada la distingue como "reservada"
+    /// hasta que `relocate_meta_b` la reclama de verdad — así que si el
+    /// árbol o la lista de libres la reciben de una extensión normal y la
+    /// referencian en el estado confirmado (como raíz, como nodo interno,
+    /// como página de lista de libres), y DESPUÉS el fichero crece más allá
+    /// de 4 KB, `relocate_meta_b` escribe bytes de meta encima sin saber que
+    /// había algo ahí. `relocate_meta_b` en sí no protege contra esto — solo
+    /// comprueba que `n_pages` ya pasó de la página destino (ver su
+    /// comentario), no que esa página concreta esté libre — así que la única
+    /// defensa real es que NINGUNA extensión de fichero llegue a entregarla
+    /// jamás. Dos sitios extienden el fichero con un número de página nuevo:
+    /// el `else` de `alloc`, más abajo, y el cierre de `commit` que
+    /// serializa la lista de libres — los dos tienen que saltarla por igual,
+    /// porque una página de lista de libres viva es tan real como cualquier
+    /// otra.
+    fn skip_meta_b_target(p: PageNo, page_size: u32) -> Result<PageNo> {
+        if p == Self::final_meta_b_page(page_size) {
+            p.checked_add(1).ok_or(Error::Full)
+        } else {
+            Ok(p)
+        }
+    }
+
     /// Total de páginas que ha llegado a tener el fichero hasta ahora
     /// (vivas o libres). Cota superior del número de páginas DISTINTAS
     /// alcanzables desde cualquier raíz de un árbol legítimo: en un árbol
@@ -963,19 +1008,65 @@ impl<'db> WriteTxn<'db> {
         self.meta.n_pages
     }
 
-    /// Última página reservada del fichero: la cabecera es la página `0`,
-    /// las dos ranuras de meta viven en `1` y `meta_b_page` (con hueco sin
-    /// usar entre medias si `page_size` es menor que 4 KB — ver
-    /// `meta_b_page` más arriba en este fichero) — así que ninguna página
-    /// `<= meta_b_page` es jamás un hijo legítimo de un nodo interno.
+    /// Última página del prefijo FIJO reservado del fichero: la cabecera es
+    /// la página `0`, la meta A vive en la `1`, ninguna de las dos cambia
+    /// jamás — así que ninguna página `<= 1` es nunca un hijo legítimo de un
+    /// nodo interno, en NINGÚN momento de la vida del fichero.
+    ///
+    /// **Ya NO incluye a la meta B (tarea 18) — ni fija en `2` ni dinámica
+    /// del todo.** Antes de la reubicación esto era `geometry().meta_b_page`
+    /// directamente, válido mientras esa página era estática de por vida;
+    /// una versión posterior lo cambió a la constante `2`
+    /// (`INITIAL_META_B_PAGE`), asumiendo que la meta B en su posición
+    /// inicial está reservada PARA SIEMPRE — cierto hasta que
+    /// `relocate_meta_b` la libera de verdad (`self.free`, ver su
+    /// comentario) una vez completa la reubicación, momento en el que esa
+    /// página vuelve a la lista de libres como cualquier otra y SÍ puede
+    /// volver a ser un hijo legítimo. Una constante fija la rechazaba para
+    /// siempre incluso después de reciclarse — confirmado de punta a punta
+    /// (`an_overflow_value_ever_written_costs_its_node_the_fast_path_permanently`,
+    /// `it_does_not_touch_other_keyspaces`, en `tree.rs`, con árboles lo
+    /// bastante grandes como para que la meta B reubicada se reciclara y
+    /// volviera a usarse). La meta B —en cualquiera de sus dos posibles
+    /// posiciones, la inicial o la final— se comprueba aparte y de verdad
+    /// dinámica, en `current_meta_b_page`, justo abajo: en todo momento hay
+    /// como mucho UNA página con ese papel, así que una sola comparación
+    /// dinámica basta, sin falsos rechazos ni ventanas sin cubrir.
+    ///
     /// `pub(crate)`: la usa `tree::validate_child` (tarea 15, ronda 2 de
     /// revisión, hallazgo 1) para rechazar un hijo corrupto que caiga en
-    /// una de las ranuras de meta, no solo en la página `0` — se lee de la
-    /// geometría del `Pager` en vez de fijarla a un número, porque
-    /// `meta_b_page` se mueve cuando el fichero crece más allá de 4 KB de
-    /// `page_size`.
+    /// una de las ranuras de meta, no solo en la página `0`.
     pub(crate) fn last_reserved_page(&self) -> PageNo {
+        1
+    }
+
+    /// Página de la meta B AHORA MISMO: la `2` (`INITIAL_META_B_PAGE`)
+    /// antes de que `relocate_meta_b` complete, `meta_b_relocation_target()`
+    /// después — exactamente `geometry().meta_b_page`, sin más. Ningún hijo
+    /// legítimo de un nodo interno puede tener este valor jamás, porque
+    /// `alloc` nunca la reparte mientras cumple este papel — pero SÍ puede
+    /// volver a repartir la posición VIEJA una vez `relocate_meta_b` la
+    /// libera (ver su comentario), así que esta comprobación tiene que leer
+    /// la geometría vigente en cada llamada, no memorizar un valor de una
+    /// vez. `pub(crate)`: la usa `tree::validate_child`, junto con
+    /// `last_reserved_page` y `meta_b_relocation_target`.
+    pub(crate) fn current_meta_b_page(&self) -> PageNo {
         self.db.pager.geometry().meta_b_page
+    }
+
+    /// Página destino final de la reubicación de la meta B — SIEMPRE
+    /// excluida como hijo legítimo, tanto si la reubicación ya sucedió como
+    /// si no (tarea 18): ver el comentario de `skip_meta_b_target`, que es
+    /// quien de verdad la reserva desde la primera vez que `alloc`/`commit`
+    /// podrían haberla repartido, no `relocate_meta_b` cuando por fin la usa
+    /// de verdad. Redundante con `current_meta_b_page` una vez completa la
+    /// reubicación (las dos valen lo mismo entonces) — la redundancia es
+    /// inofensiva; lo que hace falta es la cobertura ANTES, mientras
+    /// `current_meta_b_page` todavía vale `INITIAL_META_B_PAGE` y esta es la
+    /// única que ya excluye el destino futuro. `pub(crate)`: la usa
+    /// `tree::validate_child`, junto con las dos anteriores.
+    pub(crate) fn meta_b_relocation_target(&self) -> PageNo {
+        Self::final_meta_b_page(self.page_size())
     }
 
     /// Páginas en uso ahora mismo: asignadas menos libres. Solo para
@@ -991,11 +1082,30 @@ impl<'db> WriteTxn<'db> {
     /// confirmar, como al sustituir o borrar un valor de overflow que la
     /// propia transacción acaba de escribir). Sin esto, ninguna de esas
     /// pruebas vería bajar el conteo nunca, con o sin fuga real.
+    ///
+    /// **Descuenta también la página destino de la reubicación de la meta B
+    /// una vez `n_pages` la cruza** (tarea 18, autorrevisión). No es una
+    /// fuga de datos: `skip_meta_b_target` la retira del espacio de
+    /// numeración para siempre en cuanto `alloc`/`commit` la cruzan, tanto
+    /// si la reubicación ya sucedió (entonces es meta legítima) como si no
+    /// (entonces es, sencillamente, un hueco reservado a la espera) — pero
+    /// nunca aparece en `free`, así que sin este descuento cualquier prueba
+    /// que sustituya o borre valores lo bastante grandes como para cruzar
+    /// esa página vería un `pages_in_use` una unidad más alto que antes de
+    /// cruzarla, sin que put/delete/replace tuvieran ninguna fuga real —
+    /// confirmado de punta a punta,
+    /// `replacing_large_with_small_then_large_again_then_deleting_returns_to_baseline`
+    /// en `tree.rs`. `target > INITIAL_META_B_PAGE` descarta `page_size` de
+    /// 4 KB o más: ahí el destino ya ES la página `2` desde la creación —
+    /// ver `final_meta_b_page` — y jamás hay salto que descontar, porque
+    /// `alloc` nunca extiende el fichero hacia atrás, hasta la `2`.
     #[cfg(test)]
     pub fn pages_in_use(&mut self) -> u32 {
         let n = self.meta.n_pages;
         let free = self.state().freelist.len() as u32 + self.own_free.len() as u32;
-        n - free
+        let target = self.meta_b_relocation_target();
+        let skip_gap = if target > INITIAL_META_B_PAGE && n > target { 1 } else { 0 };
+        n - free - skip_gap
     }
 
     /// Toma una página libre reutilizable o extiende el fichero.
@@ -1045,7 +1155,13 @@ impl<'db> WriteTxn<'db> {
         let p = if let Some(p) = self.state().freelist.pop_refill(pager, oldest)? {
             p
         } else {
-            let p = self.meta.n_pages;
+            // Salta la página destino final de la meta B (tarea 18): ver el
+            // comentario de `skip_meta_b_target`. Una página que nunca sale
+            // de aquí tampoco puede volver más tarde por la lista de libres
+            // (`pop_refill`, arriba) — nadie la libera nunca porque nadie la
+            // recibió nunca — así que este único salto basta para que jamás
+            // aparezca como dato en ningún camino que pase por `alloc`.
+            let p = Self::skip_meta_b_target(self.meta.n_pages, self.page_size())?;
             self.meta.n_pages = p.checked_add(1).ok_or(Error::Full)?;
             p
         };
@@ -1363,10 +1479,123 @@ impl<'db> WriteTxn<'db> {
         crate::tree::get(self, self.meta.root, &scoped(ns, key))
     }
 
+    /// Traslada la meta B a su posición definitiva (tarea 18). No hace nada
+    /// si ya está ahí — bases con `page_size >= 4096` (ya en sectores
+    /// distintos desde `Db::create`) o una reubicación anterior que ya
+    /// completó, sea de esta sesión o de una previa.
+    ///
+    /// Es la ÚNICA operación de este motor que reescribe la cabecera —
+    /// escrita una sola vez en el resto de la vida del fichero (tarea 3) — y
+    /// por eso el orden importa tanto: primero se escribe una copia de la
+    /// meta CONFIRMADA en su sitio nuevo, se sincroniza, y solo entonces se
+    /// reescribe la cabecera para que apunte ahí, y se vuelve a sincronizar.
+    ///
+    /// **La copia es la meta CONFIRMADA (`self.db.committed`), nunca
+    /// `self.meta`** — la de esta transacción, con su propio `root` todavía
+    /// a medio construir. Mismo razonamiento que `Db::extend_counter_ceiling`
+    /// (ver su comentario): así, si el proceso muere en cualquier punto de
+    /// esta función, lo único que puede llegar a verse como confirmado es el
+    /// último estado que YA lo estaba antes de que esta transacción
+    /// empezara — jamás un commit a medio hacer.
+    ///
+    /// **Corte entre el primer `sync` y la escritura de cabecera**: la
+    /// cabecera sigue apuntando a la posición antigua, donde la meta
+    /// también sigue estando intacta (nunca se toca) — se monta igual, y la
+    /// reubicación se reintenta en el commit siguiente (la próxima vez que
+    /// se llame a esta función, `geometry.meta_b_page` seguirá siendo el
+    /// antiguo).
+    ///
+    /// **Corte después de la cabecera dura**: la posición nueva ya tiene,
+    /// de forma duradera, una copia válida del último estado confirmado —
+    /// montar por ahí (si el desempate de `Meta::load` la elige) no pierde
+    /// nada tampoco. Ver `the_database_survives_a_crash_during_relocation`
+    /// y `a_crash_after_the_header_write_does_not_roll_back_a_commit`, en
+    /// `relocation_tests`.
+    ///
+    /// **No hace falta reservar la página destino aquí** — a diferencia de
+    /// lo que un primer intento de esta función podría sugerir: ninguna
+    /// extensión de fichero (ni `alloc` ni el cierre de `commit` que
+    /// serializa la lista de libres) entrega jamás esa página concreta como
+    /// dato, así que para cuando esta función se ejecuta ya está
+    /// garantizado que no hay nada ahí que proteger — ver
+    /// `skip_meta_b_target`. El `debug_assert` de abajo comprueba esa
+    /// invariante en vez de repetir el trabajo que ya hace el salto.
+    fn relocate_meta_b(&mut self) -> Result<()> {
+        let geometry = self.db.pager.geometry();
+        let target = Self::final_meta_b_page(geometry.page_size);
+        if geometry.meta_b_page == target {
+            return Ok(());
+        }
+        debug_assert!(
+            self.meta.n_pages > target,
+            "relocate_meta_b se llamó con el fichero todavía por debajo de la página destino: \
+             skip_meta_b_target no puede haber protegido esa página todavía"
+        );
+
+        let mut new_geometry = geometry;
+        new_geometry.meta_b_page = target;
+
+        let current = *self.db.committed.read().unwrap();
+        // Con `new_geometry`, NO con `geometry`: `MetaSlot::B.page(&geometry)`
+        // resuelve con la posición VIEJA, no con `target` — escribir así deja
+        // la posición nueva sin ningún contenido legible justo cuando la
+        // cabecera, dos líneas más abajo, empieza a apuntar ahí. Con
+        // `new_geometry`, `MetaSlot::B.page(&new_geometry)` ya es `target`.
+        current.0.store_via(&self.db.pager, &new_geometry, MetaSlot::B)?;
+        self.db.pager.sync()?;
+
+        new_geometry.write(self.db.pager.storage())?;
+        self.db.pager.sync()?;
+        self.db.pager.set_geometry(new_geometry);
+
+        // La posición VIEJA queda libre de verdad: nada vuelve a apuntarla
+        // desde aquí en adelante (la cabecera, ya duradera, señala
+        // `target`), así que puede reciclarse como cualquier otra página
+        // libre en vez de perderse para siempre. Autorrevisión de esta
+        // ronda: sin esto, cada base que llega a reubicar pierde una página
+        // (512 B a 32 KB, según `page_size`) para siempre — nada la libera
+        // ni la reutiliza jamás — y la contabilidad de fugas de `tree.rs`
+        // (`overflow_inside_a_bulk_freed_subtree_leaves_no_orphan_pages`,
+        // `churn_then_range_delete_on_a_low_fanout_tree_leaves_no_orphan_pages`)
+        // lo detecta de punta a punta como una fuga de una página, siempre
+        // la misma.
+        //
+        // Segura de liberar ANTES de que termine esta transacción, no solo
+        // tras confirmar: a diferencia de una página de árbol, una página de
+        // meta nunca es visible a través de `Meta.root`/`freelist_head` de
+        // ningún snapshot — ningún lector, viejo o nuevo, la referencia
+        // jamás — así que no hace falta la misma protección de lector que
+        // `free` da a una página de árbol reciclada (ver su comentario).
+        //
+        // No a prueba de cortes hasta el final: si el proceso muere DESPUÉS
+        // de que la cabecera ya apunta a `target` (duradero, los dos `sync`
+        // de arriba ya pasaron) pero ANTES de que ESTA transacción llegue a
+        // confirmar de verdad, este `free` — mutación solo en memoria, igual
+        // que cualquier otra de esta transacción — no sobrevive, y la
+        // reubicación no se reintenta en la siguiente sesión (ya completó:
+        // `geometry.meta_b_page == target` la próxima vez que se llame), así
+        // que la página queda perdida en ese cruce concreto. Peor que
+        // "nunca perderla", mejor que "perderla siempre": el caso común —
+        // una reubicación cuya transacción sí llega a confirmar — la
+        // recicla.
+        self.free(geometry.meta_b_page);
+        Ok(())
+    }
+
     /// Escribe la lista de libres, sincroniza, escribe la meta inactiva y
     /// vuelve a sincronizar. Ese orden es lo que hace el commit atómico: la
     /// meta solo apunta a páginas que ya están en disco.
     pub fn commit(mut self) -> Result<()> {
+        // Reubicación de la meta B (tarea 18), antes de tocar nada más: se
+        // comprueba en TODO commit una vez el fichero pasa de 4 KB, pero
+        // `relocate_meta_b` es barata de llamar de más — un campo comparado
+        // — y no hace nada si ya está en su sitio, así que no hace falta
+        // acotarlo a "la primera vez". `u64` en la multiplicación: con
+        // `n_pages`/`page_size` en `u32`, el producto desborda de sobra
+        // antes de que ninguno de los dos se acerque a su máximo real.
+        if (self.meta.n_pages as u64) * (self.page_size() as u64) > 4096 {
+            self.relocate_meta_b()?;
+        }
         let mut n_pages = self.meta.n_pages;
         let txn_id = self.meta.txn_id;
         {
@@ -1391,11 +1620,19 @@ impl<'db> WriteTxn<'db> {
         }
         {
             let pager = &self.db.pager;
+            let page_size = self.page_size();
             // La lista de libres se escribe extendiendo el fichero, nunca
             // reutilizando páginas libres: reutilizarlas mientras se serializa
             // la propia lista sería recursivo.
+            //
+            // Salta la página destino final de la meta B igual que `alloc`
+            // (tarea 18, ver el comentario de `skip_meta_b_target`): una
+            // página de lista de libres es tan "dato en vivo" como cualquier
+            // nodo del árbol, y esta es una extensión de fichero completamente
+            // aparte de `WriteTxn::alloc` — nada comparte el salto entre las
+            // dos si no se repite aquí.
             let mut alloc = || -> Result<PageNo> {
-                let p = n_pages;
+                let p = Self::skip_meta_b_target(n_pages, page_size)?;
                 n_pages = p.checked_add(1).ok_or(Error::Full)?;
                 Ok(p)
             };
@@ -1441,7 +1678,7 @@ impl<'db> WriteTxn<'db> {
         self.db.maybe_sync()?;
 
         let target = self.slot.other();
-        let geometry = *self.db.pager.geometry();
+        let geometry = self.db.pager.geometry();
         self.meta.store_via(&self.db.pager, &geometry, target)?;
         self.db.maybe_sync()?;
 
@@ -1673,7 +1910,11 @@ mod tests {
         }
         let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), Options::default()).unwrap();
         let mut tx = db.begin_write().unwrap();
-        assert_eq!(tx.alloc().unwrap(), 9, "la página huérfana vuelve a la lista de libres");
+        // 3, no 9 (tarea 18): con el suelo bajado, la primera página
+        // asignable tras crear la base es la 3 (cabecera, meta A y meta B en
+        // su posición inicial ocupan 0..=2), no la 9 de cuando la meta B
+        // nacía ya en su posición final.
+        assert_eq!(tx.alloc().unwrap(), 3, "la página huérfana vuelve a la lista de libres");
         tx.commit().unwrap();
     }
 
@@ -1729,7 +1970,7 @@ mod tests {
         tx.commit().unwrap();
 
         let committed = db.committed.read().unwrap().0;
-        let geometry = *db.pager.geometry();
+        let geometry = db.pager.geometry();
         let mut ceiling = 500u64;
         // Dos extensiones seguidas: el camino que una transacción enorme
         // recorre más de una vez, y en el que la segunda sobrescribe dos
@@ -1900,5 +2141,353 @@ mod tests {
             before, after,
             "abortar sin commit no debe cambiar ni un byte del fichero ya confirmado"
         );
+    }
+
+    /// Tarea 18: reubicación de la meta B y suelo de 1,5 KB.
+    mod relocation_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[test]
+        fn a_fresh_database_is_under_two_kilobytes() {
+            let s = Arc::new(MemStorage::new());
+            let _db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), Options::default()).unwrap();
+            assert!(s.len().unwrap() <= 1_536, "suelo: 3 páginas de 512 B");
+        }
+
+        #[test]
+        fn the_second_meta_moves_when_the_file_grows_past_four_kilobytes() {
+            let s = Arc::new(MemStorage::new());
+            let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), Options::default()).unwrap();
+            assert_eq!(Geometry::read(&*s).unwrap().meta_b_page, 2);
+
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..200u32 {
+                tx.put(0x01, &i.to_be_bytes(), &[0u8; 40]).unwrap();
+            }
+            tx.commit().unwrap();
+
+            assert!(s.len().unwrap() > 4096);
+            assert_eq!(Geometry::read(&*s).unwrap().meta_b_page, 8, "reubicada al offset 4096");
+
+            // No basta con que la cabecera apunte al sitio nuevo: los datos
+            // escritos en la MISMA transacción que disparó la reubicación
+            // tienen que seguir siendo legibles. Si `relocate_meta_b`
+            // hubiera escrito sobre una página que el árbol seguía usando
+            // (ver `allocation_never_hands_out_the_meta_b_relocation_target`
+            // y `freelist_serialization_never_hands_out_the_meta_b_relocation_target_either`,
+            // más abajo, para el porqué eso ya no puede pasar), esto lo
+            // habría dejado ilegible o con el valor equivocado.
+            let r = db.begin_read();
+            for i in [0u32, 1, 100, 199] {
+                assert_eq!(
+                    r.get(0x01, &i.to_be_bytes()).unwrap().as_deref(),
+                    Some(&[0u8; 40][..]),
+                    "clave {i} corrupta o perdida tras la reubicación"
+                );
+            }
+        }
+
+        /// Envuelve `MemStorage` y deja pasar CUALQUIER escritura salvo la
+        /// SEGUNDA vez que se escribe la cabecera (offset 0, `HEADER_SIZE`
+        /// bytes): la primera (`Db::create`) tiene que suceder para poder
+        /// montar nada; la segunda —la única reescritura de cabecera que
+        /// existe en este motor, la de `relocate_meta_b`— falla siempre,
+        /// modelando un corte de corriente justo ahí, después de que la meta
+        /// ya aterrizó, con `sync`, en su posición nueva (ver el orden
+        /// documentado en `WriteTxn::relocate_meta_b`).
+        struct CrashOnHeaderWrite {
+            inner: MemStorage,
+            header_writes: std::sync::atomic::AtomicU64,
+        }
+        impl Storage for CrashOnHeaderWrite {
+            fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> {
+                self.inner.read_at(o, b)
+            }
+            fn write_at(&self, o: u64, b: &[u8]) -> Result<()> {
+                if o == 0 && b.len() == crate::header::HEADER_SIZE {
+                    let n = self.header_writes.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n >= 2 {
+                        return Err(Error::Io(crate::IoError::WriteZero));
+                    }
+                }
+                self.inner.write_at(o, b)
+            }
+            fn sync(&self) -> Result<()> {
+                self.inner.sync()
+            }
+            fn len(&self) -> Result<u64> {
+                self.inner.len()
+            }
+        }
+
+        /// Corte de corriente ENTRE las dos escrituras de `relocate_meta_b`:
+        /// la meta ya está, de forma duradera, en su posición nueva, pero la
+        /// cabecera nunca llega a cambiar. La base tiene que seguir
+        /// montando — por la cabecera VIEJA, que sigue siendo coherente con
+        /// la posición VIEJA de la meta, nunca tocada — y el commit
+        /// interrumpido no debe haberse perdido ni un byte de lo que ya
+        /// estaba confirmado antes de él. Reemplaza la prueba homónima del
+        /// brief: tal como estaba escrita ahí (una única clave, sin cruzar
+        /// nunca los 4 KB) `relocate_meta_b` no llegaba a invocarse, así que
+        /// no ejercitaba ninguna reubicación — pasaba por la razón
+        /// equivocada.
+        #[test]
+        fn the_database_survives_a_crash_during_relocation() {
+            let crash = Arc::new(CrashOnHeaderWrite {
+                inner: MemStorage::new(),
+                header_writes: std::sync::atomic::AtomicU64::new(0),
+            });
+            let db = Db::create(Box::new(ArcCrash(Arc::clone(&crash))), Options::default()).unwrap();
+
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"k", b"v").unwrap();
+            tx.commit().unwrap();
+
+            // Cruza los 4 KB: dispara `relocate_meta_b`, que aquí se corta
+            // justo al intentar escribir la cabecera.
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..200u32 {
+                tx.put(0x02, &i.to_be_bytes(), &[0u8; 40]).unwrap();
+            }
+            assert!(tx.commit().is_err(), "la escritura de cabecera debia fallar en esta prueba");
+
+            // "Reinicio": una base nueva, sin envoltorio de fallos, sobre la
+            // misma foto de bytes que dejó el corte.
+            let recovered = MemStorage::new();
+            recovered.restore(crash.inner.snapshot());
+            let recovered = Arc::new(recovered);
+
+            assert_eq!(
+                Geometry::read(&*recovered).unwrap().meta_b_page, 2,
+                "la cabecera no debio cambiar: la escritura que la actualiza fue la que se corto"
+            );
+
+            let db = Db::open(Box::new(ArcStorage(Arc::clone(&recovered))), Options::default()).unwrap();
+            assert_eq!(
+                db.begin_read().get(0x01, b"k").unwrap().as_deref(),
+                Some(b"v".as_slice()),
+                "el commit anterior al corte no debio perderse"
+            );
+            assert_eq!(
+                db.begin_read().get(0x02, &0u32.to_be_bytes()).unwrap(),
+                None,
+                "el commit interrumpido no debio verse, ni parcial ni completo"
+            );
+
+            // La reubicación se reintenta en el siguiente commit que cruce
+            // el umbral, y esta vez completa.
+            let mut tx = db.begin_write().unwrap();
+            for i in 200..400u32 {
+                tx.put(0x02, &i.to_be_bytes(), &[0u8; 40]).unwrap();
+            }
+            tx.commit().unwrap();
+            assert_eq!(Geometry::read(&*recovered).unwrap().meta_b_page, 8);
+        }
+
+        struct ArcCrash(Arc<CrashOnHeaderWrite>);
+        impl Storage for ArcCrash {
+            fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> { self.0.read_at(o, b) }
+            fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
+            fn sync(&self) -> Result<()> { self.0.sync() }
+            fn len(&self) -> Result<u64> { self.0.len() }
+        }
+
+        #[test]
+        fn page_sizes_of_four_kilobytes_or_more_never_relocate() {
+            let s = Arc::new(MemStorage::new());
+            let opts = Options { page_size: 4096, ..Options::default() };
+            let _db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), opts).unwrap();
+            assert_eq!(Geometry::read(&*s).unwrap().meta_b_page, 2, "ya están en sectores distintos");
+        }
+
+        /// Envuelve `MemStorage` y deja pasar la primera escritura de
+        /// cabecera (offset 0, `HEADER_SIZE` bytes) intacta — la de
+        /// `Db::create`, que tiene que suceder para poder montar nada — pero
+        /// falla CUALQUIER escritura que llegue después de la SEGUNDA
+        /// escritura de cabecera (la de `relocate_meta_b`, la única
+        /// reescritura de cabecera que existe en este motor). Modela un
+        /// corte justo después de que la cabecera ya apunta a la posición
+        /// nueva, pero antes de que este commit termine de escribir su
+        /// propia meta.
+        struct CrashAfterSecondHeaderWrite {
+            inner: MemStorage,
+            header_writes: std::sync::atomic::AtomicU64,
+            dead: AtomicBool,
+        }
+        impl Storage for CrashAfterSecondHeaderWrite {
+            fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> {
+                self.inner.read_at(o, b)
+            }
+            fn write_at(&self, o: u64, b: &[u8]) -> Result<()> {
+                if self.dead.load(Ordering::SeqCst) {
+                    return Err(Error::Io(crate::IoError::WriteZero));
+                }
+                if o == 0 && b.len() == crate::header::HEADER_SIZE {
+                    let n = self.header_writes.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.inner.write_at(o, b)?;
+                    if n == 2 {
+                        self.dead.store(true, Ordering::SeqCst);
+                    }
+                    return Ok(());
+                }
+                self.inner.write_at(o, b)
+            }
+            fn sync(&self) -> Result<()> {
+                self.inner.sync()
+            }
+            fn len(&self) -> Result<u64> {
+                self.inner.len()
+            }
+        }
+        struct ArcCrash2(Arc<CrashAfterSecondHeaderWrite>);
+        impl Storage for ArcCrash2 {
+            fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> { self.0.read_at(o, b) }
+            fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
+            fn sync(&self) -> Result<()> { self.0.sync() }
+            fn len(&self) -> Result<u64> { self.0.len() }
+        }
+
+        /// Self-review (interacción con la tarea 9): un corte justo DESPUÉS
+        /// de que la cabecera cambia, pero antes de que el commit que
+        /// disparó la reubicación termine de escribir su propia meta, no
+        /// debe hacer retroceder el último commit REALMENTE confirmado antes
+        /// de esa transacción — solo puede perderse el trabajo de la propia
+        /// transacción interrumpida, como en cualquier aborto.
+        ///
+        /// Construida para fallar contra una versión anterior de
+        /// `relocate_meta_b` que escribía la copia de la meta en la posición
+        /// VIEJA (con la geometría de antes de la reubicación) en vez de en
+        /// `target`: cuando la ranura activa al empezar la transacción que
+        /// dispara la reubicación es la B, esa versión dejaba la página
+        /// nueva sin ningún contenido legible, y un corte en esta ventana
+        /// hacía que `Meta::load` recuperase la meta A — un commit entero
+        /// más vieja — como si fuera la última confirmada. Con la meta
+        /// copiada en `target` (la corrección de esta ronda), las dos
+        /// ranuras describen el mismo último commit real y el desempate por
+        /// `txn_id` siempre elige la correcta.
+        #[test]
+        fn a_crash_after_the_header_write_does_not_roll_back_a_commit() {
+            let crash =
+                Arc::new(CrashAfterSecondHeaderWrite {
+                    inner: MemStorage::new(),
+                    header_writes: std::sync::atomic::AtomicU64::new(0),
+                    dead: AtomicBool::new(false),
+                });
+            let db = Db::create(Box::new(ArcCrash2(Arc::clone(&crash))), Options::default()).unwrap();
+
+            // Un commit vacío basta para pasar la ranura activa de A a B:
+            // `commit` siempre escribe en `self.slot.other()`, sin importar
+            // si esta transacción tocó algo.
+            db.begin_write().unwrap().commit().unwrap();
+            assert_eq!(db.begin_read().txn_id(), 2, "la ranura activa ahora es B");
+
+            // Cruza los 4 KB (seis `alloc()` con página de 512 B llegan a
+            // n_pages = 10, ver `WriteTxn::skip_meta_b_target`) sin tocar el
+            // árbol: esta prueba es sobre la meta, no sobre datos.
+            let mut tx = db.begin_write().unwrap();
+            for _ in 0..6 {
+                tx.alloc().unwrap();
+            }
+            assert!(tx.commit().is_err(), "la segunda escritura de cabecera debia fallar en esta prueba");
+
+            let recovered = MemStorage::new();
+            recovered.restore(crash.inner.snapshot());
+            let recovered = Arc::new(recovered);
+            assert_eq!(Geometry::read(&*recovered).unwrap().meta_b_page, 8, "la cabecera si cambio");
+
+            let db = Db::open(Box::new(ArcStorage(Arc::clone(&recovered))), Options::default()).unwrap();
+            assert_eq!(
+                db.begin_read().txn_id(), 2,
+                "el commit vacio (txn_id 2), ya confirmado antes de la transaccion interrumpida, \
+                 no debio retroceder a txn_id 1"
+            );
+        }
+
+        /// Invariante que hace segura la reubicación sin necesidad de
+        /// "rescatar" nada en el momento de reubicar (ver el comentario de
+        /// `WriteTxn::skip_meta_b_target`): la página destino nunca sale de
+        /// `alloc`, ni siquiera tras muchas asignaciones seguidas.
+        #[test]
+        fn allocation_never_hands_out_the_meta_b_relocation_target() {
+            let (_s, db) = fresh();
+            let mut tx = db.begin_write().unwrap();
+            for _ in 0..20 {
+                let p = tx.alloc().unwrap();
+                assert_ne!(p, 8, "la pagina destino de la reubicacion de la meta B no debe repartirse nunca");
+            }
+            tx.commit().unwrap();
+        }
+
+        /// El otro camino de extensión de fichero — el cierre que `commit`
+        /// usa para serializar la lista de libres, aparte de `alloc` — tiene
+        /// que saltarse la misma página. Construida para fallar sin ese
+        /// segundo salto: cinco páginas asignadas a mano dejan `n_pages`
+        /// exactamente en el destino (8), sin cruzar todavía el umbral de
+        /// reubicación (8 × 512 = 4096, no > 4096); liberar cuatro de ellas
+        /// desde otra transacción (van directas a la lista de libres
+        /// persistente, no al cupo propio de la transacción) obliga a
+        /// `commit` a serializarlas extendiendo el fichero — y sin el salto
+        /// en ese cierre, la única página nueva que hace falta sería
+        /// exactamente la 8.
+        #[test]
+        fn freelist_serialization_never_hands_out_the_meta_b_relocation_target_either() {
+            let (s, db) = fresh();
+
+            let mut tx = db.begin_write().unwrap();
+            let mut pages = Vec::new();
+            for _ in 0..5 {
+                let p = tx.alloc().unwrap();
+                tx.write_page(p, &alloc::vec![1u8; 512]).unwrap();
+                pages.push(p);
+            }
+            tx.set_root(pages[0]);
+            tx.commit().unwrap();
+            assert_eq!(pages, alloc::vec![3, 4, 5, 6, 7]);
+
+            let mut tx = db.begin_write().unwrap();
+            for &p in &pages[1..] {
+                tx.free(p);
+            }
+            tx.commit().unwrap();
+
+            let freelist_head = db.committed.read().unwrap().0.freelist_head;
+            assert_ne!(
+                freelist_head, 8,
+                "la serializacion de la lista de libres entrego la pagina destino de la reubicacion \
+                 de la meta B"
+            );
+            assert_eq!(Geometry::read(&*s).unwrap().meta_b_page, 2, "todavia no crucé el umbral");
+
+            // Un commit más cruza los 4 KB (n_pages ya estaba en 10 tras
+            // serializar la lista de libres) y dispara la reubicación real.
+            // Su propio `alloc()` puede reciclar de la lista de libres que
+            // acaba de crecer (mismo orden de preferencia de siempre: antes
+            // que extender), así que se registra junto con el resto.
+            let mut recycled = alloc::collections::BTreeSet::new();
+            let mut tx = db.begin_write().unwrap();
+            let p = tx.alloc().unwrap();
+            recycled.insert(p);
+            tx.write_page(p, &alloc::vec![2u8; 512]).unwrap();
+            tx.commit().unwrap();
+            assert_eq!(Geometry::read(&*s).unwrap().meta_b_page, 8);
+
+            // La lista de libres sigue siendo legible y sigue entregando el
+            // resto de las páginas que liberó la segunda transacción: si
+            // `relocate_meta_b` hubiera escrito encima de la página de lista
+            // de libres real en vez de solo su destino reservado, esto
+            // fallaría con `Corrupt` en vez de reciclar limpio.
+            let mut tx = db.begin_write().unwrap();
+            while recycled.len() < pages[1..].len() {
+                recycled.insert(tx.alloc().unwrap());
+            }
+            tx.commit().unwrap();
+
+            assert_eq!(
+                recycled,
+                pages[1..].iter().copied().collect(),
+                "las cuatro páginas liberadas deben reciclarse, exactamente ellas y nada más"
+            );
+        }
     }
 }
