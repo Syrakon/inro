@@ -131,6 +131,14 @@ impl Pager {
     pub fn cached_pages(&self) -> usize {
         self.cache.lock().unwrap().entries.len()
     }
+
+    /// Solo para pruebas: si no se pudiera espiar qué páginas concretas
+    /// quedan cacheadas, no habría forma de distinguir un desalojo LRU real
+    /// de uno que simplemente tira una entrada cualquiera.
+    #[cfg(test)]
+    pub fn is_cached(&self, page_no: PageNo) -> bool {
+        self.cache.lock().unwrap().entries.iter().any(|e| e.page_no == page_no)
+    }
 }
 
 impl Cache {
@@ -166,12 +174,15 @@ mod tests {
     use crate::header::FORMAT_MAJOR;
     use crate::storage::MemStorage;
 
-    fn pager(cache_pages: usize) -> Pager {
-        let g = Geometry {
+    fn geometry() -> Geometry {
+        Geometry {
             page_size: 512, format_major: FORMAT_MAJOR, format_minor: 0, flags: 0,
             db_id: [0; 16], created_unix: 0, meta_a_page: 1, meta_b_page: 8,
-        };
-        Pager::new(Box::new(MemStorage::new()), g, cache_pages)
+        }
+    }
+
+    fn pager(cache_pages: usize) -> Pager {
+        Pager::new(Box::new(MemStorage::new()), geometry(), cache_pages)
     }
 
     #[test]
@@ -202,7 +213,40 @@ mod tests {
             p.write(n, &page).unwrap();
             p.read(n).unwrap();
         }
-        assert!(p.cached_pages() <= 2);
+        // No basta con "<= 2": un `insert` que no hiciera nada con ningún
+        // presupuesto (no solo con 0) también pasaría esa comprobación.
+        assert_eq!(p.cached_pages(), 2);
+        // Las páginas tempranas quedaron fuera; solo sobreviven las dos
+        // últimas tocadas.
+        for n in 0..8 {
+            assert!(!p.is_cached(n), "la pagina {n} deberia haber sido desalojada");
+        }
+        assert!(p.is_cached(8));
+        assert!(p.is_cached(9));
+    }
+
+    #[test]
+    fn eviction_prefers_the_least_recently_used_entry() {
+        let p = pager(2);
+        let page = alloc::vec![0u8; 512];
+        p.write(0, &page).unwrap();
+        p.read(0).unwrap();
+        p.write(1, &page).unwrap();
+        p.read(1).unwrap();
+
+        // Tocar la página 0 la vuelve la más recientemente usada; la 1
+        // queda como la menos usada, aunque la 0 se insertó primero. Un
+        // desalojo por mero orden de inserción (FIFO) confundiría esto
+        // con "la 0 es la más vieja" y desalojaría la equivocada.
+        p.read(0).unwrap();
+
+        p.write(2, &page).unwrap();
+        p.read(2).unwrap();
+
+        assert_eq!(p.cached_pages(), 2);
+        assert!(p.is_cached(0), "la pagina tocada recientemente sobrevive");
+        assert!(!p.is_cached(1), "la pagina menos usada se desaloja, no la mas vieja por insercion");
+        assert!(p.is_cached(2), "la pagina recien insertada esta presente");
     }
 
     #[test]
@@ -220,5 +264,19 @@ mod tests {
         let page = alloc::vec![0u8; 512];
         p.write(4, &page).unwrap();
         assert_eq!(p.file_pages().unwrap(), 5);
+    }
+
+    #[test]
+    fn file_pages_floors_a_partial_trailing_page() {
+        // Fuera de `Pager`, a través del `Storage` subyacente: deja el
+        // fichero en 1001 bytes, una página completa (0..512) más una cola
+        // parcial de 489 bytes que no llega a formar una página entera. El
+        // suelo es correcto porque un `alloc` posterior sobrescribe esa
+        // cola con una página completa; lo que este test verifica es que
+        // `file_pages` no la cuenta antes de que eso pase.
+        let storage = MemStorage::new();
+        storage.write_at(1000, &[7]).unwrap();
+        let p = Pager::new(Box::new(storage), geometry(), 1);
+        assert_eq!(p.file_pages().unwrap(), 1);
     }
 }
