@@ -231,7 +231,36 @@ impl Db {
     }
 
     pub fn open(storage: Box<dyn Storage>, opts: Options) -> Result<Self> {
-        let geometry = Geometry::read(storage.as_ref())?;
+        let (geometry, used_mirror) = Geometry::read_reporting_fallback(storage.as_ref())?;
+        // Repara la principal cuando hubo que caer al espejo (ronda de
+        // revisión posterior a la corrección del hallazgo HIGH de la tarea
+        // 18): sin esto, sobrevivir a UN desgarro de cabecera gasta la
+        // redundancia entera y no la devuelve — la base sigue abriendo, pero
+        // desde ese momento corre sobre una sola copia legible de la
+        // geometría para siempre, sin que nadie lo note, hasta que un
+        // segundo fallo (un sector malo, otro corte que también alcance a
+        // la principal si algún día volviera a escribirse) la deja
+        // inservible sin ningún aviso previo. Reparar aquí restaura la
+        // redundancia de inmediato, en la sesión que la descubre, no "algún
+        // día si hay suerte y llega otra escritura de cabecera" — que
+        // podría no llegar nunca (la cabecera no vuelve a tocarse tras la
+        // única reubicación de la vida del fichero).
+        //
+        // Sincroniza DE INMEDIATO, no "a caballo del próximo commit": una
+        // sesión de solo lectura puede no hacer ningún commit jamás, y
+        // dejar la reparación sin sincronizar hasta un commit que quizá
+        // nunca llegue es exactamente la misma ventana de vulnerabilidad
+        // que esta reparación existe para cerrar — solo que trasladada de
+        // "para siempre" a "hasta que alguien escriba, si alguien lo hace".
+        // El coste es una escritura y un `sync` MÁS, solo en esta ruta de
+        // excepción (un desgarro de cabecera es un evento raro, no el
+        // camino común que sí importa mantener a coste constante — ver
+        // `open_costs_the_same_on_a_small_and_a_large_file`, que sigue
+        // midiendo el camino SIN reparación).
+        if used_mirror {
+            geometry.write(storage.as_ref())?;
+            storage.sync()?;
+        }
         let (meta, slot) = Meta::load(storage.as_ref(), &geometry)?;
         // Se desenvuelve ANTES de construir el `Pager` provisional que lee
         // la lista de libres, no solo el definitivo de `assemble`: si la
@@ -2647,6 +2676,72 @@ mod tests {
                     "prefix {prefix}: el commit anterior al corte no debio perderse"
                 );
             }
+        }
+
+        /// LOW hallado en la revisión posterior a la corrección del HIGH: el
+        /// espejo existe para sobrevivir a UN desgarro, pero si `Db::open`
+        /// no repara la principal tras usarlo, esa reapertura ya gastó la
+        /// redundancia sin devolverla — la base sigue abriendo, pero desde
+        /// ahí corre sobre una sola copia legible para siempre (la cabecera
+        /// no vuelve a tocarse tras la única reubicación de la vida del
+        /// fichero), a un sector malo de quedar inservible sin ningún
+        /// aviso.
+        #[test]
+        fn reopening_after_a_torn_primary_repairs_it_from_the_mirror() {
+            let crash = Arc::new(TearSecondHeaderWrite {
+                inner: MemStorage::new(),
+                header_writes: std::sync::atomic::AtomicU64::new(0),
+                prefix: 45,
+                dead: AtomicBool::new(false),
+            });
+            let db = Db::create(Box::new(ArcTearHeader(Arc::clone(&crash))), Options::default())
+                .unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"antes", b"confirmado").unwrap();
+            tx.commit().unwrap();
+
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..200u32 {
+                tx.put(0x02, &i.to_be_bytes(), &[0u8; 40]).unwrap();
+            }
+            let _ = tx.commit();
+
+            let recovered = MemStorage::new();
+            recovered.restore(crash.inner.snapshot());
+            let recovered = Arc::new(recovered);
+
+            // Antes de reabrir: la principal, tal cual quedó del corte, NO
+            // decodifica sola — la premisa de esta prueba.
+            let mut primary_before = [0u8; crate::header::HEADER_SIZE];
+            recovered.read_at(0, &mut primary_before).unwrap();
+            assert!(
+                Geometry::decode(&primary_before).is_err(),
+                "la premisa de esta prueba es que la principal, sin reparar, no decodifica"
+            );
+
+            Db::open(Box::new(ArcStorage(Arc::clone(&recovered))), Options::default()).unwrap();
+
+            // Tras reabrir: la principal debe decodificar POR SÍ SOLA, sin
+            // necesitar el espejo — la reparación la reescribió.
+            let mut primary_after = [0u8; crate::header::HEADER_SIZE];
+            recovered.read_at(0, &mut primary_after).unwrap();
+            assert!(
+                Geometry::decode(&primary_after).is_ok(),
+                "la reapertura debio reparar la cabecera principal a partir del espejo"
+            );
+
+            // Una tercera sesión, sin espejo de por medio (el arnés de
+            // corte ya no está activo): si la reparación no hubiera
+            // ocurrido de verdad, esta apertura seguiría dependiendo del
+            // espejo en silencio, sin que esta prueba lo notara — la
+            // comprobación de arriba, sobre los bytes crudos, es la que de
+            // verdad prueba la reparación.
+            let db3 = Db::open(Box::new(ArcStorage(Arc::clone(&recovered))), Options::default())
+                .unwrap();
+            assert_eq!(
+                db3.begin_read().get(0x01, b"antes").unwrap().as_deref(),
+                Some(b"confirmado".as_slice())
+            );
         }
 
         /// Invariante que hace segura la reubicación sin necesidad de

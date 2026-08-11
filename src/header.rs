@@ -116,14 +116,25 @@ impl Geometry {
     /// entero) sigue intacto, pero inalcanzable, porque nada llega a leer
     /// más allá de la cabecera.
     pub fn read(storage: &dyn Storage) -> Result<Self> {
+        Self::read_reporting_fallback(storage).map(|(g, _)| g)
+    }
+
+    /// Igual que `read`, pero además indica si tuvo que caer al espejo —
+    /// `Db::open` (`tx.rs`, ronda de revisión posterior a la tarea 18) lo
+    /// usa para decidir si hay que REPARAR la principal, sin pagar una
+    /// segunda lectura de la página `0` solo para volver a comprobar lo que
+    /// esta misma llamada ya comprobó. `pub(crate)`: la caída al espejo es
+    /// un detalle de implementación de este módulo; `read` (el método
+    /// público) no lo expone.
+    pub(crate) fn read_reporting_fallback(storage: &dyn Storage) -> Result<(Self, bool)> {
         let mut b = [0u8; HEADER_SIZE];
         storage.read_at(0, &mut b)?;
         match Self::decode(&b) {
-            Ok(g) => Ok(g),
+            Ok(g) => Ok((g, false)),
             Err(primary_err) => {
                 let mut mirror = [0u8; HEADER_SIZE];
                 match storage.read_at(HEADER_MIRROR_OFFSET, &mut mirror).ok().and_then(|()| Self::decode(&mirror).ok()) {
-                    Some(g) => Ok(g),
+                    Some(g) => Ok((g, true)),
                     // Sin espejo legible tampoco: el error de la PRINCIPAL,
                     // no el del espejo, es el que quien llama espera — es
                     // el mismo `Err` que devolvía este método antes de que

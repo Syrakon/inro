@@ -387,7 +387,7 @@ mod tests {
     /// Todas las pruebas de este módulo usan `Options::default()`
     /// (`page_size` 512, meta A siempre en la página 1, meta B en la 2
     /// hasta que `relocate_meta_b` la traslada a la 8 — ver `opts_with` y
-    /// `is_meta_offset`, justo abajo).
+    /// `is_meta_offset_at`, justo abajo).
     const TEST_PAGE_SIZE: u64 = 512;
 
     /// Offsets que corresponden a una ranura de meta EN CUALQUIERA de sus
@@ -411,11 +411,63 @@ mod tests {
     /// comentario de `wrap_key`), así que la comprobación correcta es
     /// justo la contraria: excluir estos offsets concretos, no poner un
     /// suelo.
-    fn is_meta_offset(o: u64) -> bool {
+    ///
+    /// **La posición INICIAL de la meta B (`meta_b_initial`, offset 1024)
+    /// deja de ser meta en cuanto la reubicación se confirma** — ronda de
+    /// revisión posterior a la corrección del hallazgo HIGH:
+    /// `WriteTxn::relocate_meta_b` la libera de verdad (`self.free`,
+    /// `tx.rs`) una vez completa, y a partir de ahí puede reciclarse como
+    /// una página de datos normal — `free_subtree_accepts_a_child_at_the_old_meta_b_page_once_it_has_been_recycled`
+    /// (`tree.rs`) construye exactamente ese caso. Tratar el offset 1024
+    /// como meta PARA SIEMPRE, sin importar cuándo ocurrió cada escritura,
+    /// tenía dos consecuencias: una escritura sellada legítima que
+    /// aterrizara ahí después de reciclarse quedaba excluida del auditor de
+    /// nonces (podía esconder una reutilización real), y
+    /// `simulate_power_loss` la revertía como si fuera una ranura de meta
+    /// en vez de tratarla como cualquier otra página de datos (que este
+    /// arnés modela como "llegada sin condición" — ver su comentario). La
+    /// meta A (1024... la 512) y la posición FINAL de la meta B (4096)
+    /// nunca se reciclan (`skip_meta_b_target` en `tx.rs` las reserva para
+    /// siempre), así que esas dos siguen siendo meta incondicionalmente.
+    ///
+    /// `idx` es la posición de esta escritura dentro de la lista completa
+    /// (`writes`, en orden); `relocated_at`, si existe, es el índice de la
+    /// primera escritura de cabecera (principal o espejo) que confirma la
+    /// reubicación — ver `relocation_completed_at`. Una escritura al offset
+    /// 1024 EN O ANTES de ese índice es meta; después, dato.
+    fn is_meta_offset_at(o: u64, idx: usize, relocated_at: Option<usize>) -> bool {
         let meta_a = TEST_PAGE_SIZE;
         let meta_b_initial = 2 * TEST_PAGE_SIZE;
         let meta_b_final = core::cmp::max(2, 4096 / TEST_PAGE_SIZE) * TEST_PAGE_SIZE;
-        o == meta_a || o == meta_b_initial || o == meta_b_final
+        if o == meta_a || o == meta_b_final {
+            return true;
+        }
+        if o == meta_b_initial {
+            return match relocated_at {
+                Some(cutoff) => idx <= cutoff,
+                None => true,
+            };
+        }
+        false
+    }
+
+    /// Índice, dentro de `writes`, de la primera escritura de cabecera
+    /// (principal, offset `0`, o espejo, `HEADER_MIRROR_OFFSET`) cuyo
+    /// contenido decodifica con `meta_b_page` ya en su destino final — la
+    /// señal más temprana posible de que la reubicación se confirmó de
+    /// verdad (no una escritura desgarrada: esas miden menos de
+    /// `HEADER_SIZE` y no decodifican, así que no cuentan). `None` si la
+    /// reubicación nunca llegó a confirmarse en esta corrida.
+    fn relocation_completed_at(writes: &[PhysWrite]) -> Option<usize> {
+        let target_meta_b_page = (core::cmp::max(2, 4096 / TEST_PAGE_SIZE)) as u32;
+        writes.iter().position(|(o, b)| {
+            (*o == 0 || *o == crate::header::HEADER_MIRROR_OFFSET)
+                && b.len() == crate::header::HEADER_SIZE
+                && <&[u8; crate::header::HEADER_SIZE]>::try_from(b.as_slice())
+                    .ok()
+                    .and_then(|arr| crate::header::Geometry::decode(arr).ok())
+                    .is_some_and(|g| g.meta_b_page == target_meta_b_page)
+        })
     }
 
     /// `(página, contador, texto cifrado)` de cada escritura que de verdad
@@ -424,9 +476,14 @@ mod tests {
     /// par `(página, contador)` ES el nonce, leído del fichero igual que lo
     /// leería un atacante.
     fn sealed_writes(writes: &[PhysWrite]) -> Vec<(PageNo, u64, &[u8])> {
+        let relocated_at = relocation_completed_at(writes);
         writes
             .iter()
-            .filter(|(o, b)| *o > 0 && !is_meta_offset(*o) && b.len() == TEST_PAGE_SIZE as usize)
+            .enumerate()
+            .filter(|(idx, (o, b))| {
+                *o > 0 && !is_meta_offset_at(*o, *idx, relocated_at) && b.len() == TEST_PAGE_SIZE as usize
+            })
+            .map(|(_, w)| w)
             .map(|(o, b)| {
                 let page = (*o / TEST_PAGE_SIZE) as PageNo;
                 let counter = u64::from_le_bytes(b[..8].try_into().unwrap());
@@ -556,23 +613,11 @@ mod tests {
             self.writes.lock().unwrap().clone()
         }
 
-        fn nonces(&self) -> Vec<(u64, [u8; 8])> {
-            self.writes
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(o, b)| {
-                    let mut first8 = [0u8; 8];
-                    first8.copy_from_slice(&b[..8]);
-                    (*o, first8)
-                })
-                .collect()
-        }
-
         /// Solo los pares que de verdad representan `(página, contador de
         /// nonce)`, descartando cabecera y meta-ranuras (ronda de revisión
-        /// posterior a la primera entrega: `nonces()` sin filtrar hacía
-        /// fallar esta prueba por una razón que NO es un nonce repetido).
+        /// posterior a la primera entrega: los pares de `self.writes` sin
+        /// filtrar hacían fallar esta prueba por una razón que NO es un
+        /// nonce repetido).
         ///
         /// `Db::extend_counter_ceiling`/`WriteTxn::commit` escriben
         /// ranuras de meta con el MISMO `txn_id` en claro en sus primeros
@@ -582,14 +627,31 @@ mod tests {
         /// produce, a propósito, un `(offset, primeros 8 bytes)` repetido
         /// por transacción que NO es un fallo de seguridad — no hay ningún
         /// nonce de por medio — pero sí lo detectaría un `dedup` que no
-        /// distinguiera meta de datos. `is_meta_offset` (tarea 18,
+        /// distinguiera meta de datos. `is_meta_offset_at` (tarea 18,
         /// autorrevisión: sustituye el suelo `meta_b_page + 1` de antes,
         /// que asumía la meta B estática desde la creación — ver su
         /// comentario) excluye las ranuras de meta EN CUALQUIERA de sus
         /// posiciones posibles, no solo las páginas por debajo de un suelo
-        /// fijo.
+        /// fijo — y, desde la ronda de revisión posterior a la corrección
+        /// del hallazgo HIGH, solo mientras la posición inicial de la meta
+        /// B siga siéndolo de verdad (ver su comentario): opera sobre
+        /// `self.writes` directamente, no sobre `self.nonces()`, porque
+        /// necesita el ÍNDICE de cada escritura dentro de la lista para
+        /// saber si ocurrió antes o después de que la reubicación se
+        /// confirmara.
         fn encrypted_page_nonces(&self) -> Vec<(u64, [u8; 8])> {
-            self.nonces().into_iter().filter(|(offset, _)| *offset > 0 && !is_meta_offset(*offset)).collect()
+            let writes = self.writes.lock().unwrap();
+            let relocated_at = relocation_completed_at(&writes);
+            writes
+                .iter()
+                .enumerate()
+                .filter(|(idx, (o, _))| *o > 0 && !is_meta_offset_at(*o, *idx, relocated_at))
+                .map(|(_, (o, b))| {
+                    let mut first8 = [0u8; 8];
+                    first8.copy_from_slice(&b[..8]);
+                    (*o, first8)
+                })
+                .collect()
         }
     }
 
@@ -1133,12 +1195,13 @@ mod tests {
         }
 
         fn encrypted_page_nonces(&self) -> Vec<(u64, [u8; 8])> {
-            self.writes
-                .lock()
-                .unwrap()
+            let writes = self.writes.lock().unwrap();
+            let relocated_at = relocation_completed_at(&writes);
+            writes
                 .iter()
-                .filter(|(o, _)| *o > 0 && !is_meta_offset(*o))
-                .map(|(o, b)| {
+                .enumerate()
+                .filter(|(idx, (o, _))| *o > 0 && !is_meta_offset_at(*o, *idx, relocated_at))
+                .map(|(_, (o, b))| {
                     let mut first8 = [0u8; 8];
                     first8.copy_from_slice(&b[..8]);
                     (*o, first8)
