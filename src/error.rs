@@ -15,10 +15,28 @@ pub enum Error {
     VersionTooNew { found: u16, supported: u16 },
     /// Ya hay una transacción de escritura en curso en este proceso.
     WriterBusy,
+    /// La transacción de escritura anterior entró en pánico mientras tenía
+    /// el candado de escritor tomado (p. ej. dentro de un extractor de
+    /// índice que no debía entrar en pánico nunca — ver `IndexDef::extract`)
+    /// y lo dejó envenenado. A diferencia de `WriterBusy`, este candado
+    /// nunca se libera solo: confundir los dos casos bajo el mismo error
+    /// dejaría cualquier `begin_write` posterior fallando para siempre con
+    /// un mensaje que sugiere "espera y reintenta" cuando la base en
+    /// realidad necesita intervención.
+    WriterPoisoned,
     /// El extractor registrado no coincide con el que construyó el índice.
     IndexVersionMismatch { id: u8, stored: u32, provided: u32 },
     /// Un índice único ya contiene ese valor indexado.
     DuplicateKey { id: u8 },
+    /// `delete_range` sobre un `ns` con índices definidos: el borrado por
+    /// rango libera subárboles enteros sin visitar cada entrada (ver el
+    /// comentario de `WriteTxn::delete_range`), así que no hay forma barata
+    /// de saber qué entradas de índice retirar. Enrutarlo por `delete` clave
+    /// a clave sería correcto pero destruiría la garantía de coste que
+    /// justifica `delete_range` — justo para el caso de uso, poda diaria por
+    /// retención, que más se beneficia de tener también un índice. Fallar
+    /// alto y claro es preferible a divergir en silencio.
+    DeleteRangeIndexed { ns: u8 },
     KeyTooLarge { len: u32, max: u32 },
     /// No queda espacio direccionable: el fichero alcanzó 2^32 páginas.
     Full,

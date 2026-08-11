@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::freelist::Freelist;
 use crate::header::{Geometry, FORMAT_MAJOR, MAX_PAGE_SIZE, MIN_PAGE_SIZE};
-use crate::index::{index_key, primary_of, IndexDef, CATALOG_NS};
+use crate::index::{index_key, primary_of, IndexDef, CATALOG_NS, INDEX_NS_BASE};
 use crate::meta::{Meta, MetaSlot};
 use crate::pager::Pager;
 use crate::{Error, PageNo, Result, Storage, TxnId};
@@ -256,6 +256,22 @@ impl<'db> ReadTxn<'db> {
     /// primaria ni la longitud que le siguen, así que el orden que ve quien
     /// llama es el del valor indexado, aunque la clave real en el árbol
     /// lleve más bytes detrás.
+    ///
+    /// **Cuidado con el modismo `scan_index(id, v, v ++ [0xff])`** para "todo
+    /// lo que vale exactamente `v`" (ronda 2 de revisión, hallazgo 9, sin
+    /// arreglo — documentado): en un índice NO único la entrada completa es
+    /// `v ++ primaria ++ longitud`, así que ese límite superior también es
+    /// mayor que cualquier entrada cuya clave primaria empiece por el byte
+    /// `0xff` — comparado byte a byte, `v` seguido de `0xff` es UN prefijo
+    /// estricto de `v` seguido de `0xff` seguido de más bytes, y un prefijo
+    /// estricto compara menor, así que esa fila cae fuera del rango
+    /// `[from, to)` y `scan_index` no la devuelve, aunque su valor indexado
+    /// sea `v` en todos los sentidos que importan. El límite en sí,
+    /// `[from, to)`, es correcto y hace justo lo que dice; el problema es
+    /// solo de este modismo concreto para construirlo. Quien necesite
+    /// cubrir el rango entero de un valor indexado sin este hueco debe
+    /// construir `to` con suficientes bytes `0xff` de sobra como para
+    /// exceder cualquier clave primaria real posible, no solo uno.
     pub fn scan_index(&self, id: u8, from: &[u8], to: &[u8]) -> Result<Vec<Vec<u8>>> {
         let def = self
             .db
@@ -358,7 +374,23 @@ pub struct WriteTxn<'db> {
 
 impl Db {
     pub fn begin_write(&self) -> Result<WriteTxn<'_>> {
-        let guard = self.write_lock.try_lock().map_err(|_| Error::WriterBusy)?;
+        // `try_lock` distingue dos causas muy distintas de fallo (ronda 2 de
+        // revisión, hallazgo 7): `WouldBlock` es un escritor legítimo en
+        // curso — reintentar más tarde tiene sentido — pero `Poisoned`
+        // significa que una transacción anterior entró en pánico con este
+        // candado tomado (el sitio más probable: un extractor de índice
+        // caprichoso, ver el comentario de `IndexDef::extract`) y el candado
+        // de la biblioteca estándar queda envenenado PARA SIEMPRE, no solo
+        // hasta que el otro escritor termine. Colapsar los dos casos en
+        // `WriterBusy`, como hacía antes, convertía ese envenenamiento en un
+        // ladrillo silencioso: cada apertura posterior fallaría con un
+        // mensaje que invita a reintentar, cuando reintentar nunca
+        // funcionará.
+        let guard = match self.write_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(Error::WriterBusy),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::WriterPoisoned),
+        };
         let (mut meta, slot) = *self.committed.read().unwrap();
         meta.txn_id += 1;
         let pre_freelist = guard
@@ -599,6 +631,19 @@ impl<'db> WriteTxn<'db> {
     /// `Full`) a mitad de aplicar las mutaciones ya planeadas, el mismo tipo
     /// de fallo catastrófico que ya obliga a abandonar cualquier `put`/
     /// `delete` de este motor.
+    ///
+    /// **Nota sobre `KeyTooLarge` (ronda 2 de revisión, hallazgo 8, sin
+    /// arreglo — documentado):** esta función reutiliza la misma variante
+    /// `Error::KeyTooLarge { len, max }` que usa `tree::put` para la clave
+    /// primaria, así que un `Err` de este tipo no dice POR SÍ SOLO si lo
+    /// rechazó la clave primaria o una entrada de algún índice, ni cuál. Es
+    /// una limitación real, de prioridad baja: `len`/`max` siguen siendo
+    /// correctos y suficientes para saber "esta escritura no cabe", que es
+    /// la información que importa para decidir qué hacer a continuación
+    /// (nada la vuelve a intentar igual). Distinguirlo exigiría o una nueva
+    /// variante de error o añadir un campo a esta, cualquiera de las dos
+    /// cosas un cambio de la forma pública de `Error` fuera del alcance de
+    /// esta ronda.
     pub fn put(&mut self, ns: u8, key: &[u8], value: &[u8]) -> Result<()> {
         let defs = self.db.indexes_for(ns);
         if defs.is_empty() {
@@ -606,6 +651,28 @@ impl<'db> WriteTxn<'db> {
         }
 
         let max_key = self.page_size() / 4;
+
+        // Clave primaria demasiado grande (ronda 2 de revisión, hallazgo 3):
+        // en un índice único la entrada de índice es SOLO el valor indexado
+        // — la clave primaria viaja como valor, nunca como parte de la
+        // clave de índice — así que el chequeo de tamaño de más abajo, que
+        // solo mira entradas de índice, no la ve nunca. Sin este chequeo
+        // aparte, una clave primaria de sobra pasaba la fase de
+        // planificación entera, la entrada de índice se llegaba a escribir
+        // de verdad en la fase de aplicación, y solo el último paso
+        // (`put_raw(ns, key, value)`) fallaba — dejando esa entrada huérfana
+        // en memoria si quien llama no abandonaba la transacción, la misma
+        // clase de mutación prematura que el resto de esta función existe
+        // para evitar. `1 +` porque `scoped()` antepone el byte de `ns`
+        // antes de que la clave llegue a `tree::put`, que es quien de verdad
+        // aplica este límite (ver su comentario) — comprobarlo aquí sin ese
+        // `+1` habría aceptado una clave que `tree::put` iba a rechazar de
+        // todas formas, un byte más allá del límite real.
+        let full_key_len = 1 + key.len() as u32;
+        if full_key_len > max_key {
+            return Err(Error::KeyTooLarge { len: full_key_len, max: max_key });
+        }
+
         let previous = self.get(ns, key)?;
 
         // Fase de planificación: solo lecturas, ninguna página se toca
@@ -635,8 +702,16 @@ impl<'db> WriteTxn<'db> {
             }
             for ik in (def.extract)(key, value) {
                 let entry = index_key(def, &ik, key);
-                if entry.len() as u32 > max_key {
-                    return Err(Error::KeyTooLarge { len: entry.len() as u32, max: max_key });
+                // `+ 1`: mismo motivo que arriba — la entrada de índice
+                // también pasa por `scoped()` (bajo `def.index_ns()`) antes
+                // de llegar a `tree::put`, que mide la clave YA con ese
+                // byte de más (ronda 2 de revisión, hallazgo 2). Sin el
+                // `+ 1` una entrada de exactamente `page_size / 4` bytes
+                // pasaba esta comprobación y fallaba después, en la fase de
+                // aplicación, ya con la entrada vieja borrada.
+                let full_entry_len = entry.len() as u32 + 1;
+                if full_entry_len > max_key {
+                    return Err(Error::KeyTooLarge { len: full_entry_len, max: max_key });
                 }
                 if def.unique
                     && let Some(existing_pk) = self.get(def.index_ns(), &ik)?
@@ -686,7 +761,52 @@ impl<'db> WriteTxn<'db> {
     /// lista de libres en bloque y desengancha el subárbol entero. El coste
     /// es proporcional al número de páginas internas, no al de entradas
     /// borradas.
+    ///
+    /// **Se rechaza sobre un `ns` con algún índice definido** (ronda 2 de
+    /// revisión, hallazgo 1) — `Error::DeleteRangeIndexed`. Es justo la
+    /// propiedad de arriba, "nunca lee las hojas", la que hace imposible
+    /// mantener los índices aquí sin tirarla: no hay forma de saber qué
+    /// entradas de índice retirar sin visitar cada valor borrado, y
+    /// visitarlos todos vuelve a poner el coste en proporción al número de
+    /// entradas, exactamente lo que esta función existe para evitar.
+    ///
+    /// Se consideraron tres caminos:
+    /// 1. Enrutar por `delete` clave a clave cuando `ns` está indexado:
+    ///    correcto, pero destruye la garantía de coste que justifica esta
+    ///    función — precisamente para el caso de uso, poda por retención,
+    ///    que más se beneficia de tener también un índice (la carga de
+    ///    referencia de este proyecto es justo esa: cientos de miles de
+    ///    entradas podadas por nodo y día).
+    /// 2. Rechazar limpio con un error propio. Preserva la corrección Y la
+    ///    garantía de coste sin ambigüedad, al precio de que quien llama
+    ///    tenga que decidir explícitamente qué hacer en vez de que el motor
+    ///    decida por él.
+    /// 3. Aceptarlo SOLO cuando el índice declara que su clave empieza por
+    ///    el mismo cubo temporal que la clave primaria que borra el rango
+    ///    — entonces borrar el rango de datos `[from, to)` corresponde a
+    ///    borrar también un rango CONTIGUO de entradas de índice, y el
+    ///    camino rápido de `delete_range` serviría para ambos árboles. Es
+    ///    la vía que anticipa la especificación del proyecto (sección 8).
+    ///    Pero esa correspondencia depende de una propiedad de `extract`
+    ///    que el motor no puede verificar — igual que la versión es la
+    ///    única defensa posible contra un extractor que cambia, aquí solo
+    ///    quien llama puede afirmar "mi extractor sí respeta esto", y
+    ///    construir un mecanismo de declaración correcto (¿por qué campo se
+    ///    marca?, ¿cómo se deriva el rango de índice a partir de `from`/
+    ///    `to`?, ¿qué pasa si la declaración es falsa?) es una pieza de
+    ///    diseño propia, no un arreglo de esta ronda.
+    ///
+    /// Se optó por (2): es la única de las tres que no puede divergir en
+    /// silencio bajo ninguna circunstancia y no exige inventar superficie de
+    /// API nueva sin el diseño y las pruebas que merece. (1) traiciona
+    /// exactamente el caso de uso que este motor prioriza; (3) es el camino
+    /// correcto a largo plazo, pero como tarea propia y deliberada, con su
+    /// propio ciclo de revisión — no como parte de una ronda de correcciones
+    /// sobre otro hallazgo.
     pub fn delete_range(&mut self, ns: u8, from: &[u8], to: &[u8]) -> Result<()> {
+        if !self.db.indexes_for(ns).is_empty() {
+            return Err(Error::DeleteRangeIndexed { ns });
+        }
         let (a, b) = (scoped(ns, from), scoped(ns, to));
         let root = crate::tree::delete_range(self, self.meta.root, &a, &b)?;
         self.meta.root = root;
@@ -772,27 +892,69 @@ impl Db {
 
 impl Db {
     /// Registra un índice (tarea 16). Si el catálogo ya tiene ese `id` con
-    /// otra versión, falla: el llamante decide si reconstruirlo o corregir
-    /// el extractor — `version` es la única defensa posible, porque la
-    /// lógica de indexado vive en código del llamante y el motor no puede
-    /// comprobar por sí mismo si `extract` cambió.
+    /// una definición distinta, falla: el llamante decide si reconstruirlo o
+    /// corregir la llamada.
     ///
-    /// Registrar el mismo `id` dos veces en el mismo proceso (misma versión)
-    /// es idempotente: sustituye la entrada en memoria en vez de duplicarla.
-    /// Sin esto, una segunda llamada dejaría dos copias del mismo `IndexDef`
-    /// en `indexes`, y `indexes_for` se lo entregaría dos veces a
-    /// `WriteTxn::put`/`delete` — no corrompe nada (borrar y volver a poner
-    /// la misma entrada es idempotente), pero duplica trabajo en cada
-    /// escritura para siempre, en silencio.
+    /// **Compara el registro COMPLETO del catálogo** (versión, unicidad,
+    /// `ns`, nombre — todo lo que `IndexDef::encode` guarda), no solo la
+    /// versión (ronda 2 de revisión, hallazgo 5). Redefinir el mismo `id`
+    /// como único cuando antes no lo era, o sobre otro `ns`, bajo la MISMA
+    /// versión, dejaría el índice mintiendo en silencio exactamente igual
+    /// que un extractor cambiado sin subir la versión: `scan_index`
+    /// buscaría en el árbol equivocado, o `put`/`delete` dejarían de
+    /// comprobar una unicidad que el catálogo en disco todavía promete.
+    /// Todo ese resto SÍ vive en el catálogo, así que compararlo no cuesta
+    /// nada extra. Lo único que de verdad no se puede comprobar así —
+    /// **y no hay forma de comprobarlo, en ninguna ronda de correcciones**
+    /// — es `extract` en sí: es código del llamante, un puntero a función
+    /// sin ninguna propiedad observable que distinga "la misma lógica" de
+    /// "otra lógica que hoy calcula lo mismo por casualidad" (ni siquiera
+    /// comparar la dirección del puntero es fiable entre unidades de
+    /// compilación, ver el comentario de `IndexDef` sobre `PartialEq`).
+    /// `version` sigue siendo, y seguirá siendo, la única defensa posible
+    /// contra ESE cambio concreto.
+    ///
+    /// Registrar el mismo `id` dos veces en el mismo proceso (misma
+    /// definición) es idempotente: sustituye la entrada en memoria en vez de
+    /// duplicarla. Sin esto, una segunda llamada dejaría dos copias del
+    /// mismo `IndexDef` en `indexes`, y `indexes_for` se lo entregaría dos
+    /// veces a `WriteTxn::put`/`delete` — no corrompe nada (borrar y volver
+    /// a poner la misma entrada es idempotente), pero duplica trabajo en
+    /// cada escritura para siempre, en silencio.
+    ///
+    /// **No hace `backfill`** (ronda 2 de revisión, hallazgo 10, sin arreglo
+    /// — documentado): filas escritas en `ns` ANTES de esta llamada se
+    /// quedan sin indexar para siempre. Como la comparación de arriba es
+    /// contra el registro tal cual quedó grabado la primera vez, reabrir
+    /// más tarde con la MISMA definición nunca lo detecta ni lo avisa — el
+    /// índice está simplemente incompleto desde el principio, en silencio.
+    /// Levantar un índice sobre datos preexistentes exige hoy que quien
+    /// llama reescriba esas filas él mismo (p. ej. un `put` de cada fila
+    /// sobre su propio valor) después de `define_index`, antes de confiar
+    /// en `scan_index`.
     pub fn define_index(&self, def: IndexDef) -> Result<()> {
         if def.id >= 0x80 {
+            return Err(Error::BadFormat);
+        }
+        // (Ronda 2 de revisión, hallazgo 6): `ns` debe caer fuera de los dos
+        // rangos que el propio motor se reserva — el catálogo (`ns == 0`) y
+        // el espacio de cualquier índice (`ns >= INDEX_NS_BASE`, donde vive
+        // CADA índice, incluido este mismo). Sin este chequeo, un `IndexDef`
+        // con `ns = CATALOG_NS` indexaría el catálogo consigo mismo, y uno
+        // con `ns >= INDEX_NS_BASE` indexaría las entradas crudas de OTRO
+        // índice — en ambos casos, `WriteTxn::put`/`delete` empezarían a
+        // mutar esos espacios reservados como si fueran datos de usuario
+        // cada vez que alguien escribe ahí (incluida la propia maquinaria
+        // de índices), con resultados que ninguna otra comprobación de este
+        // módulo anticipa.
+        if def.ns == CATALOG_NS || def.ns >= INDEX_NS_BASE {
             return Err(Error::BadFormat);
         }
         let mut tx = self.begin_write()?;
         match tx.get(CATALOG_NS, &[def.id])? {
             Some(record) => {
                 let stored = IndexDef::stored_version(&record).ok_or(Error::BadFormat)?;
-                if stored != def.version {
+                if record != def.encode() {
                     return Err(Error::IndexVersionMismatch {
                         id: def.id,
                         stored,
