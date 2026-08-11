@@ -55,6 +55,48 @@ pub struct PageRef<'a> {
 /// overflow, así que pueden liberarse sin abrirlos". Tarea 15, ronda de
 /// revisión 1: ver `children_plain` más abajo y el comentario de
 /// `free_subtree` en `tree.rs` para la corrección que este bit cierra.
+///
+/// **El coste real de perderlo, medido — tarea 15, ronda de revisión 2,
+/// hallazgo 3.** Este bit es MONÓTONO por nodo: una vez que se pone a
+/// `false` (un hijo deja de ser plano — se vuelve interno, o gana una
+/// entrada de overflow), solo una RECONSTRUCCIÓN de ese nodo puede
+/// volver a ponerlo a `true`, y ninguna operación de hoy reconstruye un
+/// nodo SOLO para reevaluar el bit — únicamente lo toca de pasada
+/// `insert_rec`/`delete_rec`/`delete_range_rec` cuando de todos modos
+/// tenían que tocar ese nodo por otra razón (ver el comentario de
+/// `Insertion` en `tree.rs`). Borrar la entrada que causó el overflow NO
+/// restaura el bit: el nodo se reconstruye igual, pero el nuevo valor de
+/// `children_plain` sigue calculándose a partir del viejo (`viejo &&
+/// plano_el_hijo_tocado`), y "viejo" ya era `false`.
+///
+/// Medido de punta a punta sobre 20.000 entradas
+/// (`an_overflow_value_ever_written_costs_its_node_the_fast_path_permanently`,
+/// `tree.rs`, guarda estos números como regresión permanente, con margen):
+///
+/// | Árbol | Páginas leídas — tercio medio | Páginas leídas — poda completa |
+/// |---|---|---|
+/// | recién sembrado | 50 | 80 |
+/// | 4000 ciclos de borrar-y-reinsertar (sin overflow) | 50 | — |
+/// | UNA hoja que alguna vez tuvo un valor de overflow (ya borrado) | 71 | — |
+/// | TODAS las hojas tuvieron alguna vez un valor de overflow (ya borrados) | 230 | 651 |
+///
+/// El churn puro (borrar y reinsertar valores normales) no envenena el
+/// árbol — la fila de 4000 ciclos es la buena noticia, y por eso merece
+/// quedar registrada, no solo el caso malo. Pero un valor grande escrito
+/// UNA VEZ bajo un nodo de nivel 2, aunque se borre después, le cuesta a
+/// ESE nodo su camino rápido para siempre: 4,6× más lecturas en el peor
+/// caso medido sobre un tercio del árbol, más de 8× sobre la poda
+/// completa. Una base que alguna vez ha guardado valores grandes deja de
+/// tener la garantía de coste de la poda diaria — el motivo de ser de
+/// esta tarea — para los nodos que llegaron a tocar esos valores,
+/// permanentemente.
+///
+/// Lo único que restaura el bit es reconstruir el nodo desde cero
+/// verificando de verdad sus hijos — fusión de páginas infrautilizadas
+/// (ya pendiente desde la tarea 12 por la deriva de profundidad que
+/// documenta `MAX_DEPTH` en `tree.rs`) sería el mecanismo natural para
+/// hacerlo de paso. Nada de lo que existe hoy lo hace: trabajo de fase 2,
+/// no de esta tarea.
 const CHILDREN_PLAIN_FLAG: u8 = 0x01;
 
 impl<'a> PageRef<'a> {

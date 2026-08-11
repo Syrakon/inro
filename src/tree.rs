@@ -906,18 +906,46 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
             // nivel. Se descarta y el padre apunta directamente al nieto. Así
             // el árbol encoge por arriba sin código específico de raíz.
             //
-            // El hijo que se promueve (`extra`) es siempre uno que esta
-            // llamada NO tocó — el que sí se tocó es el que acaba de
-            // desaparecer (`Removal::Gone`, más arriba) — así que su
-            // "planitud" es exactamente la que ya tenía ESTA página antes
-            // de la operación (`page.children_plain()`), sin necesidad de
-            // volver a comprobarlo.
+            // **Corrección, ronda 2 de revisión de la tarea 15 ("también
+            // corregir").** Este comentario decía antes que el hijo que se
+            // promueve (`extra`) "es siempre uno que esta llamada NO tocó",
+            // y por eso usaba directamente `page.children_plain()` (el
+            // valor VIEJO, sin pasar por `children_plain`, la variable que
+            // sí se actualiza con el resultado fresco del hijo tocado) para
+            // etiquetar el `Removal::Updated` de abajo. Es falso en un caso:
+            // si `page.n_slots() == 0` (un nodo interno corrupto sin
+            // separadores — imposible de producir por `emit`, que nunca
+            // construye uno así, pero no comprobado al leer una página
+            // ajena), `child_index` resuelve a la posición `extra` para
+            // CUALQUIER clave, así que el hijo tocado por esta llamada Y el
+            // que acaba en `extra` son el MISMO — exactamente el caso que
+            // el comentario decía que no podía pasar. Con `page.n_slots() ==
+            // 0`, `entries` ya estaba vacío ANTES de procesar `result`
+            // (el bucle de más arriba no tiene nada que copiar), así que
+            // esta rama se alcanza también con `Removal::Updated` (no solo
+            // con el `Gone` que colapsa un nodo bien formado), y en ese
+            // caso `page.children_plain()` (el valor de ANTES de tocar
+            // nada) puede ser `true` mientras el resultado fresco del hijo
+            // tocado (`plain`, ya incorporado en `children_plain` por el
+            // `&=` de la rama `Updated`, más arriba) sea `false` — el hijo
+            // promovido quedaría etiquetado como plano sin serlo, la
+            // dirección insegura que las rondas 1 y 2 de revisión llevan
+            // cerrando en todos los demás sitios.
+            //
+            // La corrección real, no solo de comentario: usar
+            // `children_plain` (la variable local, ya actualizada) en vez
+            // de volver a leer `page.children_plain()`. Para un árbol bien
+            // formado (`page.n_slots() >= 1`) esta rama solo se alcanza vía
+            // `Removal::Gone` — que nunca toca `children_plain`, así que en
+            // ese caso `children_plain == page.children_plain()` siempre —
+            // así que el cambio no altera ningún resultado ya correcto,
+            // solo cierra el caso corrupto.
             if entries.is_empty() {
                 tx.free(page_no);
                 return Ok(if extra == 0 {
                     Removal::Gone
                 } else {
-                    Removal::Updated(extra, page.children_plain())
+                    Removal::Updated(extra, children_plain)
                 });
             }
 
@@ -1051,8 +1079,64 @@ impl RangeBudget {
 /// jamás reparte la página `0` (reservada para la cabecera) ni ninguna
 /// anterior a `n_pages` en el momento de la asignación, así que cualquier
 /// hijo `== 0` o `>= n_pages` es, sin ambigüedad, corrupción.
+///
+/// **Ronda 2 de revisión de la tarea 15, hallazgo 1 — clase todavía
+/// abierta.** La comprobación original solo rechazaba `0`, pero `1..=
+/// meta_b_page` (la ranura de meta A en la página `1`, la ranura de meta B
+/// en `meta_b_page`, y el hueco reservado entre medias si `page_size` es
+/// menor que 4 KB) son EXACTAMENTE tan inválidas como la `0` — ninguna es
+/// una página de nodo legítima, por la misma razón (`alloc` nunca las
+/// reparte). Confirmado de punta a punta con `extra == 1` (la ranura de
+/// meta A): `free_subtree` la volcaba a la lista de libres sin más, y tras
+/// el commit `alloc()` volvía a repartir la página `1` — la siguiente
+/// escritura destruye esa ranura de meta, mismo desenlace que con la `0`,
+/// una página más allá. La cota correcta es `child <= meta_b_page`, no
+/// `child == 0`: `meta_b_page` es la página reservada más alta (se lee de
+/// la geometría del `Pager` vía `WriteTxn::last_reserved_page`, no se fija
+/// a un número, porque se mueve cuando el fichero crece más allá de 4 KB
+/// de `page_size` — ver `meta_b_page` en `tx.rs`). Como `meta_b_page` es
+/// siempre `>= 2` (`max(2, 4096 / page_size)`), esta comprobación ya cubre
+/// `child == 0` sin necesitar las dos por separado.
 fn validate_child(tx: &WriteTxn, page_no: PageNo, child: PageNo) -> Result<()> {
-    if child == 0 || child >= tx.n_pages() {
+    if child <= tx.last_reserved_page() || child >= tx.n_pages() {
+        return Err(Error::Corrupt { page: page_no, kind: CorruptKind::CellBounds });
+    }
+    Ok(())
+}
+
+/// Comprueba que los `n_slots() + 1` punteros a hijo de un nodo interno
+/// (las `n_slots()` celdas normales más `extra`) no contienen ningún
+/// duplicado.
+///
+/// **Ronda 2 de revisión de la tarea 15, hallazgo 2.** Un nodo interno
+/// corrupto con, por ejemplo, `child(0) == extra`, hace que la misma
+/// página se libere DOS VECES dentro de la misma llamada a
+/// `free_subtree`/`delete_range_rec` — dos dueños de una sola página tras
+/// el siguiente `alloc()`, la clase de corrupción que este motor combate
+/// desde la tarea 9. `validate_child` (más arriba) no cierra esto: valida
+/// que CADA hijo, por separado, sea un número de página plausible, pero
+/// dos hijos pueden ser cada uno perfectamente plausibles y a la vez el
+/// MISMO número.
+///
+/// Se llama en LAS DOS ramas de `free_subtree` (con `children_plain()`
+/// cierto o falso), no solo en la de bloque, porque un duplicado hace daño
+/// por los dos caminos: en la de bloque, `tx.free(child)` se llama dos
+/// veces directamente sobre el mismo número, sin ninguna otra
+/// comprobación de por medio — el camino que se salta la recursión, así
+/// que también el que hace MÁS daño, sin ni siquiera necesitar abrir la
+/// página repetida una segunda vez. En la recursiva, `free_subtree` se
+/// invoca dos veces sobre la MISMA página — cada invocación acaba en su
+/// propio `tx.free(page_no)` al terminar, así que el resultado es el
+/// mismo doble-free, solo que tarda una lectura de página más en
+/// manifestarse en vez de ser instantáneo. El coste de comprobar aquí es
+/// lineal en el número de hijos de ESTE nodo — unas pocas decenas como
+/// mucho, dado el límite de `page_size / 4` sobre el tamaño de clave que
+/// ya impone `put` — nada frente a la lectura de página que esta función
+/// ya ha pagado para llegar aquí.
+fn validate_no_duplicate_children(page_no: PageNo, page: &PageRef<'_>) -> Result<()> {
+    let mut children: Vec<PageNo> = (0..=page.n_slots()).map(|i| child_at(page, i)).collect();
+    children.sort_unstable();
+    if children.windows(2).any(|w| w[0] == w[1]) {
         return Err(Error::Corrupt { page: page_no, kind: CorruptKind::CellBounds });
     }
     Ok(())
@@ -1144,6 +1228,7 @@ fn free_subtree(
             tx.free(page_no);
         }
         PageType::Internal => {
+            validate_no_duplicate_children(page_no, &page)?;
             let plain = page.children_plain();
             for i in 0..=page.n_slots() {
                 let child = child_at(&page, i);
@@ -1330,7 +1415,16 @@ fn delete_range_rec(
             // promueve lo que de verdad haya sobrevivido en la última
             // posición de la reconstrucción — ya con el resultado propio
             // de esa posición incorporado, no el original sin tocar.
+            // Ronda 2 de revisión de la tarea 15, hallazgo 2: comprobación
+            // de duplicados igual que en `free_subtree` — un `child_at`
+            // repetido entre estos `n + 1` hijos procesaría la MISMA
+            // página dos veces en dos llamadas recursivas distintas, cada
+            // una con su propio resultado (`Updated`/`Gone`) aplicado a
+            // esta reconstrucción, y potencialmente su propio `tx.free()`
+            // si alguna de las dos concluye `Gone` — el mismo doble-free
+            // que en `free_subtree`, por el mismo motivo estructural.
             let n = page.n_slots();
+            validate_no_duplicate_children(page_no, &page)?;
             let mut results: Vec<Removal> = Vec::with_capacity(n + 1);
             for i in 0..=n {
                 let child = child_at(&page, i);
@@ -4143,6 +4237,75 @@ mod range_tests {
         db
     }
 
+    /// Tarea 15, ronda 2 de revisión, hallazgo 3: `children_plain` es
+    /// monótono e IRREVERSIBLE por nodo (ver el comentario de
+    /// `CHILDREN_PLAIN_FLAG` en `page.rs`, donde viven los números
+    /// medidos que esta prueba guarda como regresión permanente). Dos
+    /// afirmaciones, cada una con su propia asserción:
+    /// - El churn puro (borrar y reinsertar valores normales, sin
+    ///   overflow) NO envenena el árbol: el coste tras 4000 ciclos se
+    ///   queda cerca del de un árbol recién sembrado.
+    /// - Un valor de overflow escrito una sola vez bajo un nodo, aunque se
+    ///   borre después, SÍ le cuesta a ese nodo su camino rápido para
+    ///   siempre — el coste sube con el número de nodos que llegaron a
+    ///   tocar un valor así, no con el número de entradas borradas.
+    #[test]
+    fn an_overflow_value_ever_written_costs_its_node_the_fast_path_permanently() {
+        let read_middle_third = |db: &Db| -> u64 {
+            let before = db.pages_read();
+            let mut tx = db.begin_write().unwrap();
+            tx.delete_range(0x01, b"006000", b"013000").unwrap();
+            let read = db.pages_read() - before;
+            tx.commit().unwrap();
+            read
+        };
+
+        let fresh = seeded(20_000);
+        let fresh_read = read_middle_third(&fresh);
+
+        let churned = seeded(20_000);
+        let mut tx = churned.begin_write().unwrap();
+        for i in 0..4000u32 {
+            tx.delete(0x01, alloc::format!("{i:06}").as_bytes()).unwrap();
+            tx.put(0x01, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
+        }
+        tx.commit().unwrap();
+        let churned_read = read_middle_third(&churned);
+        assert!(
+            churned_read <= fresh_read + 20,
+            "el churn sin overflow envenenó el árbol: fresco={fresh_read}, tras 4000 \
+             ciclos={churned_read}"
+        );
+
+        let one_poisoned_leaf = seeded(20_000);
+        let mut tx = one_poisoned_leaf.begin_write().unwrap();
+        tx.put(0x01, b"010000", &alloc::vec![7u8; 2000]).unwrap();
+        tx.delete(0x01, b"010000").unwrap();
+        tx.commit().unwrap();
+        let one_poisoned_read = read_middle_third(&one_poisoned_leaf);
+        assert!(
+            one_poisoned_read > fresh_read,
+            "una sola hoja que tuvo overflow, ya borrado, no subió el coste: \
+             fresco={fresh_read}, con una hoja envenenada={one_poisoned_read}"
+        );
+
+        let all_poisoned = seeded(20_000);
+        let mut tx = all_poisoned.begin_write().unwrap();
+        for i in 0..20_000u32 {
+            let key = alloc::format!("{i:06}");
+            tx.put(0x01, key.as_bytes(), &alloc::vec![7u8; 2000]).unwrap();
+            tx.delete(0x01, key.as_bytes()).unwrap();
+            tx.put(0x01, key.as_bytes(), b"v").unwrap();
+        }
+        tx.commit().unwrap();
+        let all_poisoned_read = read_middle_third(&all_poisoned);
+        assert!(
+            all_poisoned_read > 4 * fresh_read,
+            "todas las hojas tuvieron overflow, ya borrado, pero el coste no subió ni 4×: \
+             fresco={fresh_read}, con todas envenenadas={all_poisoned_read}"
+        );
+    }
+
     #[test]
     fn deletes_exactly_the_requested_range() {
         let db = seeded(2000);
@@ -4491,6 +4654,61 @@ mod range_bound_tests {
     use crate::storage::MemStorage;
     use crate::tx::{Db, Options};
 
+    /// Construye una cadena "gemela" de `k` niveles que ejercita el mismo
+    /// fenómeno de 2^k caminos que el hallazgo 2 de la tarea 14
+    /// (`child(0) == extra` repetido en cada nivel), pero SIN que ningún
+    /// nodo tenga hijos duplicados dentro de sí mismo.
+    ///
+    /// **Por qué cambió respecto a la construcción original.** La ronda 2
+    /// de revisión de la tarea 15 (hallazgo 2) añadió
+    /// `validate_no_duplicate_children`, que rechaza `child(0) == extra`
+    /// de inmediato, con `CellBounds`, antes de que la cota de TRABAJO
+    /// tenga ocasión de intervenir — exactamente la construcción que
+    /// usaban las pruebas de este módulo antes de esa corrección, así que
+    /// dejaron de fallar con `TreeLoop` (empezaron a fallar más rápido
+    /// todavía, con `CellBounds`, pero eso ya no ejercita `RangeBudget`,
+    /// que es lo que estas pruebas existen para comprobar).
+    ///
+    /// La construcción de aquí comparte páginas ENTRE hermanos, no DENTRO
+    /// de un mismo nodo: en cada nivel `i` hay dos páginas, `left` y
+    /// `right`, y el nivel `i+1` las referencia cruzadas —
+    /// `new_left.child(0) = left`, `new_left.extra = right`;
+    /// `new_right.child(0) = right`, `new_right.extra = left` — así que
+    /// NINGÚN nodo individual repite un hijo (`left != right` siempre, son
+    /// páginas distintas), pero procesar `new_left` visita tanto `left`
+    /// como `right`, y procesar `new_right` visita las MISMAS dos — el
+    /// mismo par de páginas, alcanzado por dos caminos distintos. Con `k`
+    /// niveles así apilados, la profundidad `d` acumula 2^d invocaciones
+    /// aunque solo existan `2k + 2` páginas de verdad — el mismo ataque de
+    /// fondo, con una fachada estructural distinta.
+    fn build_twin_chain_dag(tx: &mut WriteTxn, k: u32) -> PageNo {
+        let leaf_a = tx.alloc().unwrap();
+        let leaf_a_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
+        tx.write_page(leaf_a, &leaf_a_bytes).unwrap();
+        let leaf_b = tx.alloc().unwrap();
+        let leaf_b_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
+        tx.write_page(leaf_b, &leaf_b_bytes).unwrap();
+
+        let (mut left, mut right) = (leaf_a, leaf_b);
+        for _ in 0..k {
+            let new_left = tx.alloc().unwrap();
+            let mut lb = PageBuilder::new(512, PageType::Internal);
+            lb.set_extra(right);
+            let l_bytes = lb.build(&[(b"k".as_slice(), CellPayload::Child(left))]).unwrap();
+            tx.write_page(new_left, &l_bytes).unwrap();
+
+            let new_right = tx.alloc().unwrap();
+            let mut rb = PageBuilder::new(512, PageType::Internal);
+            rb.set_extra(left);
+            let r_bytes = rb.build(&[(b"k".as_slice(), CellPayload::Child(right))]).unwrap();
+            tx.write_page(new_right, &r_bytes).unwrap();
+
+            left = new_left;
+            right = new_right;
+        }
+        left
+    }
+
     /// Dos nodos internos cuyo `extra` se apunta el uno al otro: sin la
     /// cota de profundidad, `free_subtree` (que SÍ se llama a sí misma,
     /// a diferencia del cursor) desbordaría la pila de verdad, no solo
@@ -4521,9 +4739,9 @@ mod range_bound_tests {
         );
     }
 
-    /// `k` páginas internas con `child(0) == extra`, cada una apuntando a la
-    /// siguiente, terminando en una hoja vacía — el mismo DAG del hallazgo 2
-    /// de la tarea 14 (`a_corrupt_dag_with_repeated_children_is_rejected_quickly_not_slowly`,
+    /// `build_twin_chain_dag` de `k` niveles — el mismo fenómeno de fondo
+    /// que el DAG del hallazgo 2 de la tarea 14
+    /// (`a_corrupt_dag_with_repeated_children_is_rejected_quickly_not_slowly`,
     /// en `cursor_tests`), reutilizado aquí porque `free_subtree` está
     /// expuesto exactamente al mismo fenómeno: cada camino raíz-hoja mide
     /// `k + 1` niveles (muy por debajo de `MAX_DEPTH`), pero hay 2^k
@@ -4534,22 +4752,8 @@ mod range_bound_tests {
         let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
         let mut tx = db.begin_write().unwrap();
 
-        let leaf = tx.alloc().unwrap();
-        let leaf_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
-        tx.write_page(leaf, &leaf_bytes).unwrap();
-
         let k = 60u32; // muy por debajo de MAX_DEPTH (128); 2^60 caminos.
-        let mut next_page = leaf;
-        let mut root = leaf;
-        for _ in 0..k {
-            let p = tx.alloc().unwrap();
-            let mut b = PageBuilder::new(512, PageType::Internal);
-            b.set_extra(next_page);
-            let bytes = b.build(&[(b"k".as_slice(), CellPayload::Child(next_page))]).unwrap();
-            tx.write_page(p, &bytes).unwrap();
-            next_page = p;
-            root = p;
-        }
+        let root = build_twin_chain_dag(&mut tx, k);
 
         let mut budget = RangeBudget::new(tx.n_pages());
         let start = std::time::Instant::now();
@@ -4615,22 +4819,8 @@ mod range_bound_tests {
         let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
         let mut tx = db.begin_write().unwrap();
 
-        let leaf = tx.alloc().unwrap();
-        let leaf_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
-        tx.write_page(leaf, &leaf_bytes).unwrap();
-
         let k = 60u32;
-        let mut next_page = leaf;
-        let mut root = leaf;
-        for _ in 0..k {
-            let p = tx.alloc().unwrap();
-            let mut b = PageBuilder::new(512, PageType::Internal);
-            b.set_extra(next_page);
-            let bytes = b.build(&[(b"k".as_slice(), CellPayload::Child(next_page))]).unwrap();
-            tx.write_page(p, &bytes).unwrap();
-            next_page = p;
-            root = p;
-        }
+        let root = build_twin_chain_dag(&mut tx, k);
 
         let start = std::time::Instant::now();
         let err = delete_range(&mut tx, root, b"\x00", b"\xff").unwrap_err();
@@ -4979,6 +5169,154 @@ mod range_accounting_tests {
 
         let mut budget = RangeBudget::new(tx.n_pages());
         let err = free_subtree(&mut tx, root, 1, &mut budget).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::CellBounds, .. }),
+            "se esperaba CellBounds, se obtuvo {err:?}"
+        );
+    }
+
+    /// Ronda 2 de revisión de la tarea 15, hallazgo 1: `validate_child`
+    /// rechazaba `child == 0`, pero `1..=meta_b_page` — las ranuras de
+    /// meta — son exactamente tan inválidas. `extra == 1` (la ranura de
+    /// meta A) es la reproducción exacta del informe: antes de esta
+    /// corrección, `free_subtree` la volcaba a la lista de libres, y la
+    /// siguiente escritura habría destruido esa ranura de meta. La prueba
+    /// afirma `Err(Corrupt)` directamente — no observa lo que `alloc()`
+    /// devuelve después, que es justo el síntoma indirecto que dejó pasar
+    /// esta clase de defecto la primera vez.
+    #[test]
+    fn free_subtree_rejects_a_child_pointing_at_a_reserved_meta_slot() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let leaf = tx.alloc().unwrap();
+        let leaf_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
+        tx.write_page(leaf, &leaf_bytes).unwrap();
+
+        let root = tx.alloc().unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        // `extra == 1`: la ranura de meta A, no la página `0` — la
+        // reproducción exacta del hallazgo 1. `children_plain` a `true`
+        // para forzar el camino en bloque, el que la corrección de la
+        // ronda 1 dejó protegido solo contra `child == 0`.
+        rb.set_extra(1);
+        rb.set_children_plain(true);
+        let root_bytes = rb.build(&[(b"m".as_slice(), CellPayload::Child(leaf))]).unwrap();
+        tx.write_page(root, &root_bytes).unwrap();
+
+        let mut budget = RangeBudget::new(tx.n_pages());
+        let err = free_subtree(&mut tx, root, 1, &mut budget).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::CellBounds, .. }),
+            "se esperaba CellBounds, se obtuvo {err:?}"
+        );
+    }
+
+    /// Igual que la prueba anterior, pero justo en el límite:
+    /// `last_reserved_page()` (`meta_b_page`) debe rechazarse, no solo las
+    /// páginas estrictamente por debajo — la comparación correcta es
+    /// `child <= meta_b_page`, no `child < meta_b_page`.
+    #[test]
+    fn free_subtree_rejects_a_child_at_exactly_the_last_reserved_page() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let last_reserved = tx.last_reserved_page();
+
+        let root = tx.alloc().unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(last_reserved);
+        rb.set_children_plain(true);
+        let root_bytes = rb.build(&[]).unwrap();
+        tx.write_page(root, &root_bytes).unwrap();
+
+        let mut budget = RangeBudget::new(tx.n_pages());
+        let err = free_subtree(&mut tx, root, 1, &mut budget).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::CellBounds, .. }),
+            "se esperaba CellBounds, se obtuvo {err:?}"
+        );
+    }
+
+    /// Ronda 2 de revisión de la tarea 15, hallazgo 2: un nodo interno
+    /// corrupto con `child(0) == extra` no debe hacer que `free_subtree`
+    /// libere la misma página dos veces — dos dueños de una sola página
+    /// tras el siguiente `alloc()`, sin que nada lo detecte. Camino en
+    /// bloque (`children_plain() == true`): el que hace más daño, porque
+    /// libera sin abrir nada.
+    #[test]
+    fn free_subtree_rejects_duplicate_child_pointers_on_the_bulk_path() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let leaf = tx.alloc().unwrap();
+        let leaf_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
+        tx.write_page(leaf, &leaf_bytes).unwrap();
+
+        let root = tx.alloc().unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        // `extra == leaf` a la vez que `child(0) == leaf`: el mismo número
+        // de página aparece dos veces entre los hijos de este nodo.
+        rb.set_extra(leaf);
+        rb.set_children_plain(true);
+        let root_bytes = rb.build(&[(b"m".as_slice(), CellPayload::Child(leaf))]).unwrap();
+        tx.write_page(root, &root_bytes).unwrap();
+
+        let mut budget = RangeBudget::new(tx.n_pages());
+        let err = free_subtree(&mut tx, root, 1, &mut budget).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::CellBounds, .. }),
+            "se esperaba CellBounds, se obtuvo {err:?}"
+        );
+    }
+
+    /// Misma corrupción que la prueba anterior, pero con
+    /// `children_plain() == false`, para confirmar que la comprobación de
+    /// duplicados no se salta el camino recursivo — ahí el doble-free
+    /// tardaría una lectura de página más en manifestarse (dos llamadas a
+    /// `free_subtree` sobre la misma página, cada una con su propio
+    /// `tx.free()` al terminar), pero sigue siendo el mismo defecto.
+    #[test]
+    fn free_subtree_rejects_duplicate_child_pointers_on_the_recursive_path() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let leaf = tx.alloc().unwrap();
+        let leaf_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
+        tx.write_page(leaf, &leaf_bytes).unwrap();
+
+        let root = tx.alloc().unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(leaf);
+        rb.set_children_plain(false);
+        let root_bytes = rb.build(&[(b"m".as_slice(), CellPayload::Child(leaf))]).unwrap();
+        tx.write_page(root, &root_bytes).unwrap();
+
+        let mut budget = RangeBudget::new(tx.n_pages());
+        let err = free_subtree(&mut tx, root, 1, &mut budget).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::CellBounds, .. }),
+            "se esperaba CellBounds, se obtuvo {err:?}"
+        );
+    }
+
+    /// La comprobación de duplicados también debe cubrir `delete_range_rec`,
+    /// no solo `free_subtree`: aquí el árbol tiene profundidad suficiente
+    /// para que la raíz no se acoja al atajo de "subárbol contenido"
+    /// (`from` no vacío, igual que en `range_bound_tests`), así que la
+    /// corrupción se alcanza por el camino de reconstrucción, no por el de
+    /// liberación en bloque.
+    #[test]
+    fn delete_range_rejects_duplicate_child_pointers() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let leaf = tx.alloc().unwrap();
+        let leaf_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
+        tx.write_page(leaf, &leaf_bytes).unwrap();
+
+        let root = tx.alloc().unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(leaf);
+        let root_bytes = rb.build(&[(b"m".as_slice(), CellPayload::Child(leaf))]).unwrap();
+        tx.write_page(root, &root_bytes).unwrap();
+
+        let err = delete_range(&mut tx, root, b"\x00", b"\xff").unwrap_err();
         assert!(
             matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::CellBounds, .. }),
             "se esperaba CellBounds, se obtuvo {err:?}"

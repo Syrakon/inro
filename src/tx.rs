@@ -411,6 +411,21 @@ impl<'db> WriteTxn<'db> {
         self.meta.n_pages
     }
 
+    /// Última página reservada del fichero: la cabecera es la página `0`,
+    /// las dos ranuras de meta viven en `1` y `meta_b_page` (con hueco sin
+    /// usar entre medias si `page_size` es menor que 4 KB — ver
+    /// `meta_b_page` más arriba en este fichero) — así que ninguna página
+    /// `<= meta_b_page` es jamás un hijo legítimo de un nodo interno.
+    /// `pub(crate)`: la usa `tree::validate_child` (tarea 15, ronda 2 de
+    /// revisión, hallazgo 1) para rechazar un hijo corrupto que caiga en
+    /// una de las ranuras de meta, no solo en la página `0` — se lee de la
+    /// geometría del `Pager` en vez de fijarla a un número, porque
+    /// `meta_b_page` se mueve cuando el fichero crece más allá de 4 KB de
+    /// `page_size`.
+    pub(crate) fn last_reserved_page(&self) -> PageNo {
+        self.db.pager.geometry().meta_b_page
+    }
+
     /// Páginas en uso ahora mismo: asignadas menos libres. Solo para
     /// pruebas, para poder afirmar sobre liberaciones (p. ej. que borrar o
     /// reemplazar un valor de overflow libera de verdad su cadena vieja).
