@@ -1233,25 +1233,76 @@ mod invariant_tests {
         }
     }
 
-    /// Repetir puts sobre la MISMA clave no debe hacer crecer el fichero sin
-    /// límite — pero desde la corrección del hallazgo 1 de la revisión de la
-    /// tarea 12 (`WriteTxn::alloc`, `src/tx.rs`), el reciclado ya no es por
-    /// operación, es por transacción CONFIRMADA: la meta confirmada actúa
-    /// como un lector implícito de sus propias páginas mientras la
-    /// transacción que las libera no haya confirmado, así que 2000 `put`
-    /// sobre la misma clave dentro de UNA sola transacción sin confirmar sí
-    /// hacen crecer el fichero durante esa transacción (cada una libera la
-    /// página anterior, que sigue siendo parte del árbol confirmado hasta
-    /// que ESTA transacción confirme) — eso ya no es la propiedad a
-    /// demostrar, es justo lo que corrige el hallazgo 1.
+    /// Repetir puts sobre la MISMA clave, DENTRO de la misma transacción sin
+    /// confirmar, no debe hacer crecer el fichero proporcionalmente al
+    /// número de actualizaciones.
     ///
-    /// Lo que sigue siendo cierto, y lo que prueba esta versión, es que el
-    /// reciclado ocurre en cuanto hay un commit de por medio: una SEGUNDA
-    /// ronda de 2000 actualizaciones, en una transacción nueva después de
-    /// que la primera ronda confirme, sí puede reciclar las páginas que
-    /// liberó la primera — porque para entonces ya son parte de una
-    /// transacción confirmada más antigua que la actual, no de la que
-    /// las liberó.
+    /// Es la propiedad que motivó el hallazgo 1 de la ronda 2 de revisión de
+    /// esta tarea: el camino de inserción copy-on-write libera la página
+    /// vieja en cada `put`, así que 2000 actualizaciones de la misma clave
+    /// liberan 2000 páginas — casi todas asignadas por esta misma
+    /// transacción un instante antes. Sin el conjunto propio de páginas
+    /// (`WriteTxn::own_free` / `self_allocated`, `src/tx.rs`), que
+    /// distingue "página que esta transacción asignó y ya liberó ella
+    /// misma" (reciclable de inmediato, nunca la vio la meta confirmada) de
+    /// "página heredada del árbol confirmado" (protegida hasta el commit,
+    /// hallazgo 1 de la ronda 1), cada una de esas 2000 páginas habría
+    /// consumido una página nueva del fichero en vez de reciclar la
+    /// anterior — el escenario exacto del lote de mil registros que describe
+    /// el hallazgo: miles de páginas por transacción, casi todas liberadas,
+    /// ninguna reciclable hasta el commit.
+    #[test]
+    fn repeated_updates_to_one_key_do_not_leak_pages_within_one_transaction() {
+        let storage = alloc::sync::Arc::new(MemStorage::new());
+        let db =
+            Db::create(alloc::boxed::Box::new(ArcStorage(storage.clone())), Options::default())
+                .unwrap();
+
+        let mut tx = db.begin_write().unwrap();
+        let mut root = put(&mut tx, 0, b"k", b"0").unwrap();
+        tx.set_root(root);
+        tx.commit().unwrap();
+        let size_after_first_commit = storage.snapshot().len();
+
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..2000u32 {
+            root = put(&mut tx, root, b"k", &i.to_le_bytes()).unwrap();
+        }
+        tx.set_root(root);
+        tx.commit().unwrap();
+        let size_after_2000_updates = storage.snapshot().len();
+
+        let r = db.begin_read();
+        assert_eq!(get(&r, r.root(), b"k").unwrap().as_deref(), Some(&1999u32.to_le_bytes()[..]));
+        // Una hoja de una sola clave no debería requerir más páginas que al
+        // principio, salvo el puñado que ocupa la lista de libres al
+        // serializarse (la PRIMERA página, heredada del commit anterior a
+        // esta transacción, sí queda protegida hasta que ESTA transacción
+        // confirme — eso cuenta como una página adicional, no como 2000):
+        // nada que crezca proporcionalmente al número de puts.
+        assert!(
+            size_after_2000_updates <= size_after_first_commit + 4096,
+            "el fichero creció de {size_after_first_commit} a {size_after_2000_updates} bytes \
+             tras 2000 actualizaciones de la misma clave en una sola transacción: páginas \
+             filtradas en vez de recicladas dentro de la transacción"
+        );
+    }
+
+    /// Repetir puts sobre la MISMA clave, en UNA transacción confirmada
+    /// aparte de la que hace las 2000 actualizaciones, no debe hacer crecer
+    /// el fichero proporcionalmente a ellas. Complementa (no sustituye) a
+    /// `repeated_updates_to_one_key_do_not_leak_pages_within_one_transaction`,
+    /// que prueba el reciclado DENTRO de una misma transacción sin
+    /// confirmar (`WriteTxn::own_free`, hallazgo 1 de la ronda 2 de
+    /// revisión de la tarea 12): esta prueba, en cambio, arranca una
+    /// SEGUNDA ronda de 2000 actualizaciones en una transacción NUEVA
+    /// después de que la primera ronda confirme, y comprueba que esa
+    /// segunda ronda recicla lo que liberó la primera — porque para
+    /// entonces esas páginas ya son parte de una transacción confirmada
+    /// más antigua que la actual, no de la que las liberó (hallazgo 1 de
+    /// la ronda 1). Las dos propiedades — reciclado intra-transacción y
+    /// reciclado entre transacciones confirmadas — son independientes y
+    /// las dos importan; de ahí las dos pruebas.
     #[test]
     fn repeated_updates_to_one_key_do_not_leak_pages_once_committed() {
         let storage = alloc::sync::Arc::new(MemStorage::new());
@@ -1306,6 +1357,53 @@ mod invariant_tests {
             "el fichero creció de {size_after_first_round} a {size_after_second_round} bytes \
              en la segunda ronda: páginas de una transacción ya confirmada que no se \
              reciclaron"
+        );
+    }
+
+    /// La carga que justifica el hallazgo 1 de la ronda 2 de revisión de la
+    /// tarea 12: un lote de 1000 registros de log DISTINTOS, en una sola
+    /// transacción, tal como escribiría el escritor de borde real que
+    /// menciona el hallazgo. Cada `put` de clave nueva recorre y libera el
+    /// camino raíz→hoja que acaba de tocar (copia en escritura), así que
+    /// 1000 puts liberan miles de páginas — casi todas asignadas por esta
+    /// misma transacción un instante antes.
+    ///
+    /// Medido a mano antes de esta prueba (`cargo test
+    /// probe_batch_growth_before_round_2`, sobre el commit anterior a esta
+    /// ronda, sin `own_free`/`self_allocated`): 1 480 704 bytes, 2892
+    /// páginas de 512 — sin reciclar dentro de la transacción, casi 3
+    /// páginas por `put`. Con el conjunto propio de páginas: 94 208 bytes,
+    /// 184 páginas — una reducción de ~15,7×. El techo de esta prueba dejó
+    /// bastante margen sobre las 184 medidas y bien por debajo de las 2892
+    /// de antes, para que un futuro cambio que rompa el reciclado intra-
+    /// transacción falle aquí, ruidosamente.
+    #[test]
+    fn a_batch_of_many_distinct_puts_does_not_grow_the_file_a_page_per_put() {
+        let storage = alloc::sync::Arc::new(MemStorage::new());
+        let db =
+            Db::create(alloc::boxed::Box::new(ArcStorage(storage.clone())), Options::default())
+                .unwrap();
+        let mut tx = db.begin_write().unwrap();
+        let mut root = 0;
+        for i in 0..1000u32 {
+            root = put(
+                &mut tx,
+                root,
+                alloc::format!("log/{i:06}").as_bytes(),
+                b"registro de ejemplo de la carga real",
+            )
+            .unwrap();
+        }
+        tx.set_root(root);
+        tx.commit().unwrap();
+        let size = storage.snapshot().len();
+        let page_size = 512usize;
+        assert!(
+            size <= 400 * page_size,
+            "el fichero mide {size} bytes ({} páginas de {page_size}) tras 1000 puts \
+             distintos en una sola transacción: muy por encima de las ~184 que hacen falta de \
+             verdad, señal de que el reciclado intra-transacción dejó de funcionar",
+            size / page_size
         );
     }
 }
@@ -1730,23 +1828,88 @@ mod delete_invariant_tests {
     }
 
     /// Borrar TODAS las claves de un árbol y reinsertarlas, varias veces
-    /// seguidas, no debe hacer crecer el fichero sin límite: cada página que
-    /// `delete_rec` libera (hojas vacías y nodos internos colapsados) debe
-    /// quedar disponible para que `put` la recicle — en cuanto haya un
-    /// commit de por medio.
+    /// seguidas, DENTRO de la misma transacción sin confirmar (un commit
+    /// por ciclo, no dos), no debe hacer crecer el fichero sin límite.
     ///
-    /// Ese matiz importa desde la corrección del hallazgo 1 de la revisión
-    /// de la tarea 12 (`WriteTxn::alloc`, `src/tx.rs`): la meta confirmada
-    /// es un lector implícito de sus propias páginas hasta que la
-    /// transacción que las libera confirme, así que borrar TODO el árbol y
-    /// reinsertarlo dentro de la MISMA transacción sin confirmar no puede
-    /// reciclar nada — las 400 páginas que libera el borrado siguen siendo
-    /// parte del árbol confirmado en ese instante. Por eso el borrado y la
-    /// reinserción de cada ciclo van en transacciones separadas, cada una
-    /// con su propio commit: así la reinserción de un ciclo sí puede
-    /// reciclar lo que confirmó el borrado del mismo ciclo.
+    /// Es la propiedad que motivó el hallazgo 1 de la ronda 2 de revisión de
+    /// esta tarea: borrar 400 claves libera del orden de 400+ páginas
+    /// (hojas vacías y nodos internos colapsados), casi todas asignadas por
+    /// la construcción original o por ciclos anteriores — es decir,
+    /// heredadas de una transacción confirmada previa la primera vez, pero
+    /// una vez que esta transacción las reasigna en la fase de reinserción
+    /// del MISMO ciclo, quedan marcadas como propias (`self_allocated`) y
+    /// cualquier borrado posterior DENTRO de esta misma transacción las
+    /// recicla de inmediato via `own_free`, sin esperar a un commit.
     #[test]
-    fn deleting_everything_then_reinserting_does_not_leak_pages() {
+    fn deleting_everything_then_reinserting_does_not_leak_pages_within_one_transaction() {
+        let storage = alloc::sync::Arc::new(MemStorage::new());
+        let db =
+            Db::create(alloc::boxed::Box::new(ArcStorage(storage.clone())), Options::default())
+                .unwrap();
+
+        let mut tx = db.begin_write().unwrap();
+        let mut root = 0;
+        let n = 400u32;
+        for i in 0..n {
+            root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v").unwrap();
+        }
+        tx.set_root(root);
+        tx.commit().unwrap();
+        let size_after_build = storage.snapshot().len();
+
+        for _cycle in 0..3 {
+            // Borrado y reinserción en la MISMA transacción, un solo
+            // commit al final del ciclo.
+            let mut tx = db.begin_write().unwrap();
+            let mut root = tx.root();
+            for i in 0..n {
+                let (r, existed) =
+                    delete(&mut tx, root, alloc::format!("k/{i:05}").as_bytes()).unwrap();
+                assert!(existed, "clave {i}");
+                root = r;
+            }
+            assert_eq!(root, 0, "el árbol vacío no deja raíz");
+            for i in 0..n {
+                root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v").unwrap();
+            }
+            tx.set_root(root);
+            tx.commit().unwrap();
+        }
+        let size_after_cycles = storage.snapshot().len();
+
+        // Solo el PRIMER borrado de cada ciclo libera páginas heredadas de
+        // fuera de esta transacción (protegidas hasta que confirme); el
+        // resto, dentro del mismo ciclo, son páginas que la propia
+        // reinserción del ciclo anterior ya había vuelto a asignar — y esas
+        // sí se reciclan de inmediato. El margen cubre el coste legítimo de
+        // volcar la lista de libres en los tres commits, no una fuga.
+        assert!(
+            size_after_cycles <= size_after_build + 16384,
+            "el fichero creció de {size_after_build} a {size_after_cycles} bytes tras ciclos \
+             de borrado + reinserción en una sola transacción cada uno: páginas filtradas en \
+             vez de recicladas dentro de la transacción"
+        );
+    }
+
+    /// Borrar TODAS las claves de un árbol y reinsertarlas, varias veces
+    /// seguidas, EN TRANSACCIONES SEPARADAS (borrado y reinserción de cada
+    /// ciclo, cada una con su propio commit), no debe hacer crecer el
+    /// fichero sin límite.
+    ///
+    /// Complementa (no sustituye) a
+    /// `deleting_everything_then_reinserting_does_not_leak_pages_within_one_transaction`,
+    /// que prueba el reciclado DENTRO de una misma transacción sin
+    /// confirmar (hallazgo 1 de la ronda 2 de revisión de la tarea 12,
+    /// `WriteTxn::own_free`): esta prueba, en cambio, demuestra que el
+    /// reciclado también funciona ENTRE transacciones confirmadas — la
+    /// meta confirmada es un lector implícito de sus propias páginas solo
+    /// hasta que la transacción que las libera confirme (hallazgo 1 de la
+    /// ronda 1), así que la reinserción de un ciclo, en su propia
+    /// transacción después de que el borrado del mismo ciclo confirme, sí
+    /// puede reciclar lo que ese borrado liberó. Las dos propiedades son
+    /// independientes y las dos importan.
+    #[test]
+    fn deleting_everything_then_reinserting_does_not_leak_pages_across_commits() {
         let storage = alloc::sync::Arc::new(MemStorage::new());
         let db =
             Db::create(alloc::boxed::Box::new(ArcStorage(storage.clone())), Options::default())
