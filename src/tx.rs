@@ -317,6 +317,12 @@ impl<'db> WriteTxn<'db> {
         self.guard.as_mut().expect("el estado del escritor siempre está presente")
     }
 
+    /// Tamaño de página fijado al crear la base. `emit` (árbol) lo necesita
+    /// para saber cuánto cabe en una página nueva.
+    pub fn page_size(&self) -> u32 {
+        self.db.pager.geometry().page_size
+    }
+
     /// Toma una página libre reutilizable o extiende el fichero.
     pub fn alloc(&mut self) -> Result<PageNo> {
         let oldest = self.db.oldest_reader();
