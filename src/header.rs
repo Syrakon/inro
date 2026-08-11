@@ -29,11 +29,17 @@ pub struct Geometry {
 
 impl Geometry {
     pub fn encode(&self) -> [u8; HEADER_SIZE] {
-        // encode derives log2 from trailing_zeros, which is only meaningful for a power of two.
-        // This asserts that page_size is a power of two with log2 in range 9..=16.
+        // `encode` derives log2 from `trailing_zeros`, which only means "log base 2"
+        // for a power of two: 1536.trailing_zeros() is 9, so a non-power-of-two would
+        // silently encode as 512 and decode back as 512. Both halves are load-bearing.
+        debug_assert!(
+            self.page_size.is_power_of_two(),
+            "page_size {} no es potencia de dos",
+            self.page_size
+        );
         debug_assert!(
             (9..=16).contains(&self.page_size.trailing_zeros()),
-            "page_size must be a power of two with log2 in range 9..=16, got {}",
+            "page_size {} fuera del rango admitido de 512 B a 64 KB",
             self.page_size
         );
         let mut b = [0u8; HEADER_SIZE];
@@ -122,6 +128,15 @@ mod tests {
         let mut g = sample();
         g.page_size = MAX_PAGE_SIZE; // 65_536 (log2 = 16)
         assert_eq!(Geometry::decode(&g.encode()).unwrap(), g);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no es potencia de dos")]
+    fn encode_rejects_a_page_size_that_is_not_a_power_of_two() {
+        let mut g = sample();
+        g.page_size = 1536;
+        let _ = g.encode();
     }
 
     #[test]
