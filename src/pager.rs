@@ -127,6 +127,13 @@ impl Pager {
         Ok((len / self.geometry.page_size as u64) as u32)
     }
 
+    /// Devuelve el medio de almacenamiento, descartando la caché. Se usa al
+    /// abrir, donde el pager provisional para leer la lista de libres se
+    /// reemplaza por el definitivo.
+    pub fn into_storage(self) -> Box<dyn Storage> {
+        self.storage
+    }
+
     #[cfg(test)]
     pub fn cached_pages(&self) -> usize {
         self.cache.lock().unwrap().entries.len()

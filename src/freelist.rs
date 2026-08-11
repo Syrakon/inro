@@ -9,6 +9,7 @@ pub const FREELIST_HEADER: usize = 32;
 
 /// Un grupo de páginas liberadas, con la transacción más reciente que las
 /// liberó. Se reutiliza el grupo entero o ninguna de sus páginas.
+#[derive(Clone)]
 struct Group {
     max_txn: TxnId,
     pages: VecDeque<PageNo>,
@@ -50,6 +51,12 @@ fn decode_freelist_page(bytes: &[u8], page_no: PageNo) -> Result<(TxnId, VecDequ
 /// Cola de páginas libres. En memoria solo viven los grupos de los extremos
 /// (cabeza y cola); los intermedios se leen bajo demanda al vaciarse la
 /// cabeza (`pop_refill`) o, en bloque, al hacer `flush`.
+///
+/// `Clone` es barato: solo copia los grupos materializados en memoria (a lo
+/// sumo cabeza y cola), nunca la cadena entera en disco. Lo usa la capa de
+/// transacciones para poder deshacer una transacción de escritura abortada:
+/// ver `WriteTxn` en `tx.rs`.
+#[derive(Clone)]
 pub struct Freelist {
     groups: VecDeque<Group>,
     /// Primera página en disco que aún no se ha traído a `groups`, o 0 si

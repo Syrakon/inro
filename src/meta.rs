@@ -95,6 +95,13 @@ impl Meta {
         storage.write_at(offset, &self.encode(g.page_size))
     }
 
+    /// Escribe a través del `Pager` en lugar de directamente al medio, para
+    /// que la caché se invalide.
+    #[cfg(feature = "std")]
+    pub fn store_via(&self, pager: &crate::pager::Pager, g: &Geometry, slot: MetaSlot) -> Result<()> {
+        pager.write(slot.page(g), &self.encode(g.page_size))
+    }
+
     /// Lee ambas ranuras, descarta las que no validen y devuelve la de mayor
     /// `txn_id`. Es todo el procedimiento de recuperación que existe: sin WAL,
     /// sin recorrido de cola, coste constante.

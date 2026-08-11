@@ -21,9 +21,13 @@ pub mod page;
 pub mod pager;
 #[cfg(feature = "std")]
 pub mod freelist;
+#[cfg(feature = "std")]
+pub mod tx;
 
 pub use error::{CorruptKind, Error, IoError, Result};
 pub use storage::Storage;
+#[cfg(feature = "std")]
+pub use tx::{Db, Options, Sync};
 
 /// Número de página. El fichero direcciona 2^32 páginas: 2 TB con páginas de
 /// 512 bytes, 16 TB con páginas de 4 KB.

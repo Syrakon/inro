@@ -44,11 +44,12 @@ mod imp_std {
 
     pub struct MemStorage {
         data: Mutex<Vec<u8>>,
+        reads: std::sync::atomic::AtomicU64,
     }
 
     impl MemStorage {
         pub fn new() -> Self {
-            Self { data: Mutex::new(Vec::new()) }
+            Self { data: Mutex::new(Vec::new()), reads: std::sync::atomic::AtomicU64::new(0) }
         }
 
         /// Copia del contenido completo. Solo para pruebas.
@@ -60,10 +61,22 @@ mod imp_std {
         pub fn restore(&self, bytes: Vec<u8>) {
             *self.data.lock().unwrap() = bytes;
         }
+
+        /// Número de llamadas a `read_at` desde la creación o el último
+        /// `reset_read_count`. Solo para pruebas: mide el coste de apertura
+        /// contando lecturas, no tiempo.
+        pub fn read_count(&self) -> u64 {
+            self.reads.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        pub fn reset_read_count(&self) {
+            self.reads.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     impl Storage for MemStorage {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let data = self.data.lock().unwrap();
             let start = offset as usize;
             let end = start + buf.len();
