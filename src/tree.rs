@@ -495,9 +495,20 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
                     } else {
                         // Desaparece el hijo `extra`: el de la última celda
                         // pasa a ocupar su lugar y pierde su separador.
+                        //
+                        // Solo `None` puede llegar aquí en la práctica —
+                        // `entries` se construye dos líneas más arriba
+                        // enteramente con `CellPayload::Child`, nunca con
+                        // `Value` — pero se hace explícito en vez de agrupar
+                        // ambos bajo un `_`: un `_` sugiere que un valor
+                        // fuera posible en un nodo interno, cuando en
+                        // realidad sería corrupción, no un caso normal más.
                         match entries.pop() {
                             Some((_, CellPayload::Child(c))) => extra = c,
-                            _ => {
+                            Some((_, CellPayload::Value(_))) => {
+                                unreachable!("nodo interno con valor: `entries` solo contiene `CellPayload::Child`")
+                            }
+                            None => {
                                 tx.free(page_no);
                                 return Ok(Removal::Gone);
                             }
