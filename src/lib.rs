@@ -14,6 +14,7 @@ pub mod error;
 pub(crate) mod crc32;
 pub(crate) mod varint;
 pub mod storage;
+pub mod header;
 
 pub use error::{CorruptKind, Error, IoError, Result};
 pub use storage::Storage;
