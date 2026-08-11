@@ -190,11 +190,18 @@ impl<'a> PageRef<'a> {
     /// Valor de la celda `i`, asumiendo que está en línea. Solo válido en
     /// páginas hoja, y solo en celdas que no son de overflow: sobre una
     /// celda de overflow, `value_len` es `OVERFLOW_MARKER` y este método
-    /// intentaría tomar un slice de ese tamaño, saliéndose de la página.
-    /// Desde la tarea 13, una hoja puede mezclar ambos tipos de celda; el
-    /// llamante debe usar `leaf_value` para distinguirlos antes de decidir
-    /// cuál de los dos leer.
-    pub fn value(&self, i: usize) -> &'a [u8] {
+    /// tomaría un slice de ese tamaño (`usize::MAX` en una máquina de 32
+    /// bits o menos, `u64::MAX as usize` en una de 64), saliéndose de la
+    /// página y entrando en pánico. Privado a propósito, no solo documentado:
+    /// una nota en el comentario no impide que código futuro dentro del
+    /// crate lo llame sobre una hoja que mezcle celdas en línea y de
+    /// overflow (posible desde la tarea 13) y provoque justo ese pánico.
+    /// `#[cfg(test)]` porque, cerrado ese hueco, su único uso que queda es
+    /// el de las pruebas de este módulo — todo el código del árbol usa
+    /// `leaf_value`, que sí distingue los dos casos; mantenerlo fuera de
+    /// pruebas sería superficie muerta en el binario de producción.
+    #[cfg(test)]
+    fn value(&self, i: usize) -> &'a [u8] {
         let off = self.slot(i);
         let (suffix_len, n1) = varint::read(&self.bytes[off..]).expect("validado en parse");
         let after = off + n1 + suffix_len as usize;

@@ -344,18 +344,6 @@ impl<'db> WriteTxn<'db> {
         self.db.pager.geometry().page_size
     }
 
-    /// Número total de páginas que el fichero conoce en este momento,
-    /// asignadas o libres. Cota superior natural para cualquier cadena
-    /// acíclica de páginas leída de disco: no puede tener más eslabones
-    /// distintos que páginas existen. `free_overflow` (tarea 13) la usa para
-    /// acotar el recorrido de una cadena de overflow corrupta que ciclara,
-    /// a falta de una cota más ajustada — su firma, fijada por la interfaz
-    /// de la tarea, no recibe la longitud del valor como sí hace
-    /// `read_overflow`.
-    pub fn n_pages(&self) -> u32 {
-        self.meta.n_pages
-    }
-
     /// Páginas en uso ahora mismo: asignadas menos libres. Solo para
     /// pruebas, para poder afirmar sobre liberaciones (p. ej. que borrar o
     /// reemplazar un valor de overflow libera de verdad su cadena vieja).

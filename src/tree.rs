@@ -194,11 +194,50 @@ pub fn write_overflow(tx: &mut WriteTxn, value: &[u8]) -> Result<(u64, PageNo)> 
 /// leídos de disco debe estarlo), pero aquí hay una cota más ajustada que la
 /// de `descend` porque `len` se conoce de antemano. Una cadena legítima
 /// nunca necesita más páginas que `ceil(len / capacidad_por_página)` —
-/// exactamente las que trocea `write_overflow`, ni una más — así que
-/// superar esa cifra sin haber reunido `len` bytes es un ciclo en los
-/// punteros `next`, no una cadena válida. La capacidad se calcula a partir
-/// del tamaño real de la primera página leída: todas las páginas del mismo
-/// fichero comparten tamaño, así que basta calcularla una vez.
+/// exactamente las que trocea `write_overflow`, ni una más. La capacidad se
+/// calcula a partir del tamaño real de la primera página leída: todas las
+/// páginas del mismo fichero comparten tamaño, así que basta calcularla una
+/// vez.
+///
+/// **La cota de saltos, sola, NO basta para rechazar un ciclo**: con
+/// capacidad uniforme por página, cada vuelta de un ciclo aporta la misma
+/// cantidad fija de bytes tanto si la página es nueva como si es una
+/// repetida, así que un ciclo alcanza `len` bytes en exactamente el mismo
+/// número de saltos que una cadena legítima de ese tamaño — la cota nunca
+/// llega a dispararse, y el bucle terminaría con `Ok` y datos repetidos en
+/// vez de los reales. Verificado con
+/// `read_overflow_terminates_on_a_cycle_instead_of_hanging`, que fabrica esa
+/// cadena a mano.
+///
+/// Lo que sí lo detecta es una comprobación distinta, tras el bucle:
+/// `write_overflow` deja `next == 0` únicamente en la ÚLTIMA página de una
+/// cadena legítima (ver su bucle de escritura), así que reunir `len` bytes
+/// agotando de verdad la cadena real siempre deja `current == 0`. Un ciclo
+/// no contiene ninguna página con `next == 0`, así que un recorrido que
+/// termina por haber reunido `len` bytes sin que la cadena llegara a su
+/// propio final deja `current` distinto de cero — sea la causa un ciclo, una
+/// `len` almacenada menor que el número real de páginas, o cualquier otra
+/// forma de alias entre cadenas. Es la comprobación que de verdad cierra el
+/// hueco de corrección: sin ella, esta función podía devolver `Ok` con bytes
+/// que no son el valor real, rompiendo la regla que sostiene el motor desde
+/// la tarea 5 (entrada corrupta se reporta como `Err`, nunca como una
+/// respuesta incorrecta silenciosa).
+///
+/// La cota de saltos se conserva de todos modos, no como mecanismo de
+/// corrección (ya no lo es, ver arriba) sino como cota EXPLÍCITA de
+/// recorrido: con páginas de tamaño uniforme —cierto para cualquier `Pager`
+/// real de este crate, que fija un único `page_size` por fichero— el propio
+/// `while current != 0 && out.len() < len` ya termina en, como mucho,
+/// `ceil(len/capacidad)` vueltas, cicle o no. Pero `read_overflow` recibe
+/// `src: &impl PageSource`, no un `Pager` concreto, y el trait no promete
+/// tamaño uniforme entre lecturas. Un `PageSource` que devolviera páginas de
+/// tamaño decreciente (nada en la firma lo impide, aunque ningún
+/// implementador de este crate lo haga) podría hacer que la capacidad
+/// efectiva por vuelta cayera a un puñado de bytes, y entonces sí haría
+/// falta un número de vueltas sin cota conocida de antemano para agotar
+/// `len` — exactamente el escenario que `todo recorrido de punteros leídos
+/// de disco va acotado` pide cerrar, sin depender de una propiedad de
+/// `Pager` que esta función no puede exigir por su propia firma.
 pub fn read_overflow(src: &impl PageSource, len: u64, first: PageNo) -> Result<Vec<u8>> {
     // Sin `with_capacity(len as usize)`: `len` viene de una celda leída de
     // disco, y si esa celda está corrompida (deliberadamente o no, pero con
@@ -231,22 +270,42 @@ pub fn read_overflow(src: &impl PageSource, len: u64, first: PageNo) -> Result<V
         out.extend_from_slice(&bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + take]);
         current = page.extra();
     }
+    // La comprobación que de verdad detecta un ciclo (o cualquier alias que
+    // deje la cadena sin agotarse): ver el comentario de la función. Debe ir
+    // ANTES de la comprobación de longitud de abajo — cuando el bucle
+    // termina con `current != 0` es precisamente porque `out.len()` ya
+    // alcanzó `len` (la otra mitad de la condición del `while`), así que esa
+    // comprobación de longitud, por sí sola, no vería nada raro.
+    if current != 0 {
+        return Err(Error::Corrupt { page: first, kind: CorruptKind::OverflowLoop });
+    }
     if out.len() as u64 != len {
         return Err(Error::Corrupt { page: first, kind: CorruptKind::CellBounds });
     }
     Ok(out)
 }
 
-/// Libera toda la cadena de páginas de overflow que empieza en `first`.
+/// Libera toda la cadena de páginas de overflow que empieza en `first`, que
+/// almacenaba un valor de `len` bytes.
+///
+/// **Desviación deliberada de la interfaz de la tarea**: el brief fija esta
+/// firma como `free_overflow(&mut WriteTxn, first: PageNo) -> Result<()>`,
+/// sin `len`. La ronda de revisión posterior a la primera entrega pidió
+/// añadirlo para acotar el recorrido igual de ajustado que `read_overflow`
+/// (`ceil(len / capacidad_por_página)`, no `tx.n_pages()`) y así encoger la
+/// ventana del hallazgo de abajo sobre `tx.free()` repetido. Los dos
+/// llamantes (`insert_rec`, `delete_rec`) ya desestructuran
+/// `LeafValue::Overflow { len, first }`; antes descartaban `len`, ahora lo
+/// pasan.
 ///
 /// Acotado en el número de páginas que recorre, igual que `read_overflow` y
-/// por la misma razón general (`descend`), pero sin su cota ajustada: esta
-/// función, fijada por la interfaz de la tarea, solo recibe `first`, no la
-/// longitud del valor, así que no puede calcular cuántas páginas *debería*
-/// tener la cadena. La cota disponible sin cambiar la firma es
-/// `tx.n_pages()`: el fichero entero no puede tener más páginas *distintas*
-/// que las que existen en él, así que una cadena acíclica jamás la supera —
-/// superarla es la prueba de un ciclo en los punteros `next`.
+/// por la misma razón general (`descend`): todo recorrido de punteros
+/// leídos de disco debe estarlo. A diferencia de `read_overflow`, esta
+/// función no necesita además la comprobación de `current != 0` al final:
+/// no tiene una segunda condición de salida basada en cuánto ha acumulado
+/// (no acumula nada, solo libera páginas), así que su único camino de
+/// salida normal (sin `Err`) es precisamente `current == 0` — no hay hueco
+/// de corrección equivalente que cerrar aquí.
 ///
 /// Si un ciclo dispara el `Err` de más abajo, esta función ya habrá llamado
 /// a `tx.free()` varias veces sobre las mismas páginas repetidas del ciclo —
@@ -255,9 +314,16 @@ pub fn read_overflow(src: &impl PageSource, len: u64, first: PageNo) -> Result<V
 /// cualquier `Err` de esta transacción (ver la nota de `put`) es abandonarla
 /// sin `commit`: `own_free`, donde van a parar esas liberaciones repetidas
 /// por ser páginas asignadas por esta misma transacción, es puramente local
-/// a `WriteTxn` y desaparece con ella si nunca confirma.
-pub fn free_overflow(tx: &mut WriteTxn, first: PageNo) -> Result<()> {
-    let max_hops = u64::from(tx.n_pages());
+/// a `WriteTxn` y desaparece con ella si nunca confirma. La cota ajustada
+/// por `len` (en vez del número total de páginas del fichero, la cota de la
+/// primera entrega, expuesta entonces como `WriteTxn::n_pages` y ya
+/// retirada por no tener más usos) no elimina esa ventana, pero la encoge:
+/// sobre una base con muchas páginas, la cota anterior podía tardar miles de
+/// llamadas a `tx.free()` repetidas en disparar el error; `ceil(len /
+/// capacidad)` la limita al tamaño real del valor que se está liberando.
+pub fn free_overflow(tx: &mut WriteTxn, len: u64, first: PageNo) -> Result<()> {
+    let capacity = core::cmp::max(tx.page_size() as u64 - PAGE_HEADER_SIZE as u64, 1);
+    let max_hops = len.div_ceil(capacity).max(1);
     let mut current = first;
     let mut hops: u64 = 0;
     while current != 0 {
@@ -508,8 +574,8 @@ fn insert_rec(
                             // Se reemplaza esta entrada: su cadena de
                             // overflow anterior, si tenía una, ya no la
                             // referencia nadie.
-                            if let LeafValue::Overflow { first, .. } = page.leaf_value(j) {
-                                free_overflow(tx, first)?;
+                            if let LeafValue::Overflow { len, first } = page.leaf_value(j) {
+                                free_overflow(tx, len, first)?;
                             }
                             payloads.push(new_payload.take().expect("se consume una sola vez"));
                         } else {
@@ -677,8 +743,8 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
             // no la referencia nadie: liberarla en los dos caminos de
             // salida (hoja que se queda vacía, y hoja que se reconstruye
             // sin ella).
-            if let LeafValue::Overflow { first, .. } = page.leaf_value(hit) {
-                free_overflow(tx, first)?;
+            if let LeafValue::Overflow { len, first } = page.leaf_value(hit) {
+                free_overflow(tx, len, first)?;
             }
             if page.n_slots() == 1 {
                 tx.free(page_no);
@@ -2487,10 +2553,13 @@ mod overflow_tests {
     }
 
     /// Dos páginas de overflow que se apuntan la una a la otra: no hay
-    /// ninguna página con `next == 0` alcanzable. `free_overflow` no recibe
-    /// ninguna longitud (a diferencia de `read_overflow`, que se autolimita
-    /// por `len`), así que sin la cota de `tx.n_pages()` este bucle sería
-    /// literalmente infinito, no solo lento.
+    /// ninguna página con `next == 0` alcanzable. `free_overflow` no
+    /// acumula nada (solo libera páginas), así que su única condición de
+    /// salida normal es `current == 0` — sin la cota de `ceil(len /
+    /// capacidad)`, este bucle sería literalmente infinito, no solo lento.
+    /// `len` aquí es arbitrario (cinco páginas de capacidad): solo fija
+    /// cuántas vueltas tolera antes de rendirse, no cambia que el ciclo
+    /// nunca deja `current == 0` por sí solo.
     #[test]
     fn free_overflow_returns_an_error_instead_of_looping_forever_on_a_cycle() {
         let db = db();
@@ -2502,7 +2571,9 @@ mod overflow_tests {
         tx.write_page(a, &raw_overflow_page(page_size, b, b"aa")).unwrap();
         tx.write_page(b, &raw_overflow_page(page_size, a, b"bb")).unwrap();
 
-        let err = free_overflow(&mut tx, a).unwrap_err();
+        let capacity = (page_size as usize - PAGE_HEADER_SIZE) as u64;
+        let len = capacity * 5;
+        let err = free_overflow(&mut tx, len, a).unwrap_err();
         assert!(
             matches!(err, crate::Error::Corrupt { kind: CorruptKind::OverflowLoop, .. }),
             "se esperaba OverflowLoop, se obtuvo {err:?}"
@@ -2510,22 +2581,16 @@ mod overflow_tests {
     }
 
     /// Misma cadena cíclica que la prueba anterior, pero ejercitando
-    /// `read_overflow`. A diferencia de `free_overflow`, `read_overflow` ya
-    /// se autolimita por `len` incluso sin la cota explícita de saltos: con
-    /// todas las páginas del fichero del mismo tamaño, cada vuelta del
-    /// ciclo aporta la misma cantidad fija de bytes tanto si la página es
-    /// nueva como si es una repetida, así que `out.len()` alcanza `len` en
-    /// como mucho `ceil(len / capacidad)` iteraciones SIEMPRE — la cota
-    /// explícita nunca llega a dispararse en este caso concreto, aunque sí
-    /// protege (ver su comentario) contra una fuente de páginas que no
-    /// garantice ese tamaño uniforme. Lo que esta prueba puede afirmar de
-    /// verdad es más modesto pero real: `read_overflow` TERMINA sobre un
-    /// ciclo — no se cuelga — y punto; que el resultado sea `Ok` con bytes
-    /// repetidos (dato incorrecto, no detectado como corrupción) es una
-    /// limitación conocida, documentada aquí y en el informe de la tarea,
-    /// no una sorpresa.
+    /// `read_overflow`. Fija la regresión de la ronda de revisión posterior
+    /// a la primera entrega (hallazgo 1): antes de la comprobación
+    /// `current != 0` que añadió esa ronda, esta misma llamada devolvía
+    /// `Ok` con 2460 bytes repetidos (`A,B,A,B,A`) en vez de fallar — la
+    /// cota de saltos por sí sola no distingue un ciclo de páginas
+    /// uniformes de una cadena legítima de ese tamaño (ver el comentario de
+    /// `read_overflow`). Ahora debe devolver `OverflowLoop`: la cadena
+    /// nunca llega a su propia `next == 0`.
     #[test]
-    fn read_overflow_terminates_on_a_cycle_instead_of_hanging() {
+    fn read_overflow_rejects_a_cycle_instead_of_returning_wrong_data() {
         let db = db();
         let mut tx = db.begin_write().unwrap();
         let a = tx.alloc().unwrap();
@@ -2537,11 +2602,10 @@ mod overflow_tests {
 
         let capacity = (page_size as usize - PAGE_HEADER_SIZE) as u64;
         let len = capacity * 5;
-        // Lo único que se afirma: que esta llamada retorna. Un bucle
-        // infinito real dejaría el `cargo test` colgado en vez de fallar
-        // este `assert`.
-        let result = read_overflow(&tx, len, a);
-        assert!(result.is_ok(), "se esperaba que el ciclo, de páginas uniformes, completara \
-                 con Ok (dato incorrecto pero sin colgarse); se obtuvo {result:?}");
+        let err = read_overflow(&tx, len, a).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: CorruptKind::OverflowLoop, .. }),
+            "se esperaba OverflowLoop, se obtuvo {err:?}"
+        );
     }
 }
