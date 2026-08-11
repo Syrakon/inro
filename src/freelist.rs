@@ -266,7 +266,14 @@ impl Freelist {
             self.push(page, txn);
         }
 
-        let page_size = pager.geometry().page_size as usize;
+        // `logical_page_size`, no `geometry().page_size` (tarea 17): las
+        // páginas de lista de libres pasan por `write_encrypted` más abajo,
+        // igual que las del árbol, así que tienen que construirse con el
+        // mismo tamaño lógico que espera esa función — si no, el sellado
+        // produciría una página física de tamaño incorrecto (o, sin
+        // cifrado, esto coincide exactamente con `geometry().page_size`,
+        // sin ningún cambio de comportamiento).
+        let page_size = pager.logical_page_size() as usize;
         let capacity = (page_size - FREELIST_HEADER) / 4;
 
         // Se escribe de la cola hacia la cabeza para poder enlazar cada página
@@ -299,7 +306,14 @@ impl Freelist {
                 h.update(&b[..8]);
                 h.update(&b[12..]);
                 b[8..12].copy_from_slice(&h.finish().to_le_bytes());
-                pager.write(page_no, &b)?;
+                // `write_encrypted`, no `write` (tarea 17): sin este cambio,
+                // una página de lista de libres se quedaría en claro en un
+                // fichero cifrado, y además `Pager::read` (que descifra
+                // incondicionalmente si hay clave activa) fallaría al
+                // releerla más tarde — ver el comentario de `Db::open` en
+                // `tx.rs` sobre por qué el `Pager` provisional también
+                // necesita la clave antes de leer la lista de libres.
+                pager.write_encrypted(page_no, txn, &b)?;
 
                 if tail == 0 {
                     tail = page_no;

@@ -5,8 +5,9 @@ use alloc::vec::Vec;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use crate::crypto::Encryption;
 use crate::header::Geometry;
-use crate::{PageNo, Result, Storage};
+use crate::{PageNo, Result, Storage, TxnId};
 
 /// Entrada de caché. `used` es un contador monótono, no un reloj: sirve solo
 /// para elegir la víctima menos usada recientemente.
@@ -34,6 +35,16 @@ pub struct Pager {
     /// mide `MemStorage::read_count`, a una capa de distancia, y con otro
     /// propósito (el coste de `Db::open` en `tx.rs`).
     reads: AtomicU64,
+    /// Cifrado por página activo, si la base se abrió con una clave de datos
+    /// ya desenvuelta (tarea 17). Existe siempre — no solo bajo la feature
+    /// `encryption` — porque `Encryption` en sí es un tipo simple sin
+    /// dependencia de `chacha20poly1305`/`aes-gcm` (ver `crypto.rs`); lo que
+    /// SÍ está tras esa feature es la capacidad de hacer algo útil con él
+    /// (`seal_and_write`/`decrypt`, más abajo). Se fija después de `new`,
+    /// no en el constructor: la clave de datos no se conoce hasta leer (o
+    /// generar) la meta, y la meta se lee/escribe A TRAVÉS de este mismo
+    /// `Pager` en `Db::open`/`Db::create` — ver `with_encryption`.
+    encryption: Option<Encryption>,
 }
 
 struct Cache {
@@ -53,11 +64,34 @@ impl Pager {
                 tick: 0,
             }),
             reads: AtomicU64::new(0),
+            encryption: None,
         }
+    }
+
+    /// Activa el cifrado por página con la clave de datos ya desenvuelta.
+    /// Separado de `new` a propósito (ver el comentario del campo
+    /// `encryption`): no rompe ninguna de las llamadas existentes a
+    /// `Pager::new` (pruebas de este módulo y de `freelist.rs` incluidas),
+    /// que siguen construyendo un `Pager` sin cifrar sin cambiar una línea.
+    pub fn with_encryption(mut self, encryption: Option<Encryption>) -> Self {
+        self.encryption = encryption;
+        self
     }
 
     pub fn geometry(&self) -> &Geometry {
         &self.geometry
+    }
+
+    /// Bytes útiles de una página lógica: lo que `PageBuilder` y todo lo que
+    /// construye páginas (`tree.rs`, `freelist.rs`) debe usar en vez de
+    /// `geometry().page_size`. Con cifrado, veinticuatro menos: ocho de
+    /// `txn_id` en claro y dieciséis de tag (`crypto::CIPHER_PREFIX`). Sin
+    /// cifrado, coincide con el tamaño físico.
+    pub fn logical_page_size(&self) -> u32 {
+        match &self.encryption {
+            Some(_) => self.geometry.page_size - crate::crypto::CIPHER_PREFIX as u32,
+            None => self.geometry.page_size,
+        }
     }
 
     fn offset(&self, page_no: PageNo) -> u64 {
@@ -96,11 +130,47 @@ impl Pager {
 
         let mut buf = vec![0u8; self.geometry.page_size as usize];
         self.storage.read_at(self.offset(page_no), &mut buf)?;
-        let bytes: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
+
+        // Descifrar, si procede, ANTES de cachear: la caché guarda texto
+        // plano (ver el comentario de `Pager`, arriba de la struct), así que
+        // un acierto de caché —el caso frecuente— no vuelve a pagar el coste
+        // de autenticar. `page_no` entra en la derivación del nonce, igual
+        // que en la escritura (`write_encrypted`): sin él, dos páginas
+        // distintas escritas por la MISMA transacción compartirían nonce.
+        let bytes: Arc<[u8]> = match &self.encryption {
+            None => Arc::from(buf.into_boxed_slice()),
+            Some(enc) => Arc::from(self.decrypt(enc, page_no, buf)?.into_boxed_slice()),
+        };
 
         let mut c = self.cache.lock().unwrap();
         c.insert(page_no, Arc::clone(&bytes));
         Ok(bytes)
+    }
+
+    /// Descifra `buf` (el contenido físico completo recién leído) y devuelve
+    /// solo la porción de página lógica en claro, con el prefijo de
+    /// `txn_id`+tag ya recortado. Un fallo de autenticación —clave
+    /// incorrecta o página manipulada— se propaga como `Error::Decrypt`, no
+    /// como una página corrupta cualquiera: quien llama necesita distinguir
+    /// los dos casos (ver las pruebas `a_wrong_key_fails_to_decrypt...` y
+    /// `a_tampered_page_is_rejected` en `crypto.rs`).
+    #[cfg(feature = "encryption")]
+    fn decrypt(&self, enc: &Encryption, page_no: PageNo, mut buf: Vec<u8>) -> Result<Vec<u8>> {
+        crate::crypto::open(enc, page_no, &mut buf)?;
+        Ok(buf[crate::crypto::CIPHER_PREFIX..].to_vec())
+    }
+
+    /// Sin la feature `encryption`, `self.encryption` solo puede llegar aquí
+    /// como `Some` si alguien construyó un `Encryption` dentro del propio
+    /// crate sin pasar por la reexportación pública (gateada, ver `lib.rs`)
+    /// y lo coló en `Options` — no hay ningún camino de producción que lo
+    /// haga hoy. Falla alto en vez de tratar el cifrado como texto plano:
+    /// devolver `buf` tal cual convertiría cabecera+tag+texto cifrado en
+    /// "la página", que ni `PageRef::parse` va a aceptar como válida ni,
+    /// si por algún accidente numérico lo hiciera, sería el dato real.
+    #[cfg(not(feature = "encryption"))]
+    fn decrypt(&self, _enc: &Encryption, _page_no: PageNo, _buf: Vec<u8>) -> Result<Vec<u8>> {
+        Err(crate::Error::BadFormat)
     }
 
     /// Precondición que debe garantizar quien llama, no `Pager`: toda
@@ -119,6 +189,43 @@ impl Pager {
         // contenido antiguo bajo el mismo número sería corrupción silenciosa.
         self.cache.lock().unwrap().remove(page_no);
         Ok(())
+    }
+
+    /// Como `write`, pero cifrando primero si esta base lo tiene activo.
+    /// `plain` debe medir `logical_page_size()`: quien construye la página
+    /// (`WriteTxn::write_page` en `tx.rs`, `Freelist::flush`) ya usa ese
+    /// tamaño, así que el resultado, una vez sellado, mide exactamente
+    /// `geometry().page_size` — lo que `write` exige.
+    ///
+    /// `txn` es la transacción que hace esta escritura: entra en la
+    /// derivación del nonce junto con `page_no` (ver `crypto::seal`). Su
+    /// unicidad — la invariante de la que depende TODA la confidencialidad
+    /// de este esquema — es responsabilidad de quien llama: una página no
+    /// debe escribirse dos veces dentro de la misma transacción. El diseño
+    /// de copia en escritura del motor lo cumple por construcción (una
+    /// página sucia se escribe una sola vez, al confirmar); `Pager` no
+    /// tiene forma de comprobarlo por sí mismo.
+    pub fn write_encrypted(&self, page_no: PageNo, txn: TxnId, plain: &[u8]) -> Result<()> {
+        match &self.encryption {
+            None => self.write(page_no, plain),
+            Some(enc) => self.seal_and_write(enc, page_no, txn, plain),
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    fn seal_and_write(&self, enc: &Encryption, page_no: PageNo, txn: TxnId, plain: &[u8]) -> Result<()> {
+        let mut raw = vec![0u8; self.geometry.page_size as usize];
+        crate::crypto::seal(enc, page_no, txn, plain, &mut raw)?;
+        self.write(page_no, &raw)
+    }
+
+    /// Mismo razonamiento que el `decrypt` gemelo, más arriba: sin la
+    /// feature `encryption` no hay forma de producir un sellado real, así
+    /// que falla alto en vez de escribir `plain` sin cifrar bajo la
+    /// apariencia de que sí se cifró.
+    #[cfg(not(feature = "encryption"))]
+    fn seal_and_write(&self, _enc: &Encryption, _page_no: PageNo, _txn: TxnId, _plain: &[u8]) -> Result<()> {
+        Err(crate::Error::BadFormat)
     }
 
     pub fn sync(&self) -> Result<()> {

@@ -7,11 +7,21 @@ use std::sync::{Mutex, MutexGuard, RwLock};
 use std::time::Instant;
 
 use crate::freelist::Freelist;
-use crate::header::{Geometry, FORMAT_MAJOR, MAX_PAGE_SIZE, MIN_PAGE_SIZE};
+use crate::header::{Geometry, FORMAT_MAJOR, MAX_PAGE_SIZE, MIN_PAGE_SIZE, FLAG_ENCRYPTED};
 use crate::index::{index_key, primary_of, IndexDef, CATALOG_NS, INDEX_NS_BASE};
 use crate::meta::{Meta, MetaSlot};
 use crate::pager::Pager;
 use crate::{Error, PageNo, Result, Storage, TxnId};
+
+// Reexportado para que el resto del crate (y las pruebas de `crypto.rs`,
+// que lo importan como `crate::tx::Encryption`) puedan nombrarlo sin
+// conocer que en realidad vive en `crypto`. `Encryption` es un tipo simple
+// (ver su comentario en `crypto.rs`), así que reexportarlo aquí sin
+// condicionarlo a la feature `encryption` no compila nada de más — el
+// reexport PÚBLICO desde la raíz del crate (`lib.rs`) sí está tras esa
+// feature, que es el sitio que de verdad importa para "quien no cifra no
+// puede ni nombrar el tipo desde fuera".
+pub use crate::crypto::Encryption;
 
 /// Política de sincronización a disco.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,11 +42,20 @@ pub struct Options {
     pub page_size: u32,
     pub sync: Sync,
     pub cache_pages: usize,
+    /// Clave maestra y algoritmo para el cifrado por página (tarea 17).
+    /// `None` (el valor por defecto): base sin cifrar, formato idéntico al
+    /// de antes de esta tarea. Con la feature `encryption` desactivada, el
+    /// tipo `Encryption` no es alcanzable fuera del crate (ver `lib.rs`),
+    /// así que en la práctica solo puede llegar aquí `None` — `Db::create`/
+    /// `open` fallan alto con `Error::BadFormat` si alguna vez no fuera
+    /// así (ver su comentario), en vez de cifrar en silencio con una
+    /// implementación que no está compilada.
+    pub encryption: Option<Encryption>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { page_size: 512, sync: Sync::Commit, cache_pages: 32 }
+        Self { page_size: 512, sync: Sync::Commit, cache_pages: 32, encryption: None }
     }
 }
 
@@ -75,11 +94,15 @@ impl Db {
             return Err(Error::BadFormat);
         }
         let meta_b = meta_b_page(opts.page_size);
+        // Fijo en la creación (ver `header::FLAG_ENCRYPTED`): activar el
+        // cifrado más tarde exigiría reescribir todas las páginas ya
+        // existentes, así que la decisión se toma aquí y no se revisita.
+        let flags = if opts.encryption.is_some() { FLAG_ENCRYPTED } else { 0 };
         let geometry = Geometry {
             page_size: opts.page_size,
             format_major: FORMAT_MAJOR,
             format_minor: 0,
-            flags: 0,
+            flags,
             db_id: db_id(),
             created_unix: now_unix(),
             meta_a_page: 1,
@@ -87,7 +110,7 @@ impl Db {
         };
         geometry.write(storage.as_ref())?;
 
-        let meta = Meta {
+        let mut meta = Meta {
             txn_id: 1,
             root: 0,
             catalog_root: 0,
@@ -96,21 +119,34 @@ impl Db {
             n_pages: meta_b + 1,
             page_size_log2: opts.page_size.trailing_zeros() as u8,
             format_major: FORMAT_MAJOR,
-            flags: 0,
+            flags,
+            wrapped_key: None,
         };
+        // Genera la clave de datos y la envuelve con la maestra ANTES de
+        // guardar la meta: `meta.wrapped_key` tiene que estar ya poblado
+        // para que las dos ranuras se escriban con él.
+        let encryption = Self::init_data_key(&opts, &mut meta)?;
+
         // Ambas ranuras se inicializan para que la primera apertura encuentre
         // una meta válida pase lo que pase.
         meta.store(storage.as_ref(), &geometry, MetaSlot::A)?;
         meta.store(storage.as_ref(), &geometry, MetaSlot::B)?;
         storage.sync()?;
 
-        Ok(Self::assemble(storage, geometry, meta, MetaSlot::A, opts, Freelist::empty()))
+        Ok(Self::assemble(storage, geometry, meta, MetaSlot::A, opts, Freelist::empty(), encryption))
     }
 
     pub fn open(storage: Box<dyn Storage>, opts: Options) -> Result<Self> {
         let geometry = Geometry::read(storage.as_ref())?;
         let (mut meta, slot) = Meta::load(storage.as_ref(), &geometry)?;
-        let pager = Pager::new(storage, geometry, opts.cache_pages);
+        // Se desenvuelve ANTES de construir el `Pager` provisional que lee
+        // la lista de libres, no solo el definitivo de `assemble`: si la
+        // base está cifrada, sus páginas de lista de libres también lo
+        // están (`Freelist::flush` usa `Pager::write_encrypted`, ver
+        // `freelist.rs`), así que ese `Pager` provisional necesita la
+        // misma clave para poder leerlas.
+        let encryption = Self::open_data_key(&opts, &meta)?;
+        let pager = Pager::new(storage, geometry, opts.cache_pages).with_encryption(encryption);
         let mut freelist = Freelist::load(&pager, meta.freelist_head, meta.freelist_tail)?;
 
         // Recuperación: las páginas más allá de `n_pages` las escribió una
@@ -129,7 +165,7 @@ impl Db {
         meta.n_pages = core::cmp::max(meta.n_pages, file_pages);
 
         let storage = pager.into_storage();
-        Ok(Self::assemble(storage, geometry, meta, slot, opts, freelist))
+        Ok(Self::assemble(storage, geometry, meta, slot, opts, freelist, encryption))
     }
 
     fn assemble(
@@ -139,9 +175,10 @@ impl Db {
         slot: MetaSlot,
         opts: Options,
         freelist: Freelist,
+        encryption: Option<Encryption>,
     ) -> Self {
         Self {
-            pager: Pager::new(storage, geometry, opts.cache_pages),
+            pager: Pager::new(storage, geometry, opts.cache_pages).with_encryption(encryption),
             committed: RwLock::new((meta, slot)),
             write_lock: Mutex::new(Some(WriterState { freelist })),
             readers: Mutex::new(BTreeMap::new()),
@@ -149,6 +186,69 @@ impl Db {
             last_sync: Mutex::new(Instant::now()),
             indexes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Genera una clave de datos nueva y la envuelve con la maestra de
+    /// `opts.encryption`, si la hay; deja `meta.wrapped_key` lista para
+    /// guardarse. Devuelve la clave de datos (ya en claro, para que el
+    /// `Pager` de esta misma apertura pueda usarla) o `None` si `opts` no
+    /// pide cifrado.
+    #[cfg(feature = "encryption")]
+    fn init_data_key(opts: &Options, meta: &mut Meta) -> Result<Option<Encryption>> {
+        let Some(master) = &opts.encryption else { return Ok(None) };
+        let data_key = crate::crypto::generate_data_key()?;
+        let wrap_nonce = crate::crypto::generate_nonce()?;
+        meta.wrapped_key = Some(crate::crypto::wrap_key(&master.key, &data_key, wrap_nonce)?);
+        Ok(Some(Encryption { key: data_key, algorithm: master.algorithm }))
+    }
+
+    /// Sin la feature `encryption` no hay forma de generar ni envolver una
+    /// clave — `opts.encryption` solo puede ser `Some` aquí si algo dentro
+    /// del propio crate lo coló sin pasar por la reexportación pública
+    /// (gateada, ver `lib.rs`), porque fuera del crate el tipo `Encryption`
+    /// ni siquiera es nombrable en este build. Falla alto en vez de crear
+    /// una base sin cifrar en silencio cuando el llamante pidió cifrado.
+    #[cfg(not(feature = "encryption"))]
+    fn init_data_key(opts: &Options, _meta: &mut Meta) -> Result<Option<Encryption>> {
+        if opts.encryption.is_some() {
+            return Err(Error::BadFormat);
+        }
+        Ok(None)
+    }
+
+    /// Desenvuelve la clave de datos guardada en `meta` con la maestra de
+    /// `opts.encryption`. Compara la intención del llamante (`opts`) contra
+    /// lo que dice el fichero (`meta.flags & FLAG_ENCRYPTED`) en las cuatro
+    /// combinaciones posibles: sin cifrar de los dos lados es el caso
+    /// normal; pedir clave sobre un fichero sin cifrar, o abrir uno cifrado
+    /// sin dar clave, son errores de uso — el segundo con el mismo
+    /// `Error::Decrypt` que una clave incorrecta, porque para quien llama
+    /// es la misma situación de fondo: "no puedo leer estas páginas sin la
+    /// clave correcta".
+    #[cfg(feature = "encryption")]
+    fn open_data_key(opts: &Options, meta: &Meta) -> Result<Option<Encryption>> {
+        let file_is_encrypted = meta.flags & FLAG_ENCRYPTED != 0;
+        match (&opts.encryption, file_is_encrypted) {
+            (None, false) => Ok(None),
+            (None, true) => Err(Error::Decrypt { page: 0 }),
+            (Some(_), false) => Err(Error::BadFormat),
+            (Some(master), true) => {
+                let wrapped = meta.wrapped_key.ok_or(Error::Decrypt { page: 0 })?;
+                let data_key = crate::crypto::unwrap_key(&master.key, &wrapped)?;
+                Ok(Some(Encryption { key: data_key, algorithm: master.algorithm }))
+            }
+        }
+    }
+
+    /// Mismo razonamiento que `init_data_key` sin la feature: si el fichero
+    /// dice estar cifrado, o si `opts` trae una clave, no hay nada útil que
+    /// hacer sin `chacha20poly1305`/`aes-gcm` compiladas — falla alto.
+    #[cfg(not(feature = "encryption"))]
+    fn open_data_key(opts: &Options, meta: &Meta) -> Result<Option<Encryption>> {
+        if opts.encryption.is_some() || meta.flags & FLAG_ENCRYPTED != 0 {
+            return Err(Error::BadFormat);
+        }
+        Ok(None)
     }
 }
 
@@ -516,10 +616,25 @@ impl<'db> WriteTxn<'db> {
         self.guard.as_mut().expect("el estado del escritor siempre está presente")
     }
 
-    /// Tamaño de página fijado al crear la base. `emit` (árbol) lo necesita
-    /// para saber cuánto cabe en una página nueva.
+    /// Tamaño FÍSICO de página fijado al crear la base. Nadie en `tree.rs`
+    /// debe usar este método para decidir cuánto cabe en una página: eso es
+    /// `logical_page_size`, más abajo. Se conserva `pub` porque sigue
+    /// siendo información legítima (p. ej. para calcular el tamaño de
+    /// fichero desde fuera), pero ya no lo llama ningún camino que
+    /// construya páginas.
     pub fn page_size(&self) -> u32 {
         self.db.pager.geometry().page_size
+    }
+
+    /// Bytes útiles de una página lógica: lo que de verdad cabe en una
+    /// página una vez descontado el prefijo de cifrado, si lo hay (tarea
+    /// 17). `tree.rs` (`emit`, `write_overflow`, `free_overflow`, `put`) y
+    /// `freelist.rs` (`Freelist::flush`) lo usan para construir páginas y
+    /// para el límite de tamaño de clave — TODO lo que antes usaba
+    /// `page_size()` para esos dos fines ahora usa este método. Sin cifrado
+    /// coincide con `page_size()`.
+    pub fn logical_page_size(&self) -> u32 {
+        self.db.pager.logical_page_size()
     }
 
     /// Total de páginas que ha llegado a tener el fichero hasta ahora
@@ -647,8 +762,14 @@ impl<'db> WriteTxn<'db> {
         self.db.pager.read(page)
     }
 
+    /// `bytes` debe medir `logical_page_size()`: `write_encrypted` sella (si
+    /// procede) con el `txn_id` de ESTA transacción, que es lo que hace
+    /// única la derivación del nonce en la invariante crítica de la tarea
+    /// 17 — una página nunca se escribe dos veces con el mismo `txn_id`
+    /// porque nunca se escribe dos veces dentro de la misma transacción
+    /// (copia en escritura).
     pub(crate) fn write_page(&mut self, page: PageNo, bytes: &[u8]) -> Result<()> {
-        self.db.pager.write(page, bytes)?;
+        self.db.pager.write_encrypted(page, self.meta.txn_id, bytes)?;
         self.written.push(page);
         Ok(())
     }
@@ -711,7 +832,13 @@ impl<'db> WriteTxn<'db> {
             return self.put_raw(ns, key, value);
         }
 
-        let max_key = self.page_size() / 4;
+        // `logical_page_size`, no `page_size` (tarea 17): es el tamaño con
+        // el que `tree::put` construye páginas de verdad (ver su propio
+        // `max_key`), así que este límite tiene que coincidir con el suyo o
+        // una base cifrada aceptaría aquí una clave de índice que
+        // `tree::put` rechazaría después, ya con la entrada vieja borrada
+        // (ver el comentario de la fase de aplicación, más abajo).
+        let max_key = self.logical_page_size() / 4;
 
         // Clave primaria demasiado grande (ronda 2 de revisión, hallazgo 3):
         // en un índice único la entrada de índice es SOLO el valor indexado

@@ -153,7 +153,7 @@ fn overflow_capacity(page_size: u32) -> usize {
 /// enlazar cada una con la siguiente (su `next`, en el campo `extra` de la
 /// cabecera) en una sola pasada.
 pub fn write_overflow(tx: &mut WriteTxn, value: &[u8]) -> Result<(u64, PageNo)> {
-    let page_size = tx.page_size();
+    let page_size = tx.logical_page_size();
     let capacity = overflow_capacity(page_size);
     let chunks: Vec<&[u8]> = value.chunks(capacity).collect();
 
@@ -322,7 +322,7 @@ pub fn read_overflow(src: &impl PageSource, len: u64, first: PageNo) -> Result<V
 /// llamadas a `tx.free()` repetidas en disparar el error; `ceil(len /
 /// capacidad)` la limita al tamaño real del valor que se está liberando.
 pub fn free_overflow(tx: &mut WriteTxn, len: u64, first: PageNo) -> Result<()> {
-    let capacity = core::cmp::max(tx.page_size() as u64 - PAGE_HEADER_SIZE as u64, 1);
+    let capacity = core::cmp::max(tx.logical_page_size() as u64 - PAGE_HEADER_SIZE as u64, 1);
     let max_hops = len.div_ceil(capacity).max(1);
     let mut current = first;
     let mut hops: u64 = 0;
@@ -445,7 +445,7 @@ fn emit(
     entries: &[(Vec<u8>, CellPayload)],
     children_plain: bool,
 ) -> Result<Insertion> {
-    let page_size = tx.page_size();
+    let page_size = tx.logical_page_size();
     let borrowed: Vec<(&[u8], CellPayload)> =
         entries.iter().map(|(k, p)| (k.as_slice(), *p)).collect();
 
@@ -606,7 +606,7 @@ fn insert_rec(
             // una única vez, al insertarlo en su posición final más abajo
             // (en `Ok(i)` reemplaza; en `Err(i)` se inserta nuevo) —
             // moverlo evita clonar un valor potencialmente enorme.
-            let mut new_payload = Some(if value.len() > overflow_threshold(tx.page_size()) {
+            let mut new_payload = Some(if value.len() > overflow_threshold(tx.logical_page_size()) {
                 let (len, first) = write_overflow(tx, value)?;
                 LeafPayload::Overflow { len, first }
             } else {
@@ -722,7 +722,7 @@ fn insert_rec(
 /// liberadas de más sin que la raíz llegara a apuntar a la reconstrucción
 /// parcial — dos dueños o una fuga, según el caso.
 pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<PageNo> {
-    let page_size = tx.page_size();
+    let page_size = tx.logical_page_size();
     // Una división de nodo interno promueve un separador y reparte el resto
     // entre dos mitades; para que ambas conserven al menos un separador
     // propio hacen falta al menos tres entradas en total (ver el
@@ -3692,7 +3692,7 @@ mod overflow_tests {
         let mut tx = db.begin_write().unwrap();
         let a = tx.alloc().unwrap();
         let b = tx.alloc().unwrap();
-        let page_size = tx.page_size();
+        let page_size = tx.logical_page_size();
 
         tx.write_page(a, &raw_overflow_page(page_size, b, b"aa")).unwrap();
         tx.write_page(b, &raw_overflow_page(page_size, a, b"bb")).unwrap();
@@ -3721,7 +3721,7 @@ mod overflow_tests {
         let mut tx = db.begin_write().unwrap();
         let a = tx.alloc().unwrap();
         let b = tx.alloc().unwrap();
-        let page_size = tx.page_size();
+        let page_size = tx.logical_page_size();
 
         tx.write_page(a, &raw_overflow_page(page_size, b, b"aa")).unwrap();
         tx.write_page(b, &raw_overflow_page(page_size, a, b"bb")).unwrap();

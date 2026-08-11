@@ -18,11 +18,29 @@ include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APA
 [lints.rust]
 unsafe_code = "forbid"
 
-# Cero dependencias de runtime. Cada una que se añada lleva su justificación
-# escrita aquí al lado, igual que en arkeion. Parser, B-tree, codificaciones,
-# varint, CRC32, bitpacking y compresión se escriben a mano.
+# Cada dependencia que se añada lleva su justificación escrita aquí al lado,
+# igual que en arkeion. Parser, B-tree, codificaciones, varint, CRC32,
+# bitpacking y compresión se escriben a mano.
+#
+# Única excepción a la regla de cero dependencias de runtime. No se escriben
+# primitivas criptográficas propias: el ahorro no compensa el riesgo. Ambas son
+# de RustCrypto, Rust puro y compatibles con no_std, y solo se compilan si la
+# feature está activa.
+# `aes-gcm` necesita su PROPIA feature `aes` (no la de este crate, aunque
+# se llamen igual: son espacios de nombres distintos, uno por crate) para
+# exponer el tipo `Aes256Gcm` en sí — sin ella, `default-features = false`
+# deja fuera tanto ese alias como su dependencia opcional `aes`, y
+# `crypto.rs` no compila bajo la feature `aes` de este crate. Verificado
+# contra el `Cargo.toml` publicado de `aes-gcm` 0.10.3: sus features por
+# defecto son `["aes", "alloc", "getrandom"]`; aquí se activa solo `aes` +
+# `alloc`, sin `getrandom` (no hace falta: este crate no genera nonces con
+# esa dependencia, ver `crypto::generate_nonce`).
 [dependencies]
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
+aes-gcm = { version = "0.10", default-features = false, features = ["alloc", "aes"], optional = true }
 
 [features]
 default = ["std"]
 std = []
+encryption = ["dep:chacha20poly1305"]
+aes = ["encryption", "dep:aes-gcm"]

@@ -14,6 +14,17 @@ pub mod error;
 pub(crate) mod crc32;
 pub(crate) mod varint;
 pub mod storage;
+// Tipos y constantes de cifrado por página (tarea 17). Se declara SIN
+// `#[cfg(feature = "std")]` ni `#[cfg(feature = "encryption")]`, a
+// diferencia de `pager`/`tx`/`tree` más abajo: `meta.rs` necesita
+// `crypto::WRAPPED_KEY_LEN` incluso en una compilación `no_std` sin
+// cifrado, porque es parte del formato de fichero puro (bytes 40..100 de
+// cada meta-ranura), igual que `header`/`page`. Dentro del propio módulo,
+// solo lo que de verdad toca `chacha20poly1305`/`aes-gcm` — `seal`, `open`,
+// `wrap_key`, `unwrap_key`, `generate_data_key` — está tras
+// `#[cfg(feature = "encryption")]`; los tipos (`Algorithm`, `Encryption`) y
+// las constantes de tamaño no dependen de ninguna de las dos.
+pub(crate) mod crypto;
 // `header`, `meta` y `page` son el formato de fichero puro — estructuras y
 // funciones sobre `&[u8]`, sin `std::sync`/`std::fs` — deliberadamente
 // utilizables sin la parte `std` del motor (`tx`/`tree`/`pager`/`freelist`,
@@ -86,6 +97,16 @@ pub use tx::{Db, Options, ReadTxn, Sync, WriteTxn};
 pub use index::IndexDef;
 #[cfg(feature = "std")]
 pub use tree::Cursor;
+// Solo bajo `encryption`, a diferencia del resto de reexportaciones de
+// arriba: `Algorithm`/`Encryption` son datos inertes sin esta feature (ver
+// el comentario de `crypto` más arriba), pero dejarlos alcanzables como
+// `inro::Encryption` de todos modos invitaría a construir un
+// `Options { encryption: Some(...), .. }` que `Db::create`/`open` van a
+// rechazar en tiempo de ejecución (`Error::BadFormat`, ver `tx.rs`) en vez
+// de en tiempo de compilación. Gatearlo aquí convierte ese error en "no
+// existe el tipo `Encryption`" al compilar, que es antes y más claro.
+#[cfg(feature = "encryption")]
+pub use crypto::{Algorithm, Encryption};
 
 /// Número de página. El fichero direcciona 2^32 páginas: 2 TB con páginas de
 /// 512 bytes, 16 TB con páginas de 4 KB.

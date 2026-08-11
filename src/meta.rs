@@ -48,6 +48,12 @@ pub struct Meta {
     pub page_size_log2: u8,
     pub format_major: u16,
     pub flags: u8,
+    /// Clave de datos envuelta con la maestra (tarea 17), bytes 40..100:
+    /// nonce de 12, texto cifrado de 32 y tag de 16 (`crypto::WRAPPED_KEY_LEN`
+    /// = 60). `Some` si y solo si `flags & header::FLAG_ENCRYPTED != 0` — es
+    /// `decode` quien impone esa correspondencia (ver más abajo), no un
+    /// invariante que este `struct` pueda hacer cumplir por construcción.
+    pub wrapped_key: Option<[u8; crate::crypto::WRAPPED_KEY_LEN]>,
 }
 
 impl Meta {
@@ -64,6 +70,9 @@ impl Meta {
         b[30..32].copy_from_slice(&self.format_major.to_le_bytes());
         // 40..100 clave de datos envuelta (tarea 17): nonce de 12, texto
         // cifrado de 32 y tag de 16. 100..108 reservado.
+        if let Some(wrapped) = &self.wrapped_key {
+            b[40..40 + crate::crypto::WRAPPED_KEY_LEN].copy_from_slice(wrapped);
+        }
         let crc = crc32::checksum(&b[..META_SIZE - 4]);
         b[META_SIZE - 4..META_SIZE].copy_from_slice(&crc.to_le_bytes());
         b
@@ -77,6 +86,21 @@ impl Meta {
         if stored != crc32::checksum(&b[..META_SIZE - 4]) {
             return Err(Error::Corrupt { page: 0, kind: CorruptKind::Checksum });
         }
+        let flags = b[29];
+        // `wrapped_key` se lee condicionado a `FLAG_ENCRYPTED`, no a si la
+        // región 40..100 es distinta de cero: una base sin cifrar nunca
+        // escribe ahí (`encode`, arriba, solo copia `wrapped_key` cuando es
+        // `Some`), así que en la práctica ambos criterios coinciden, pero
+        // basarse en el flag es exacto — "todo ceros" también sería, en
+        // teoría, un envoltorio válido (nonce, texto cifrado y tag a cero),
+        // por astronómicamente improbable que sea en la práctica.
+        let wrapped_key = if flags & crate::header::FLAG_ENCRYPTED != 0 {
+            let mut w = [0u8; crate::crypto::WRAPPED_KEY_LEN];
+            w.copy_from_slice(&b[40..40 + crate::crypto::WRAPPED_KEY_LEN]);
+            Some(w)
+        } else {
+            None
+        };
         Ok(Self {
             txn_id: u64::from_le_bytes(b[0..8].try_into().unwrap()),
             root: u32::from_le_bytes(b[8..12].try_into().unwrap()),
@@ -85,8 +109,9 @@ impl Meta {
             freelist_tail: u32::from_le_bytes(b[20..24].try_into().unwrap()),
             n_pages: u32::from_le_bytes(b[24..28].try_into().unwrap()),
             page_size_log2: b[28],
-            flags: b[29],
+            flags,
             format_major: u16::from_le_bytes(b[30..32].try_into().unwrap()),
+            wrapped_key,
         })
     }
 
@@ -146,7 +171,38 @@ mod tests {
         Meta {
             txn_id, root: 9, catalog_root: 0, freelist_head: 0, freelist_tail: 0,
             n_pages: 10, page_size_log2: 9, format_major: FORMAT_MAJOR, flags: 0,
+            wrapped_key: None,
         }
+    }
+
+    #[test]
+    fn wrapped_key_roundtrips_when_the_encrypted_flag_is_set() {
+        let mut m = meta(1);
+        m.flags = crate::header::FLAG_ENCRYPTED;
+        m.wrapped_key = Some([9u8; crate::crypto::WRAPPED_KEY_LEN]);
+        let encoded = m.encode(512);
+        assert_eq!(
+            &encoded[40..40 + crate::crypto::WRAPPED_KEY_LEN],
+            &[9u8; crate::crypto::WRAPPED_KEY_LEN][..]
+        );
+        assert_eq!(Meta::decode(&encoded).unwrap(), m);
+    }
+
+    /// Regresión adversarial: sin `FLAG_ENCRYPTED`, `decode` debe ignorar la
+    /// región 40..100 aunque no esté a cero — p. ej. basura que dejó una
+    /// versión anterior del fichero, o una base que nunca se cifró pero
+    /// cuya página de meta comparte bytes con una que sí lo estuvo. Si
+    /// `decode` derivara `wrapped_key` de "la región no es toda cero" en
+    /// vez de mirar el flag, este caso devolvería `Some` con basura en vez
+    /// de `None`.
+    #[test]
+    fn wrapped_key_is_none_without_the_encrypted_flag_even_if_bytes_are_nonzero() {
+        let m = meta(1);
+        let mut encoded = m.encode(512);
+        encoded[40] = 0xff;
+        let crc = crate::crc32::checksum(&encoded[..META_SIZE - 4]);
+        encoded[META_SIZE - 4..META_SIZE].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(Meta::decode(&encoded).unwrap().wrapped_key, None);
     }
 
     #[test]
