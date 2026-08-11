@@ -852,56 +852,193 @@ pub fn delete(tx: &mut WriteTxn, root: PageNo, key: &[u8]) -> Result<(PageNo, bo
     }
 }
 
+/// Cota de trabajo (páginas leídas) que UN SOLO `next()` puede hacer.
+///
+/// **Ronda 1 de revisión, hallazgo 2**: la cota de profundidad (`MAX_DEPTH`)
+/// por sí sola no basta. Acota cuánto puede CRECER la pila, pero no cuántas
+/// veces puede LLAMARSE `advance_to_next_leaf` dentro de una sola invocación
+/// de `next()`. Un DAG corrupto (no un ciclo: cada camino individual
+/// respeta `MAX_DEPTH`) derrota esa cota: `k` páginas internas donde
+/// `child(0) == extra`, cada una apuntando a la siguiente y terminando en
+/// una hoja vacía, mantienen todo camino raíz-hoja en `k + 1` niveles —
+/// dentro de `MAX_DEPTH` sin rozar `TreeLoop` — pero hay 2^k caminos
+/// DISTINTOS de esa profundidad, y `next()`, al reintentar tras cada hoja
+/// vacía, los recorre todos. Medido de verdad (no supuesto): k=18 tarda
+/// 1,9 s, k=20 6,3 s, k=22 25 s — duplica con cada nivel, como predice 2^k
+/// — y k=45 no termina en un tiempo razonable
+/// (`a_corrupt_dag_with_repeated_children_is_rejected_quickly_not_slowly`,
+/// más abajo, verifica esto tanto sin la cota — con un `k` pequeño, bajo
+/// `timeout` — como con ella, con un `k` que sin cota sería intratable).
+/// La cota de profundidad convertía esto en "acotado" en sentido
+/// matemático (2^128 es un número finito), pero no en la práctica: nada
+/// distinguía esa cota de un cuelgue real. Corrección del propio informe de
+/// la tarea 14, que afirmaba "acotado, no un cuelgue" sin haberlo medido.
+///
+/// La cota de trabajo cierra esto acotando el número TOTAL de páginas
+/// leídas dentro de una sola llamada a `next()`, sumando las de
+/// `next_uncommitted` y las de TODAS las llamadas a `advance_to_next_leaf`
+/// que haga esa invocación — no solo la primera (`work` es una variable
+/// LOCAL a `next_uncommitted`, pasada por referencia a cada llamada de
+/// `advance_to_next_leaf` dentro del mismo `next()`, así que el contador
+/// persiste entre reintentos consecutivos pero se reinicia en la siguiente
+/// llamada pública a `next`).
+///
+/// Elegir el límite exige saber cuánto trabajo hace un `next()` LEGÍTIMO en
+/// el peor caso, para no rechazar nunca un recorrido válido:
+/// - En un árbol que solo ha pasado por `insert_rec`/`delete_rec` no hay
+///   hojas vacías, así que una hoja que `advance_to_next_leaf` alcanza de
+///   verdad SIEMPRE tiene al menos una entrada. Por tanto el bucle de
+///   `next_uncommitted` nunca reintenta: como mucho UNA llamada a
+///   `advance_to_next_leaf` por invocación de `next()`.
+/// - Esa única llamada, en el peor caso, sube por TODA la pila actual
+///   (hasta `MAX_DEPTH` lecturas, bucle exterior) y vuelve a bajar por la
+///   rama hermana más profunda posible (hasta `MAX_DEPTH` lecturas más,
+///   bucle interior): `2 · MAX_DEPTH` como cota superior legítima de esa
+///   llamada.
+/// - Más la lectura inicial de la hoja agotada en `next_uncommitted`:
+///   `2 · MAX_DEPTH + 1` = 257 con `MAX_DEPTH = 128`.
+///
+/// `8 · MAX_DEPTH` = 1024 deja margen de sobra (~4× ese peor caso legítimo)
+/// sin acercarse ni de lejos a los pasos que hacen falta para que el ataque
+/// exponencial sea notable: con esta cota, la construcción de 2^k caminos
+/// del hallazgo 2 falla con `Err` en cuanto la suma de trabajo acumulado
+/// (que crece como 2^i para los primeros `i` niveles explorados, sea cual
+/// sea `k`) supera 1024 — sobre `i ≈ 10`, muy por debajo de cualquier `k`
+/// razonable, así que el coste de rechazar el ataque es constante, no
+/// función de `k`.
+const MAX_NEXT_WORK: u32 = 8 * MAX_DEPTH;
+
 /// Recorrido ordenado. Mantiene la pila de descenso porque las hojas no están
 /// encadenadas: encadenarlas obligaría, en copy-on-write, a reescribir la hoja
 /// anterior cada vez que su sucesora cambia de página.
 pub struct Cursor<'a, S: PageSource> {
     src: &'a S,
+    /// Raíz con la que se construyó el cursor. Se recuerda para que `seek`
+    /// (ronda 1 de revisión, hallazgo 4) pueda volver a descender sin que el
+    /// llamante tenga que pasarla de nuevo.
+    root: PageNo,
+    /// Espacio de claves del cursor: `Some(ns)` para uno construido con
+    /// `new` (antepone y recorta el byte `ns`), `None` para uno "crudo"
+    /// construido con `new_raw` (opera directamente sobre las claves del
+    /// árbol, sin transformación).
+    ///
+    /// **Ronda 1 de revisión, hallazgo 3**: antes había un `strip: usize`
+    /// independiente del `from`/`to` que el llamante ya había escapado con
+    /// `scoped` en `tx.rs` — nada impedía pasar uno sin el otro (`strip = 1`
+    /// con límites sin escapar habría truncado en silencio cada clave).
+    /// Guardar `ns` en vez de `strip` hace ese desajuste irrepresentable:
+    /// `new` calcula `scoped(ns, from)`/`scoped(ns, to)` Y recuerda el mismo
+    /// `ns` en el mismo sitio, así que el recorte (`strip_len`, más abajo) y
+    /// el prefijo antepuesto nunca pueden discrepar. También cierra la fuga
+    /// de diseño de que `Cursor::new` fuera público y devolviera claves con
+    /// el prefijo interno de `scoped` incluido a cualquier llamante externo:
+    /// ahora solo `new_raw` (`pub(crate)`, invisible fuera del crate) puede
+    /// hacer eso, y solo lo usan las pruebas de este módulo.
+    ns: Option<u8>,
     /// Cada nivel: página, y siguiente índice a visitar en ella.
     stack: Vec<(PageNo, usize)>,
     end: Vec<u8>,
     done: bool,
-    /// Bytes a omitir del principio de cada clave que devuelve `next`.
+    /// `Some(e)` en cuanto cualquier operación ha devuelto `Err` una vez:
+    /// el cursor queda envenenado de forma permanente y toda llamada
+    /// posterior a `next` repite el MISMO error en vez de intentar seguir.
     ///
-    /// `Cursor` en sí no sabe nada de espacios de claves: opera sobre las
-    /// claves tal como viven en el árbol, en el rango `[from, to)` que
-    /// recibió ya con cualquier prefijo incluido (así es como
-    /// `ReadTxn::scan`, en `tx.rs`, recorta por espacio "gratis" — ver el
-    /// comentario de `scoped`). Pero el byte de espacio de claves es un
-    /// detalle interno de `scoped`: la API pública (`get`/`put`/`delete`)
-    /// recibe y devuelve claves SIN él, con `ns` como parámetro aparte, así
-    /// que un `scan` cuyas claves devueltas SÍ lo llevaran sería
-    /// inconsistente con el resto de la API — y es exactamente lo que
-    /// hacía la primera versión de este cursor: sus propias pruebas (los
-    /// casos del brief, sin ningún cambio) fallaban en el primer `cargo
-    /// test` porque comparaban contra la clave sin prefijo. `strip` es 0
-    /// para un cursor construido con `new` sobre claves crudas (como los
-    /// de las pruebas de este módulo, que no pasan por `scoped`), y 1 para
-    /// el que construye `ReadTxn::scan` vía `new_with_strip`.
-    strip: usize,
+    /// **Ronda 1 de revisión, hallazgo 1**: `advance_to_next_leaf` muta
+    /// `self.stack` (el `pop()` inicial del bucle exterior, el `push` del
+    /// interior) ANTES de que el resto de la operación pueda fallar. Sin
+    /// envenenamiento, un error a mitad de esa función deja la pila
+    /// apuntando a una página que `next` da por hecho que es una hoja sin
+    /// comprobarlo — puede ser una interna, cuyo formato de celda comparte
+    /// el prefijo `[len_sufijo][sufijo]` con el de hoja pero no lo que
+    /// sigue (`page.key` sale bien, pero `page.leaf_value` reinterpreta los
+    /// 4 bytes del puntero al hijo como `[len_valor varint][valor]`, dando
+    /// basura silenciosa o un pánico de slice fuera de rango si esa
+    /// "longitud" no cabe en la página). Confirmado con un fallo
+    /// transitorio de E/S inyectado justo en esa lectura
+    /// (`a_transient_read_error_poisons_the_cursor_instead_of_returning_wrong_data`,
+    /// más abajo): sin envenenar, un reintento tras el error devolvía la
+    /// clave real con un valor corrupto en vez de otro `Err`. `seek` es la
+    /// única forma de limpiar `poison`: es una operación nueva y deliberada
+    /// del llamante, no un reintento silencioso de `next`.
+    poison: Option<Error>,
 }
 
 impl<'a, S: PageSource> Cursor<'a, S> {
-    pub fn new(src: &'a S, root: PageNo, from: &[u8], to: &[u8]) -> Result<Self> {
-        Self::new_with_strip(src, root, from, to, 0)
+    /// Recorrido de `[from, to)` dentro del espacio de claves `ns`. `from` y
+    /// `to` son claves SIN el byte de espacio, igual que en
+    /// `get`/`put`/`delete` — el cursor antepone `ns` internamente con
+    /// `scoped` (la misma transformación que usa el resto de la API) y lo
+    /// recorta de cada clave que devuelve `next`.
+    pub fn new(src: &'a S, root: PageNo, ns: u8, from: &[u8], to: &[u8]) -> Result<Self> {
+        let scoped_from = crate::tx::scoped(ns, from);
+        let scoped_to = crate::tx::scoped(ns, to);
+        let mut c = Self::new_raw(src, root, &scoped_from, &scoped_to)?;
+        c.ns = Some(ns);
+        Ok(c)
     }
 
-    /// Como `new`, pero omitiendo los primeros `strip` bytes de cada clave
-    /// devuelta por `next`. Solo la usa `ReadTxn::scan` (`tx.rs`), para
-    /// recortar el byte de espacio de claves antes de devolver la clave al
-    /// llamante — ver el comentario de campo `strip`.
-    pub(crate) fn new_with_strip(
-        src: &'a S,
-        root: PageNo,
-        from: &[u8],
-        to: &[u8],
-        strip: usize,
-    ) -> Result<Self> {
-        let mut c = Self { src, stack: Vec::new(), end: to.to_vec(), done: root == 0, strip };
+    /// Como `new`, pero sin anteponer ni recortar ningún byte: opera
+    /// directamente sobre las claves tal como viven en el árbol.
+    /// `pub(crate)`: ningún código fuera de este crate debe ver claves con
+    /// el prefijo de espacio incluido, así que solo las pruebas de este
+    /// módulo (que construyen árboles a mano con claves que no pasan por
+    /// `scoped`) tienen acceso a este constructor.
+    pub(crate) fn new_raw(src: &'a S, root: PageNo, from: &[u8], to: &[u8]) -> Result<Self> {
+        let mut c = Self {
+            src,
+            root,
+            ns: None,
+            stack: Vec::new(),
+            end: to.to_vec(),
+            done: root == 0,
+            poison: None,
+        };
         if root != 0 {
             c.seek_from(root, from)?;
         }
         Ok(c)
+    }
+
+    /// Bytes a omitir del principio de cada clave que devuelve `next`:
+    /// derivado de `ns` en vez de almacenado aparte — ver el comentario del
+    /// campo `ns`.
+    fn strip_len(&self) -> usize {
+        self.ns.is_some() as usize
+    }
+
+    /// Reposiciona el cursor en la primera entrada mayor o igual que `key`,
+    /// conservando el límite superior (`to`) y el espacio de claves con los
+    /// que se construyó. `key` es una clave SIN el byte de espacio, igual
+    /// que `from`/`to` en `new` — se antepone el mismo `ns` internamente si
+    /// el cursor lo tiene (`None` para uno construido con `new_raw`).
+    ///
+    /// **Ronda 1 de revisión, hallazgo 4**: el brief lista
+    /// `Cursor::seek(&mut self, &[u8])` en su bloque de interfaces, pero su
+    /// propio código del paso 3 nunca la define — solo la `seek_from`
+    /// privada, que además recibe la raíz como parámetro en vez de
+    /// recordarla. Añadida como envoltorio delgado sobre `seek_from`
+    /// (de ahí que el cursor ahora guarde `self.root`), limpiando `done` y
+    /// `poison`: es una operación nueva que el llamante elige hacer
+    /// explícitamente, a diferencia de reintentar `next` tras un error, que
+    /// `next` sigue rechazando mientras el cursor esté envenenado.
+    pub fn seek(&mut self, key: &[u8]) -> Result<()> {
+        let scoped_key;
+        let full: &[u8] = match self.ns {
+            Some(ns) => {
+                scoped_key = crate::tx::scoped(ns, key);
+                &scoped_key
+            }
+            None => key,
+        };
+        self.poison = None;
+        self.done = self.root == 0;
+        if self.root != 0
+            && let Err(e) = self.seek_from(self.root, full)
+        {
+            self.poison = Some(e);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Desciende hasta la primera entrada mayor o igual que `key`.
@@ -943,8 +1080,20 @@ impl<'a, S: PageSource> Cursor<'a, S> {
         }
     }
 
+    /// Cuenta una lectura de página contra el presupuesto de trabajo de la
+    /// invocación actual de `next()` — ver `MAX_NEXT_WORK`.
+    fn charge(work: &mut u32, page: PageNo) -> Result<()> {
+        *work += 1;
+        if *work > MAX_NEXT_WORK {
+            return Err(Error::Corrupt { page, kind: CorruptKind::TreeLoop });
+        }
+        Ok(())
+    }
+
     /// Sube por la pila hasta encontrar un nodo con hijos pendientes y vuelve
-    /// a bajar por su borde izquierdo.
+    /// a bajar por su borde izquierdo. `work` es el presupuesto compartido
+    /// de la llamada a `next()` que originó esta invocación — ver
+    /// `MAX_NEXT_WORK` y `next_uncommitted`.
     ///
     /// El bucle EXTERIOR (el que sube) está acotado por construcción, sin
     /// necesitar contador: cada vuelta empieza con un `pop()` incondicional,
@@ -970,13 +1119,19 @@ impl<'a, S: PageSource> Cursor<'a, S> {
     /// `MAX_DEPTH` niveles, exactamente lo que ya garantiza `descend` para un
     /// único descenso— válida en todo momento de la vida del cursor, no solo
     /// dentro de una llamada.
-    fn advance_to_next_leaf(&mut self) -> Result<bool> {
+    ///
+    /// Esa cota de profundidad, por sí sola, NO basta contra un DAG corrupto
+    /// (no un ciclo) donde cada camino individual respeta `MAX_DEPTH` pero
+    /// hay exponencialmente muchos caminos distintos — de ahí `work` y
+    /// `MAX_NEXT_WORK`, ver su comentario.
+    fn advance_to_next_leaf(&mut self, work: &mut u32) -> Result<bool> {
         loop {
             self.stack.pop();
             let Some((page_no, idx)) = self.stack.last_mut() else {
                 return Ok(false);
             };
             let page_no = *page_no;
+            Self::charge(work, page_no)?;
             let bytes = self.src.read_page(page_no)?;
             let page = PageRef::parse(&bytes, page_no)?;
             // `extra` es el hijo con índice `n_slots`, así que hay hijo
@@ -992,6 +1147,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
                 if depth > MAX_DEPTH {
                     return Err(Error::Corrupt { page: current, kind: CorruptKind::TreeLoop });
                 }
+                Self::charge(work, current)?;
                 let bytes = self.src.read_page(current)?;
                 let p = PageRef::parse(&bytes, current)?;
                 self.stack.push((current, 0));
@@ -1012,8 +1168,31 @@ impl<'a, S: PageSource> Cursor<'a, S> {
     /// esta tarea. `should_implement_trait` confunde esto con
     /// `Iterator::next`, que devolvería `Option<_>` sin más — deliberado,
     /// no un descuido.
+    ///
+    /// Envoltorio delgado sobre `next_uncommitted` (ronda 1 de revisión,
+    /// hallazgo 1): si esa función devuelve `Err`, por lo que sea, este es
+    /// el ÚNICO sitio que hace falta tocar para envenenar el cursor —
+    /// cualquier `?` nuevo que se añada dentro de `next_uncommitted` o de
+    /// `advance_to_next_leaf` en el futuro queda cubierto automáticamente,
+    /// sin tener que acordarse de marcar `poison` en cada punto de retorno
+    /// disperso por esas dos funciones.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if let Some(e) = self.poison {
+            return Err(e);
+        }
+        let result = self.next_uncommitted();
+        if let Err(e) = result {
+            self.poison = Some(e);
+        }
+        result
+    }
+
+    /// Cuerpo real de `next`, sin el envenenamiento — separado para que
+    /// `next` pueda interceptar CUALQUIER `Err` que salga de aquí (incluidos
+    /// los que vengan de `advance_to_next_leaf`) en un solo sitio.
+    fn next_uncommitted(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let mut work = 0u32;
         loop {
             if self.done {
                 return Ok(None);
@@ -1022,11 +1201,12 @@ impl<'a, S: PageSource> Cursor<'a, S> {
                 self.done = true;
                 return Ok(None);
             };
+            Self::charge(&mut work, leaf)?;
             let bytes = self.src.read_page(leaf)?;
             let page = PageRef::parse(&bytes, leaf)?;
 
             if idx >= page.n_slots() {
-                if !self.advance_to_next_leaf()? {
+                if !self.advance_to_next_leaf(&mut work)? {
                     self.done = true;
                     return Ok(None);
                 }
@@ -1040,9 +1220,9 @@ impl<'a, S: PageSource> Cursor<'a, S> {
             let key = page.key(idx);
             // La comparación con `end` es sobre la clave COMPLETA tal como
             // vive en el árbol (con cualquier prefijo de `scoped` incluido,
-            // porque `end` también lo lleva — ver `ReadTxn::scan`), no sobre
-            // la que se devuelve más abajo: recortar antes rompería el
-            // orden en cuanto `strip` fuera mayor que cero.
+            // porque `end` también lo lleva — ver `new`), no sobre la que
+            // se devuelve más abajo: recortar antes rompería el orden en
+            // cuanto `strip_len()` fuera mayor que cero.
             if key.as_slice() >= self.end.as_slice() {
                 self.done = true;
                 return Ok(None);
@@ -1051,13 +1231,13 @@ impl<'a, S: PageSource> Cursor<'a, S> {
                 LeafValue::Inline(v) => v.to_vec(),
                 LeafValue::Overflow { len, first } => read_overflow(self.src, len, first)?,
             };
+            let strip = self.strip_len();
             debug_assert!(
-                self.strip <= key.len(),
-                "strip ({}) no puede superar la longitud de la clave ({})",
-                self.strip,
+                strip <= key.len(),
+                "strip ({strip}) no puede superar la longitud de la clave ({})",
                 key.len()
             );
-            return Ok(Some((key[self.strip.min(key.len())..].to_vec(), value)));
+            return Ok(Some((key[strip.min(key.len())..].to_vec(), value)));
         }
     }
 }
@@ -3037,7 +3217,7 @@ mod cursor_tests {
         tx.commit().unwrap();
 
         let r = db.begin_read();
-        let mut c = Cursor::new(&r, r.root(), b"", b"\xff").unwrap();
+        let mut c = Cursor::new_raw(&r, r.root(), b"", b"\xff").unwrap();
         // La primera clave viene del subárbol normal, sin tocar el ciclo.
         assert_eq!(c.next().unwrap(), Some((b"aa".to_vec(), b"1".to_vec())));
         // Agotar `l1` obliga a `advance_to_next_leaf` a subir hasta la raíz
@@ -3073,7 +3253,7 @@ mod cursor_tests {
         tx.commit().unwrap();
 
         let r = db.begin_read();
-        let err = match Cursor::new(&r, r.root(), b"", b"\xff") {
+        let err = match Cursor::new_raw(&r, r.root(), b"", b"\xff") {
             Ok(_) => panic!("se esperaba TreeLoop, el cursor se construyó sin error"),
             Err(e) => e,
         };
@@ -3081,5 +3261,244 @@ mod cursor_tests {
             matches!(err, crate::Error::Corrupt { kind: CorruptKind::TreeLoop, .. }),
             "se esperaba TreeLoop, se obtuvo {err:?}"
         );
+    }
+
+    // --- Ronda 1 de revisión: pruebas de los cuatro hallazgos ------------
+
+    /// `PageSource` de pruebas que delega en uno real, pero devuelve
+    /// `Error::Io` en la llamada a `read_page` número `fail_at`, una sola
+    /// vez, para simular un fallo transitorio de E/S en medio de un
+    /// recorrido — sin depender del inyector de fallos de la tarea 20, que
+    /// todavía no existe.
+    struct FlakySource<'a, S: PageSource> {
+        inner: &'a S,
+        calls: core::cell::Cell<u32>,
+        fail_at: u32,
+    }
+
+    impl<'a, S: PageSource> PageSource for FlakySource<'a, S> {
+        fn read_page(&self, page: PageNo) -> Result<alloc::sync::Arc<[u8]>> {
+            let n = self.calls.get() + 1;
+            self.calls.set(n);
+            if n == self.fail_at {
+                return Err(crate::Error::Io(crate::error::IoError::Other(5)));
+            }
+            self.inner.read_page(page)
+        }
+    }
+
+    /// Hallazgo 1: reconstruye el mecanismo exacto que encontró la
+    /// revisión. Un árbol de tres páginas — `root` (interno, una entrada:
+    /// separador "b" -> hijo `l1`, `extra` = `l2`), `l1` (hoja, una
+    /// entrada) y `l2` (hoja, una entrada) — sin nada corrupto.
+    ///
+    /// Cuenta de lecturas hasta el punto exacto (verificada a mano, no
+    /// supuesta): `Cursor::new` (que llama a `seek_from`) lee `root` (1) y
+    /// `l1` (2); el primer `next()` relee `l1` (3) y devuelve su única
+    /// entrada; el segundo `next()` relee `l1` (4, agotada) y entra en
+    /// `advance_to_next_leaf`, cuya primera lectura (5) es la del padre
+    /// (`root`) en el bucle EXTERIOR — la lectura que decide si queda algún
+    /// hermano pendiente. Inyectar el fallo justo ahí deja la pila con
+    /// `(root, 0)` en la posición que `next` SIEMPRE trata como hoja, sin
+    /// comprobar `page_type()`.
+    ///
+    /// Sin el envenenamiento del hallazgo 1, un reintento posterior
+    /// releería `root` (esta vez con éxito, simulando que el fallo
+    /// transitorio ya pasó), lo trataría como una hoja, y devolvería la
+    /// clave real "b" (el formato `[len_sufijo][sufijo]` es compartido
+    /// entre celda de hoja e interna, así que esa parte sale bien) con un
+    /// "valor" formado por los 4 bytes crudos del puntero al hijo `l1`,
+    /// reinterpretados como `[len_valor varint][valor]` — basura silenciosa
+    /// sobre un árbol perfectamente válido, exactamente lo que el `.expect`
+    /// que se quitó de `scan` (tarea 14) pretendía evitar pero no evitaba
+    /// del todo.
+    #[test]
+    fn a_transient_read_error_poisons_the_cursor_instead_of_returning_wrong_data() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        let l1 = tx.alloc().unwrap();
+        let l2 = tx.alloc().unwrap();
+        let root = tx.alloc().unwrap();
+
+        let leaf1 =
+            PageBuilder::new(512, PageType::Leaf).build(&[(b"aa".as_slice(), CellPayload::Value(b"1"))]).unwrap();
+        let leaf2 =
+            PageBuilder::new(512, PageType::Leaf).build(&[(b"zz".as_slice(), CellPayload::Value(b"2"))]).unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(l2);
+        let rt = rb.build(&[(b"b".as_slice(), CellPayload::Child(l1))]).unwrap();
+
+        tx.write_page(l1, &leaf1).unwrap();
+        tx.write_page(l2, &leaf2).unwrap();
+        tx.write_page(root, &rt).unwrap();
+        tx.set_root(root);
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        let flaky = FlakySource { inner: &r, calls: core::cell::Cell::new(0), fail_at: 5 };
+        let mut c = Cursor::new_raw(&flaky, r.root(), b"", b"\xff").unwrap();
+
+        assert_eq!(c.next().unwrap(), Some((b"aa".to_vec(), b"1".to_vec())));
+
+        let err = match c.next() {
+            Err(e) => e,
+            Ok(v) => panic!("se esperaba Err por el fallo inyectado, se obtuvo {v:?}"),
+        };
+        assert!(matches!(err, crate::Error::Io(_)), "se esperaba Io, se obtuvo {err:?}");
+
+        // La parte que importa: el cursor debe quedar envenenado. Sin ello,
+        // esta llamada devolvía `Ok(Some((b"b", <basura>)))` en vez de
+        // repetir el error.
+        match c.next() {
+            Err(e2) => assert_eq!(e2, err, "un cursor envenenado debe repetir el mismo error"),
+            Ok(v) => panic!("el cursor envenenado devolvió un valor en vez de repetir el error: {v:?}"),
+        }
+        // Y se queda así: no es un fallo de una sola vez que se olvida.
+        match c.next() {
+            Err(e3) => assert_eq!(e3, err),
+            Ok(v) => panic!("el cursor envenenado devolvió un valor en la tercera llamada: {v:?}"),
+        }
+    }
+
+    /// Hallazgo 2: `k` páginas internas con `child(0) == extra`, cada una
+    /// apuntando a la siguiente, terminando en una hoja vacía. Cada camino
+    /// raíz-hoja tiene solo `k + 1` niveles — muy por debajo de `MAX_DEPTH`
+    /// — pero hay 2^k caminos distintos de esa profundidad, y `next()`, al
+    /// reintentar tras cada hoja vacía, los recorre todos si nada más lo
+    /// detiene. Con `k = 60`, 2^60 es intratable — la prueba en sí ya
+    /// demuestra que la cota de trabajo funciona con creces si termina en
+    /// un tiempo razonable, sin necesidad de medir microsegundos exactos.
+    ///
+    /// La versión sin cota de trabajo de esta prueba (con `k` mucho menor,
+    /// para que sea medible) SÍ se verificó por separado, revirtiendo
+    /// temporalmente `MAX_NEXT_WORK` y cronometrando bajo `timeout` — ver el
+    /// informe de la ronda 1 para los números.
+    #[test]
+    fn a_corrupt_dag_with_repeated_children_is_rejected_quickly_not_slowly() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+
+        let leaf = tx.alloc().unwrap();
+        let leaf_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
+        tx.write_page(leaf, &leaf_bytes).unwrap();
+
+        let k = 60u32; // muy por debajo de MAX_DEPTH (128); 2^60 caminos.
+        let mut next_page = leaf;
+        let mut root = leaf;
+        for _ in 0..k {
+            let p = tx.alloc().unwrap();
+            let mut b = PageBuilder::new(512, PageType::Internal);
+            b.set_extra(next_page);
+            let bytes = b.build(&[(b"k".as_slice(), CellPayload::Child(next_page))]).unwrap();
+            tx.write_page(p, &bytes).unwrap();
+            next_page = p;
+            root = p;
+        }
+        tx.set_root(root);
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        let mut c = Cursor::new_raw(&r, r.root(), b"", b"\xff").unwrap();
+        let start = std::time::Instant::now();
+        let err = match c.next() {
+            Err(e) => e,
+            Ok(v) => panic!("se esperaba Err por exceso de trabajo, se obtuvo {v:?}"),
+        };
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: CorruptKind::TreeLoop, .. }),
+            "se esperaba TreeLoop, se obtuvo {err:?}"
+        );
+        assert!(
+            elapsed.as_secs() < 2,
+            "con la cota de trabajo esto debe fallar rápido, no explorar 2^{k} caminos: tardó {elapsed:?}"
+        );
+    }
+
+    /// Hallazgo 4: `Cursor::seek` reposiciona un cursor ya construido sin
+    /// tener que crear otro. Sobre un cursor con espacio de claves (`ns` =
+    /// `Some`), `seek` recibe la clave SIN el prefijo, igual que `from`/`to`
+    /// en `new`. `seek` reposiciona solo el punto de partida — el límite
+    /// superior `to` con el que se construyó el cursor no cambia (la firma
+    /// del brief, `seek(&mut self, &[u8])`, solo tiene sitio para una
+    /// clave) — así que aquí se usa un `to` que cubre de sobra el punto al
+    /// que se reposiciona, no uno más estrecho como el de `scan` de la
+    /// primera parte de la prueba.
+    #[test]
+    fn seek_repositions_an_already_constructed_cursor() {
+        let db = seeded();
+        let r = db.begin_read();
+        let mut c = r.scan(0x01, b"", b"\xff").unwrap();
+        assert_eq!(c.next().unwrap(), Some((b"000000".to_vec(), 0u32.to_le_bytes().to_vec())));
+
+        c.seek(b"000500").unwrap();
+        assert_eq!(
+            c.next().unwrap(),
+            Some((b"000500".to_vec(), 500u32.to_le_bytes().to_vec())),
+            "seek debe reposicionar, no seguir donde se quedó"
+        );
+        assert_eq!(c.next().unwrap(), Some((b"000501".to_vec(), 501u32.to_le_bytes().to_vec())));
+    }
+
+    /// `seek` también debe limpiar `done`: seguir de un cursor que ya había
+    /// terminado (por agotar el árbol, no el límite superior — con `to =
+    /// "\xff"` el único modo de agotarse es que `advance_to_next_leaf`
+    /// devuelva `false`, es decir, recorrer de verdad hasta la última clave
+    /// del espacio) sin que quede "pegado" a `None` para siempre. `from =
+    /// "000998"` deja solo dos claves reales antes de ese final, para no
+    /// tener que consumir las 1000 sembradas.
+    #[test]
+    fn seek_clears_done_on_an_exhausted_cursor() {
+        let db = seeded();
+        let r = db.begin_read();
+        let mut c = r.scan(0x01, b"000998", b"\xff").unwrap();
+        assert_eq!(c.next().unwrap(), Some((b"000998".to_vec(), 998u32.to_le_bytes().to_vec())));
+        assert_eq!(c.next().unwrap(), Some((b"000999".to_vec(), 999u32.to_le_bytes().to_vec())));
+        assert_eq!(c.next().unwrap(), None, "el cursor agotó el árbol de verdad");
+
+        c.seek(b"000010").unwrap();
+        assert_eq!(
+            c.next().unwrap(),
+            Some((b"000010".to_vec(), 10u32.to_le_bytes().to_vec())),
+            "seek debe revivir un cursor agotado"
+        );
+    }
+
+    /// `seek` también debe limpiar `poison`: es la única forma documentada
+    /// de recuperar un cursor tras un error, y debe funcionar de verdad.
+    #[test]
+    fn seek_clears_poison_on_a_failed_cursor() {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        let l1 = tx.alloc().unwrap();
+        let l2 = tx.alloc().unwrap();
+        let root = tx.alloc().unwrap();
+
+        let leaf1 =
+            PageBuilder::new(512, PageType::Leaf).build(&[(b"aa".as_slice(), CellPayload::Value(b"1"))]).unwrap();
+        let leaf2 =
+            PageBuilder::new(512, PageType::Leaf).build(&[(b"zz".as_slice(), CellPayload::Value(b"2"))]).unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(l2);
+        let rt = rb.build(&[(b"b".as_slice(), CellPayload::Child(l1))]).unwrap();
+
+        tx.write_page(l1, &leaf1).unwrap();
+        tx.write_page(l2, &leaf2).unwrap();
+        tx.write_page(root, &rt).unwrap();
+        tx.set_root(root);
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        let flaky = FlakySource { inner: &r, calls: core::cell::Cell::new(0), fail_at: 5 };
+        let mut c = Cursor::new_raw(&flaky, r.root(), b"", b"\xff").unwrap();
+        assert_eq!(c.next().unwrap(), Some((b"aa".to_vec(), b"1".to_vec())));
+        assert!(c.next().is_err(), "el fallo inyectado debe envenenar el cursor");
+        assert!(c.next().is_err(), "sigue envenenado sin haber hecho seek");
+
+        // `seek` no vuelve a tocar la lectura fallida (ya la consumió
+        // `FlakySource`): a partir de aquí las lecturas tienen éxito, así
+        // que reposicionar debe funcionar con normalidad.
+        c.seek(b"zz").unwrap();
+        assert_eq!(c.next().unwrap(), Some((b"zz".to_vec(), b"2".to_vec())));
     }
 }

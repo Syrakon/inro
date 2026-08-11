@@ -220,26 +220,26 @@ impl<'db> ReadTxn<'db> {
     /// silenciosa" (ver el comentario de `read_overflow`) — un panic es
     /// estrictamente peor que una respuesta silenciosa, porque además
     /// aborta el proceso. `get`, `put` y `delete` ya devuelven `Result` por
-    /// esta misma razón; `scan` debe ser igual de consistente. Cambia la
-    /// firma de este método frente al brief, pero no la de `Cursor::new`
-    /// (que ya devolvía `Result` en el propio código de la tarea) ni la de
-    /// `Cursor::next`.
+    /// esta misma razón; `scan` debe ser igual de consistente.
+    ///
+    /// `ns` se le pasa a `Cursor::new` en vez de escaparse aquí (ronda 1 de
+    /// revisión, hallazgo 3): el propio cursor calcula `scoped(ns, from)` y
+    /// `scoped(ns, to)` y recuerda con qué `ns` lo hizo, así que no hay
+    /// forma de que el prefijo antepuesto al rango y el que se recorta de
+    /// cada clave devuelta se desincronicen — antes eran dos decisiones
+    /// separadas (`scoped(...)` aquí, `strip` allí) que nada obligaba a
+    /// coincidir.
     pub fn scan(&self, ns: u8, from: &[u8], to: &[u8]) -> Result<crate::tree::Cursor<'_, Self>> {
-        // `strip: 1` recorta el byte de espacio de claves que `scoped` antepuso:
-        // el llamante nunca debe verlo, igual que no lo ve en `get`/`put`/`delete`.
-        crate::tree::Cursor::new_with_strip(
-            self,
-            self.meta.root,
-            &scoped(ns, from),
-            &scoped(ns, to),
-            1,
-        )
+        crate::tree::Cursor::new(self, self.meta.root, ns, from, to)
     }
 }
 
 /// Antepone el byte de espacio de claves. Es la única transformación entre la
-/// clave que ve el usuario y la que vive en el árbol.
-fn scoped(ns: u8, key: &[u8]) -> Vec<u8> {
+/// clave que ve el usuario y la que vive en el árbol. `pub(crate)` porque
+/// `tree::Cursor::new` también la necesita (ronda 1 de revisión, hallazgo 3):
+/// el cursor calcula su propio prefijo internamente en vez de recibirlo ya
+/// aplicado, así que esta es la única función que sabe construirlo.
+pub(crate) fn scoped(ns: u8, key: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(1 + key.len());
     k.push(ns);
     k.extend_from_slice(key);
