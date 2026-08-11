@@ -1804,4 +1804,82 @@ mod delete_invariant_tests {
              completos de borrado + reinserción: páginas filtradas en vez de recicladas"
         );
     }
+
+    /// Regresión del hallazgo 2 de la revisión de la tarea 12: colapsar un
+    /// nodo interno de un solo hijo rompe el balance de altura (ver el
+    /// comentario de `MAX_DEPTH`), así que el churn sostenido debe medirse,
+    /// no darse por acotado con la fórmula de un árbol balanceado.
+    ///
+    /// Construye un árbol de 800 claves cercanas al límite de `page_size /
+    /// 4` (el peor caso de ramificación: sin prefijo común, separadores
+    /// grandes), lo somete a 15 000 ciclos de "desalojo aleatorio +
+    /// inserción en el borde" — el patrón de retención con desorden que
+    /// dispersa los colapsos por varios nodos internos en vez de
+    /// concentrarlos siempre en la misma rama — y comprueba tanto que la
+    /// profundidad SÍ crece (si dejara de hacerlo, esta prueba habría
+    /// dejado de ejercitar el fenómeno) como que se queda por debajo de un
+    /// techo medido. Un cambio futuro que empeore la deriva debe fallar
+    /// aquí, ruidosamente, en vez de comerse en silencio el margen que le
+    /// queda a `MAX_DEPTH`.
+    #[test]
+    fn churn_grows_depth_but_stays_within_the_measured_ceiling() {
+        let key_for = |i: u32| -> Vec<u8> {
+            let mut k = alloc::format!("{i:07}").into_bytes();
+            k.resize(127, b'k');
+            k
+        };
+        let n = 800u32;
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let mut root = 0;
+        for i in 0..n {
+            root = put(&mut tx, root, &key_for(i), b"v").unwrap();
+        }
+
+        // Profundidad máxima sobre una muestra de hasta 200 claves vivas,
+        // repartidas uniformemente por el conjunto (no solo las primeras):
+        // recorrer las 800/15800 enteras en cada medición sería
+        // desproporcionado frente al propio churn.
+        let sampled_max_depth = |tx: &WriteTxn, root: PageNo, live: &[u32]| -> usize {
+            let mut max_depth = 0usize;
+            for (sampled, &i) in live.iter().enumerate() {
+                if sampled % (live.len() / 200).max(1) != 0 {
+                    continue;
+                }
+                let (_, path) = descend(tx, root, &key_for(i)).unwrap().unwrap();
+                max_depth = max_depth.max(path.len() + 1);
+            }
+            max_depth
+        };
+
+        let initial: Vec<u32> = (0..n).collect();
+        let balanced = sampled_max_depth(&tx, root, &initial);
+
+        let mut rng = Rng(0xDEAD_BEEF);
+        let mut live: Vec<u32> = (0..n).collect();
+        for newest in (n..).take(15_000usize) {
+            let idx = (rng.next() as usize) % live.len();
+            let victim = live.swap_remove(idx);
+            let (r, existed) = delete(&mut tx, root, &key_for(victim)).unwrap();
+            assert!(existed, "clave {victim}");
+            root = put(&mut tx, r, &key_for(newest), b"v").unwrap();
+            live.push(newest);
+        }
+
+        let churned = sampled_max_depth(&tx, root, &live);
+        assert!(
+            churned > balanced,
+            "el churn no aumentó la profundidad ({balanced} -> {churned}): esta prueba dejó de \
+             ejercitar la deriva de balance que motivó el hallazgo 2"
+        );
+        assert!(
+            churned <= 14,
+            "profundidad {churned} tras el churn (balanceada: {balanced}): muy por encima del \
+             techo medido con esta semilla (9) — o `MAX_DEPTH` (128) deja de tener margen real, \
+             o algo empeoró la deriva sin que nadie se enterase"
+        );
+
+        let mut visited = alloc::collections::BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
 }
