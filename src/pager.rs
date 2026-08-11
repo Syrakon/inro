@@ -53,6 +53,24 @@ impl Pager {
         page_no as u64 * self.geometry.page_size as u64
     }
 
+    /// `read` libera el cerrojo de la caché entre comprobar el fallo y
+    /// volver a tomarlo para insertar la entrada nueva: el I/O de
+    /// `storage.read_at` ocurre sin el cerrojo tomado. Esa ventana podría
+    /// publicar una entrada obsoleta si un `write` a la misma página se
+    /// colara justo en medio. No puede: `write` (ver su documentación)
+    /// solo reescribe páginas que ningún lector vivo puede estar todavía
+    /// leyendo, así que esa ventana nunca se solapa con un `write` a la
+    /// misma página. Esto es una precondición que impone quien llama —
+    /// otra vez la capa de transacciones — y no algo que `Pager`
+    /// compruebe ni haga cumplir por sí mismo.
+    ///
+    /// Las páginas de meta se escriben a través de este `Pager`, pero
+    /// ningún lector llama nunca a `read` sobre una página de meta: la
+    /// vista de un lector sale del estado ya confirmado en el momento de
+    /// abrir su transacción, no de la caché del `Pager`. Las metas quedan
+    /// a salvo por ese argumento distinto, no por el de arriba — y se
+    /// rompe si algún código futuro empieza a leer una meta-página a
+    /// través de `Pager::read`.
     pub fn read(&self, page_no: PageNo) -> Result<Arc<[u8]>> {
         {
             let mut c = self.cache.lock().unwrap();
@@ -73,6 +91,14 @@ impl Pager {
         Ok(bytes)
     }
 
+    /// Precondición que debe garantizar quien llama, no `Pager`: toda
+    /// página que se reescribe aquí es, o bien recién asignada más allá de
+    /// cualquier `n_pages` que un lector vivo haya visto jamás, o bien
+    /// reciclada de la lista de libres solo después de que ningún lector
+    /// vivo preceda a la transacción que la liberó. Esa garantía la
+    /// impone la capa de transacciones — lista de libres y tabla de
+    /// lectores —, no `Pager`, que no la comprueba. De ella depende que
+    /// `read` (ver su documentación) nunca publique una entrada obsoleta.
     pub fn write(&self, page_no: PageNo, bytes: &[u8]) -> Result<()> {
         debug_assert_eq!(bytes.len(), self.geometry.page_size as usize);
         self.storage.write_at(self.offset(page_no), bytes)?;
