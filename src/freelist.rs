@@ -243,13 +243,13 @@ impl Freelist {
     /// — esa página solo se volvió basura ahora, al leerla esta
     /// transacción, no cuando se liberaron las páginas que describía.
     ///
-    /// `next_nonce` (tarea 17, ronda de revisión posterior a la primera
-    /// entrega) da el contador de nonce para CADA página que este `flush`
-    /// escribe — deliberadamente NO `txn`: el mismo defecto que motivó
-    /// separar el contador del `txn_id` en `WriteTxn::write_page`
-    /// (`tx.rs`) aplica aquí igual, así que `flush` recibe la misma
-    /// fuente de contadores que usa el resto de la transacción
-    /// (`Db::reserve_counters`), en vez de reinventar la suya.
+    /// `next_nonce` (tarea 17) da el contador de nonce para CADA página que
+    /// este `flush` escribe — deliberadamente NO `txn`: el mismo defecto
+    /// que motivó separar el contador del `txn_id` en
+    /// `WriteTxn::write_page` (`tx.rs`) aplica aquí igual, así que `flush`
+    /// recibe la misma fuente de contadores que usa el resto de la
+    /// transacción (`WriterState::live_counter`, `tx.rs`), en vez de
+    /// reinventar la suya.
     pub fn flush(
         &mut self,
         pager: &Pager,

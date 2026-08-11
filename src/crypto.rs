@@ -358,10 +358,11 @@ pub fn unwrap_key(master: &[u8; 32], wrapped: &[u8; WRAPPED_KEY_LEN]) -> Result<
 mod tests {
     use super::*;
     use crate::storage::MemStorage;
-    use crate::tx::{Db, Encryption, Options};
+    use crate::tx::{Db, Encryption, Options, Sync};
     use crate::Storage;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
+    use core::time::Duration;
     use std::sync::Mutex;
 
     /// Parametrizado por algoritmo (ronda de revisión posterior a la
@@ -695,10 +696,11 @@ mod tests {
     }
 
     /// Complementa la prueba de arriba con el otro eje: muchas
-    /// transacciones PEQUEÑAS en vez de una grande, para ejercitar
-    /// `Db::reserve_counters` cruzando el límite de una reserva
-    /// (`COUNTER_RESERVE`) varias veces — la prueba de arriba, con una sola
-    /// transacción, solo hace UNA reserva inicial.
+    /// transacciones PEQUEÑAS en vez de una grande, atravesando varias
+    /// aperturas de transacción (`begin_write`/`commit`) en vez de una
+    /// sola — comprueba que el contador vivo (`WriterState::live_counter`,
+    /// que sobrevive tal cual entre transacciones desde la segunda ronda
+    /// de revisión) se lleva bien de una a otra.
     #[test]
     fn no_nonce_is_ever_reused_across_many_small_transactions() {
         let s = Arc::new(RecordingStorage::new());
@@ -713,6 +715,381 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), nonces.len(), "nonce repetido");
+    }
+
+    /// Sonda 1 de la segunda ronda de revisión posterior a la primera
+    /// entrega (hallazgo BLOCKER 2): abortar una transacción y luego
+    /// confirmar otra distinta no debe reutilizar ningún contador. Con el
+    /// diseño roto de la primera ronda, el contador se releía de la meta
+    /// CONFIRMADA en cada `begin_write` — y como abortar no toca la meta
+    /// confirmada, la segunda transacción arrancaba exactamente donde
+    /// había arrancado la primera, repartiendo de nuevo los mismos
+    /// contadores que la abortada ya había usado para sellar páginas
+    /// reales. El caso concreto que lo demuestra: 5 `put` que se abortan,
+    /// seguidos de 5 `put` DISTINTOS que sí confirman — `alloc()`, en las
+    /// mismas condiciones de partida (mismo root confirmado, misma lista
+    /// de libres), tiende a repartir la MISMA secuencia de páginas, así
+    /// que sin el arreglo esto colisiona en página Y contador a la vez.
+    #[test]
+    fn a_rollback_then_a_commit_reuses_no_counter() {
+        let s = Arc::new(RecordingStorage::new());
+        let db = Db::create(Box::new(ArcRecording(Arc::clone(&s))), opts([31; 32])).unwrap();
+        {
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..5u32 {
+                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+            }
+            // Se descarta sin commit.
+        }
+        {
+            let mut tx = db.begin_write().unwrap();
+            for i in 100..105u32 {
+                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let nonces = s.encrypted_page_nonces();
+        let mut sorted = nonces.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), nonces.len(), "nonce repetido tras abortar y luego confirmar");
+    }
+
+    /// Sonda 2 de la segunda ronda de revisión (hallazgo BLOCKER 1): una
+    /// transacción que agota el techo de contador ya reservado, abortada
+    /// a media escritura, no debe corromper NADA de lo que ya estaba
+    /// confirmado al reabrir — ni perder datos, ni cambiar el `root`.
+    ///
+    /// Para ejercitar `Db::extend_counter_ceiling` de verdad sin necesitar
+    /// más de un millón de escrituras reales (`COUNTER_RESERVE`), esta
+    /// prueba manipula a mano el `write_counter` ya persistido (bytes
+    /// 100..108 de cada ranura de meta, recalculando el CRC) para dejarlo
+    /// artificialmente bajo — el mismo tipo de manipulación de bytes crudos
+    /// que ya usa `a_tampered_page_is_rejected`, sobre un campo distinto.
+    /// Con el diseño roto de la primera ronda, esto fallaba porque
+    /// `advance_counter` pasaba la meta DE LA TRANSACCIÓN EN CURSO — con
+    /// su `root` ya cambiado a medio hacer — a la extensión, y esa mitad
+    /// de transacción se recuperaba como si fuera un commit real.
+    #[test]
+    fn a_transaction_that_exceeds_the_ceiling_extends_it_without_losing_committed_data() {
+        let s = Arc::new(MemStorage::new());
+        let master = [41u8; 32];
+        let committed_root;
+        {
+            let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), opts(master)).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"antes", b"confirmado").unwrap();
+            tx.commit().unwrap();
+            committed_root = db.begin_read().root();
+        }
+
+        // Manipula `write_counter` de las DOS ranuras de meta a un valor
+        // artificialmente bajo, recalculando el CRC, para que la próxima
+        // transacción agote el techo enseguida.
+        let mut bytes = s.snapshot();
+        for meta_page in [1usize, 8usize] {
+            let base = meta_page * 512;
+            bytes[base + 100..base + 108].copy_from_slice(&3u64.to_le_bytes());
+            let crc = crate::crc32::checksum(&bytes[base..base + crate::meta::META_SIZE - 4]);
+            bytes[base + crate::meta::META_SIZE - 4..base + crate::meta::META_SIZE]
+                .copy_from_slice(&crc.to_le_bytes());
+        }
+        s.restore(bytes);
+
+        {
+            let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts(master)).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            // Más de 3 escrituras: agota el techo manipulado y fuerza una
+            // extensión real (con su propia sincronización incondicional)
+            // dentro de esta misma transacción.
+            for i in 0..20u32 {
+                tx.put(0x02, &i.to_be_bytes(), b"a medias").unwrap();
+            }
+            // Se descarta sin commit.
+        }
+
+        let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts(master)).unwrap();
+        let r = db.begin_read();
+        assert_eq!(r.root(), committed_root, "el root confirmado no debe cambiar tras abortar");
+        assert_eq!(r.get(0x01, b"antes").unwrap().as_deref(), Some(b"confirmado".as_slice()));
+        assert_eq!(
+            r.get(0x02, &0u32.to_be_bytes()).unwrap(),
+            None,
+            "nada de la transaccion abortada debe verse"
+        );
+    }
+
+    /// Envuelve `MemStorage` y simula un corte de corriente: las DOS
+    /// ranuras de meta solo sobreviven hasta el último `sync()` real; todo
+    /// lo demás (páginas de árbol, de lista de libres, la cabecera) se
+    /// trata como si llegara al medio sin condición — que es exactamente
+    /// lo que hace este motor: `Pager::write`/`write_encrypted` nunca
+    /// miran la política de `Sync`, solo `Db::maybe_sync` (y
+    /// `Db::extend_counter_ceiling`, que sincroniza sin condición) deciden
+    /// si un `fsync` de verdad ocurre. También lleva el mismo registro de
+    /// `(offset, primeros 8 bytes)` que `RecordingStorage`, para poder
+    /// comprobar directamente que nada se reutiliza tras el "corte".
+    ///
+    /// Asume `Options::default()` (`page_size` 512, `meta_a_page` 1,
+    /// `meta_b_page` 8) — las mismas que usa `opts()` — para saber dónde
+    /// viven las dos ranuras sin tener que leer la cabecera primero.
+    struct PowerLossStorage {
+        inner: MemStorage,
+        writes: Mutex<Vec<(u64, [u8; 8])>>,
+        last_synced_meta: Mutex<[[u8; 512]; 2]>,
+    }
+
+    const META_OFFSETS: [u64; 2] = [512, 4096];
+
+    impl PowerLossStorage {
+        fn new() -> Self {
+            Self {
+                inner: MemStorage::new(),
+                writes: Mutex::new(Vec::new()),
+                last_synced_meta: Mutex::new([[0u8; 512]; 2]),
+            }
+        }
+
+        /// Descarta cualquier escritura de meta posterior al último
+        /// `sync()` real — simula perder los búferes del sistema operativo
+        /// no vaciados a disco. Las páginas de datos/lista de libres NO se
+        /// tocan: ya "llegaron al medio" sin condición, como en la vida
+        /// real.
+        fn simulate_power_loss(&self) {
+            let saved = *self.last_synced_meta.lock().unwrap();
+            for (i, &offset) in META_OFFSETS.iter().enumerate() {
+                self.inner.write_at(offset, &saved[i]).unwrap();
+            }
+        }
+
+        fn encrypted_page_nonces(&self) -> Vec<(u64, [u8; 8])> {
+            let page_size = 512u64;
+            let meta_b_page = core::cmp::max(2, 4096 / page_size);
+            let first_data_page_offset = (meta_b_page + 1) * page_size;
+            self.writes.lock().unwrap().iter().copied().filter(|(o, _)| *o >= first_data_page_offset).collect()
+        }
+    }
+
+    impl Storage for PowerLossStorage {
+        fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> {
+            self.inner.read_at(o, b)
+        }
+
+        fn write_at(&self, o: u64, b: &[u8]) -> Result<()> {
+            if b.len() >= 8 {
+                let mut first8 = [0u8; 8];
+                first8.copy_from_slice(&b[..8]);
+                self.writes.lock().unwrap().push((o, first8));
+            }
+            self.inner.write_at(o, b)
+        }
+
+        fn sync(&self) -> Result<()> {
+            let mut saved = self.last_synced_meta.lock().unwrap();
+            for (i, &offset) in META_OFFSETS.iter().enumerate() {
+                let mut buf = [0u8; 512];
+                let _ = self.inner.read_at(offset, &mut buf);
+                saved[i] = buf;
+            }
+            self.inner.sync()
+        }
+
+        fn len(&self) -> Result<u64> {
+            self.inner.len()
+        }
+    }
+
+    struct ArcPowerLoss(Arc<PowerLossStorage>);
+    impl Storage for ArcPowerLoss {
+        fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> { self.0.read_at(o, b) }
+        fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
+        fn sync(&self) -> Result<()> { self.0.sync() }
+        fn len(&self) -> Result<u64> { self.0.len() }
+    }
+
+    /// Sonda 3 de la segunda ronda de revisión (hallazgo HIGH): bajo
+    /// `Sync::Never` o un `Sync::Interval` largo — donde los commits
+    /// normales de este motor nunca fuerzan un `fsync` — muchas
+    /// transacciones pequeñas seguidas de un corte de corriente simulado
+    /// no deben reutilizar ningún contador, aunque se pierdan sus efectos
+    /// lógicos (esa pérdida SÍ la acepta `Sync::Never`/`Interval`
+    /// explícitamente; lo que no acepta es que rompa la confidencialidad
+    /// de páginas que sobrevivieron).
+    #[test]
+    fn sync_never_or_long_interval_survives_simulated_power_loss_without_reusing_a_counter() {
+        for policy in [Sync::Never, Sync::Interval(Duration::from_secs(3600))] {
+            let s = Arc::new(PowerLossStorage::new());
+            let mk_opts = || Options { sync: policy, ..opts([51; 32]) };
+            let db = Db::create(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
+            // Bajo ninguna de las dos políticas se sincroniza en cada
+            // commit: 20 transacciones pequeñas seguidas sin que la meta
+            // llegue a ser duradera entre ellas (más allá del `sync()`
+            // incondicional de `Db::create`).
+            for i in 0..20u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+                tx.commit().unwrap();
+            }
+            drop(db);
+
+            s.simulate_power_loss();
+
+            let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
+            for i in 100..120u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+                tx.commit().unwrap();
+            }
+
+            let nonces = s.encrypted_page_nonces();
+            let mut sorted = nonces.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                nonces.len(),
+                "nonce repetido tras corte simulado bajo {policy:?}"
+            );
+        }
+    }
+
+    /// Sonda 3, variante combinada: fuerza una extensión real (igual que
+    /// `a_transaction_that_exceeds_the_ceiling_...`, mismo truco de
+    /// manipular `write_counter`) bajo `Sync::Never` específicamente, y
+    /// simula un corte justo después. Si la sincronización de la extensión
+    /// respetara la política de `Sync` en vez de ser incondicional (el
+    /// punto 5 del diseño corregido), este caso reproduciría el hallazgo
+    /// HIGH directamente: la extensión se perdería en el corte y la
+    /// siguiente sesión repartiría de nuevo los contadores que la
+    /// transacción de 20 escrituras ya había usado.
+    #[test]
+    fn an_extension_under_sync_never_survives_a_simulated_power_loss() {
+        let s = Arc::new(PowerLossStorage::new());
+        let mk_opts = || Options { sync: Sync::Never, ..opts([52; 32]) };
+        {
+            let db = Db::create(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"antes", b"confirmado").unwrap();
+            tx.commit().unwrap();
+        }
+
+        let mut bytes_snapshot = alloc::vec::Vec::new();
+        {
+            // Lee el contenido actual a través del propio `Storage` (no
+            // hay `snapshot()` en `PowerLossStorage`): basta con leer todo
+            // el fichero conocido hasta ahora.
+            let len = s.len().unwrap() as usize;
+            bytes_snapshot.resize(len, 0);
+            s.read_at(0, &mut bytes_snapshot).unwrap();
+        }
+        for meta_page in [1usize, 8usize] {
+            let base = meta_page * 512;
+            bytes_snapshot[base + 100..base + 108].copy_from_slice(&3u64.to_le_bytes());
+            let crc = crate::crc32::checksum(&bytes_snapshot[base..base + crate::meta::META_SIZE - 4]);
+            bytes_snapshot[base + crate::meta::META_SIZE - 4..base + crate::meta::META_SIZE]
+                .copy_from_slice(&crc.to_le_bytes());
+        }
+        s.write_at(0, &bytes_snapshot).unwrap();
+        // Este `sync()` de la propia prueba, fuera de cualquier `Db`,
+        // fotografía la manipulación de arriba como "la última duradera" —
+        // equivalente a que esa manipulación llevara ahí desde siempre.
+        s.sync().unwrap();
+
+        {
+            let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..20u32 {
+                tx.put(0x02, &i.to_be_bytes(), b"extendido").unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        s.simulate_power_loss();
+
+        let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
+        for i in 200..205u32 {
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x03, &i.to_be_bytes(), b"tras el corte").unwrap();
+            tx.commit().unwrap();
+        }
+
+        let nonces = s.encrypted_page_nonces();
+        let mut sorted = nonces.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), nonces.len(), "nonce repetido: la extension no sobrevivio al corte bajo Sync::Never");
+    }
+
+    /// Cuenta cuántas veces `sync()` llega de verdad al medio. Envuelve
+    /// `MemStorage` como los demás ayudantes de este módulo.
+    struct SyncCountingStorage {
+        inner: MemStorage,
+        syncs: std::sync::atomic::AtomicU64,
+    }
+    impl SyncCountingStorage {
+        fn new() -> Self {
+            Self { inner: MemStorage::new(), syncs: std::sync::atomic::AtomicU64::new(0) }
+        }
+        fn sync_count(&self) -> u64 {
+            self.syncs.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    impl Storage for SyncCountingStorage {
+        fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> { self.inner.read_at(o, b) }
+        fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.inner.write_at(o, b) }
+        fn sync(&self) -> Result<()> {
+            self.syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.sync()
+        }
+        fn len(&self) -> Result<u64> { self.inner.len() }
+    }
+    struct ArcSyncCounting(Arc<SyncCountingStorage>);
+    impl Storage for ArcSyncCounting {
+        fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> { self.0.read_at(o, b) }
+        fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
+        fn sync(&self) -> Result<()> { self.0.sync() }
+        fn len(&self) -> Result<u64> { self.0.len() }
+    }
+
+    /// Sonda 4 de la segunda ronda de revisión: el coste de sincronización
+    /// por transacción, cifrada contra sin cifrar, debe coincidir en el
+    /// caso común (ninguna transacción agota el techo de contador). Con el
+    /// diseño roto de la primera ronda esto medía 3,0 sincronizaciones por
+    /// transacción cifrada contra 2,0 sin cifrar — una reserva completa,
+    /// con su propio `fsync`, en CADA `begin_write`. Con el diseño
+    /// corregido el contador viaja de balde en la meta que el commit YA
+    /// iba a escribir, así que no debería haber ninguna diferencia.
+    #[test]
+    fn encrypted_transactions_sync_no_more_per_transaction_than_unencrypted_ones() {
+        const N: u64 = 500;
+
+        let unenc = Arc::new(SyncCountingStorage::new());
+        {
+            let db = Db::create(Box::new(ArcSyncCounting(Arc::clone(&unenc))), Options::default()).unwrap();
+            for i in 0..N as u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+                tx.commit().unwrap();
+            }
+        }
+
+        let enc = Arc::new(SyncCountingStorage::new());
+        {
+            let db = Db::create(Box::new(ArcSyncCounting(Arc::clone(&enc))), opts([61; 32])).unwrap();
+            for i in 0..N as u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+                tx.commit().unwrap();
+            }
+        }
+
+        // Resta el `sync()` inicial de `Db::create` (uno para cada base),
+        // para medir solo el coste POR TRANSACCIÓN.
+        let unenc_per_tx = (unenc.sync_count() - 1) as f64 / N as f64;
+        let enc_per_tx = (enc.sync_count() - 1) as f64 / N as f64;
+        std::eprintln!("sin cifrar: {unenc_per_tx} syncs/tx; cifrado: {enc_per_tx} syncs/tx");
+        assert_eq!(unenc_per_tx, 2.0);
+        assert_eq!(enc_per_tx, 2.0, "el cifrado no debe anadir sincronizaciones por transaccion en el caso comun");
     }
 
     /// Cobertura de ejecución real para AES-256-GCM (ronda de revisión

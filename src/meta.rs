@@ -144,6 +144,24 @@ impl Meta {
     /// Lee ambas ranuras, descarta las que no validen y devuelve la de mayor
     /// `txn_id`. Es todo el procedimiento de recuperación que existe: sin WAL,
     /// sin recorrido de cola, coste constante.
+    ///
+    /// **Desempate por `write_counter` a igualdad de `txn_id`** (tarea 17,
+    /// segunda ronda de revisión posterior a la primera entrega):
+    /// `Db::extend_counter_ceiling` puede dejar las dos ranuras con el
+    /// MISMO `txn_id` (copia exacta de la última meta confirmada, solo con
+    /// `write_counter` avanzado, escrita en la ranura inactiva mientras una
+    /// transacción está en curso — ver su comentario en `tx.rs`). Sin este
+    /// desempate, `meta.txn_id > b.txn_id` es estrictamente falso a
+    /// igualdad y la ranura A (procesada primero) gana siempre — que
+    /// podría ser precisamente la que tiene el `write_counter` más VIEJO,
+    /// dejando que una futura transacción reparta de nuevo contadores que
+    /// la extensión ya había dejado fuera de circulación. Es seguro
+    /// preferir el `write_counter` mayor en este caso, y solo en este caso:
+    /// a igualdad de `txn_id` las dos ranuras describen el MISMO árbol
+    /// confirmado (mismo `root`/lista de libres/`n_pages` — así construye
+    /// `extend_counter_ceiling` la copia), así que quedarse con el
+    /// contador más alto nunca adopta trabajo a medias, solo avanza el
+    /// techo de nonce.
     pub fn load(storage: &dyn Storage, g: &Geometry) -> Result<(Meta, MetaSlot)> {
         let mut best: Option<(Meta, MetaSlot)> = None;
         for slot in [MetaSlot::A, MetaSlot::B] {
@@ -159,7 +177,14 @@ impl Meta {
             if meta.page_size_log2 != g.page_size.trailing_zeros() as u8 {
                 continue;
             }
-            if best.map_or(true, |(b, _)| meta.txn_id > b.txn_id) {
+            let better = match best {
+                None => true,
+                Some((b, _)) => {
+                    meta.txn_id > b.txn_id
+                        || (meta.txn_id == b.txn_id && meta.write_counter > b.write_counter)
+                }
+            };
+            if better {
                 best = Some((meta, slot));
             }
         }
@@ -240,6 +265,42 @@ mod tests {
         let (m, slot) = Meta::load(&s, &g).unwrap();
         assert_eq!(m.txn_id, 2);
         assert_eq!(slot, MetaSlot::B);
+    }
+
+    /// Tarea 17, segunda ronda de revisión posterior a la primera entrega:
+    /// a igualdad de `txn_id` (el escenario que deja
+    /// `Db::extend_counter_ceiling` cuando extiende el techo de nonce a
+    /// mitad de una transacción, escribiendo una copia de la última meta
+    /// confirmada en la ranura inactiva), `load` debe preferir la ranura
+    /// con el `write_counter` más alto — es la única forma de que una
+    /// extensión sobreviva a una caída justo después: sin este desempate,
+    /// la ranura A (procesada primero en el bucle) gana siempre, aunque su
+    /// `write_counter` sea el más viejo de las dos.
+    #[test]
+    fn load_prefers_the_higher_write_counter_when_txn_id_ties() {
+        let (s, g) = (MemStorage::new(), geo());
+        let mut a = meta(5);
+        a.write_counter = 100;
+        a.store(&s, &g, MetaSlot::A).unwrap();
+        let mut b = meta(5); // mismo txn_id que A
+        b.write_counter = 200;
+        b.store(&s, &g, MetaSlot::B).unwrap();
+        let (m, slot) = Meta::load(&s, &g).unwrap();
+        assert_eq!(m.write_counter, 200, "debe preferir el contador mas alto a igualdad de txn_id");
+        assert_eq!(slot, MetaSlot::B);
+
+        // Y en el orden inverso (la ranura A tiene el contador mayor), para
+        // confirmar que no es un artefacto del orden de recorrido del bucle.
+        let (s2, g2) = (MemStorage::new(), geo());
+        let mut a2 = meta(7);
+        a2.write_counter = 300;
+        a2.store(&s2, &g2, MetaSlot::A).unwrap();
+        let mut b2 = meta(7);
+        b2.write_counter = 250;
+        b2.store(&s2, &g2, MetaSlot::B).unwrap();
+        let (m2, slot2) = Meta::load(&s2, &g2).unwrap();
+        assert_eq!(m2.write_counter, 300);
+        assert_eq!(slot2, MetaSlot::A);
     }
 
     #[test]

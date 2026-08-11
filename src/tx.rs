@@ -77,6 +77,35 @@ pub struct Db {
 /// no se relee de disco en cada una.
 struct WriterState {
     freelist: Freelist,
+    /// Contador de nonce VIVO (tarea 17, segunda ronda de revisión posterior
+    /// a la primera entrega). Estado de la BASE, no de una transacción —
+    /// vive aquí, no en `WriteTxn`, precisamente para que sobreviva a un
+    /// aborto sin comprometerse: `WriteTxn::Drop` restaura `freelist` desde
+    /// `pre_freelist`, pero NUNCA toca esto. Es justo esa propiedad —
+    /// nunca retrocede, ni siquiera cuando una transacción se descarta sin
+    /// `commit` — la que cierra el hallazgo BLOCKER de la segunda ronda: un
+    /// aborto no puede volver a repartir un contador que una transacción
+    /// muerta ya usó para sellar páginas reales en disco, porque nada
+    /// rebobina este campo.
+    live_counter: u64,
+    /// Techo hasta el que `live_counter` puede crecer sin que haga falta
+    /// otra escritura DURADERA. Solo avanza en dos momentos, los dos
+    /// demostrablemente duraderos:
+    /// - al abrir la base (`Db::assemble`), desde el `write_counter` de la
+    ///   meta ganadora;
+    /// - al extender la reserva (`Db::extend_counter_ceiling`), que
+    ///   sincroniza de forma INCONDICIONAL, sin importar la política de
+    ///   `Sync` configurada.
+    ///
+    /// Un commit normal SÍ escribe un `write_counter` más alto en la META
+    /// que ya iba a escribir de todos modos (barato: viaja con una
+    /// escritura que ya iba a pasar) — pero esa escritura NO actualiza este
+    /// campo, porque bajo `Sync::Interval`/`Never` puede no haberse hecho
+    /// durable todavía. Tratarla como si lo fuera sería reabrir exactamente
+    /// el hueco HIGH que encontró la segunda ronda de revisión: el único
+    /// avance de `counter_ceiling` en el que se puede confiar es el que ya
+    /// se demostró en disco.
+    counter_ceiling: u64,
 }
 
 /// Página de la meta B: debe caer en un sector físico de 4 KB distinto al de
@@ -121,7 +150,19 @@ impl Db {
             format_major: FORMAT_MAJOR,
             flags,
             wrapped_key: None,
-            write_counter: 0,
+            // Techo inicial pre-sembrado a `COUNTER_RESERVE` para una base
+            // cifrada (tarea 17, segunda ronda de revisión posterior a la
+            // primera entrega) — no 0. Esta escritura YA se sincroniza sin
+            // condiciones dos líneas más abajo (`storage.sync()?`, ya
+            // existía antes de esta ronda), así que sembrar el techo aquí
+            // es gratis: cubre de inmediato la primera `COUNTER_RESERVE` de
+            // contadores sin que la primera escritura cifrada de la base
+            // tenga que pagar una extensión aparte. `live_counter` arranca
+            // en 0 por separado, más abajo, al construir `WriterState` — a
+            // diferencia de `Db::open`, aquí no hay ninguna sesión previa
+            // cuyo progreso haya que proteger, así que no hace falta
+            // arrancar el contador vivo en el techo también.
+            write_counter: if opts.encryption.is_some() { COUNTER_RESERVE } else { 0 },
         };
         // Genera la clave de datos y la envuelve con la maestra ANTES de
         // guardar la meta: `meta.wrapped_key` tiene que estar ya poblado
@@ -134,7 +175,17 @@ impl Db {
         meta.store(storage.as_ref(), &geometry, MetaSlot::B)?;
         storage.sync()?;
 
-        Ok(Self::assemble(storage, geometry, meta, MetaSlot::A, opts, Freelist::empty(), encryption))
+        // `live_counter` arranca en 0, NO en `meta.write_counter`
+        // (`COUNTER_RESERVE` si está cifrada): a diferencia de `Db::open`,
+        // aquí no hay ninguna sesión previa cuyo progreso proteger, así que
+        // no hace falta arrancar el contador vivo en el techo también —
+        // ver el comentario del campo `write_counter` de `meta`, arriba.
+        let writer_state = WriterState {
+            freelist: Freelist::empty(),
+            live_counter: 0,
+            counter_ceiling: meta.write_counter,
+        };
+        Ok(Self::assemble(storage, geometry, meta, MetaSlot::A, opts, writer_state, encryption))
     }
 
     pub fn open(storage: Box<dyn Storage>, opts: Options) -> Result<Self> {
@@ -165,23 +216,46 @@ impl Db {
         // página que ya está en uso. Es corrupción silenciosa, no una fuga.
         meta.n_pages = core::cmp::max(meta.n_pages, file_pages);
 
+        // El contador VIVO arranca en el TECHO recuperado, no en "lo último
+        // que se usó" (tarea 17, segunda ronda de revisión posterior a la
+        // primera entrega, punto 3 del diseño corregido): no hay forma de
+        // saber, solo con lo que quedó en disco, cuánto del margen bajo ese
+        // techo llegó a usarse de verdad antes de una caída — así que se
+        // asume el peor caso (todo, hasta el techo) y se arranca justo ahí.
+        // Cualquier contador que una sesión anterior quemara cae por
+        // definición por debajo de este valor, así que jamás se vuelve a
+        // repartir. A diferencia de `Db::create`, aquí SÍ hay una sesión
+        // previa cuyo progreso proteger.
+        let writer_state = WriterState {
+            freelist,
+            live_counter: meta.write_counter,
+            counter_ceiling: meta.write_counter,
+        };
+
         let storage = pager.into_storage();
-        Ok(Self::assemble(storage, geometry, meta, slot, opts, freelist, encryption))
+        Ok(Self::assemble(storage, geometry, meta, slot, opts, writer_state, encryption))
     }
 
+    /// Toma `WriterState` ya construido, no `freelist`/`live_counter`
+    /// sueltos (`cargo clippy`, `too_many_arguments`: eran 8 parámetros
+    /// tras añadir `live_counter` en la segunda ronda de revisión posterior
+    /// a la primera entrega de la tarea 17 — juntar los dos que de todos
+    /// modos solo se usan para construir el mismo `WriterState` los deja
+    /// en 7, sin perder nada: cada llamador YA tenía `meta` a mano para
+    /// calcular `counter_ceiling`).
     fn assemble(
         storage: Box<dyn Storage>,
         geometry: Geometry,
         meta: Meta,
         slot: MetaSlot,
         opts: Options,
-        freelist: Freelist,
+        writer_state: WriterState,
         encryption: Option<Encryption>,
     ) -> Self {
         Self {
             pager: Pager::new(storage, geometry, opts.cache_pages).with_encryption(encryption),
             committed: RwLock::new((meta, slot)),
-            write_lock: Mutex::new(Some(WriterState { freelist })),
+            write_lock: Mutex::new(Some(writer_state)),
             readers: Mutex::new(BTreeMap::new()),
             sync: opts.sync,
             last_sync: Mutex::new(Instant::now()),
@@ -471,40 +545,35 @@ impl Drop for ReadTxn<'_> {
     }
 }
 
-/// Cuántos contadores de nonce (tarea 17, ronda de revisión posterior a la
-/// primera entrega) reserva `Db::reserve_counters` de una vez, de forma
-/// duradera, antes de que una transacción pueda sellar ninguna página.
+/// Cuánto avanza `Db::extend_counter_ceiling` el techo de contador de nonce
+/// cada vez que lo extiende (tarea 17, SEGUNDA ronda de revisión posterior a
+/// la primera entrega — el diseño de la primera ronda, que reservaba esto
+/// por transacción en `begin_write`, tenía dos defectos BLOCKER propios:
+/// una extensión a mitad de transacción podía publicar el `root` a medio
+/// hacer de esa MISMA transacción como si fuera un commit real, y un aborto
+/// no hacía retroceder nada, así que la siguiente transacción volvía a
+/// repartir los contadores que la abortada ya había usado. Ver el
+/// comentario de `WriterState::live_counter` para el diseño corregido).
 ///
-/// **Por qué hace falta reservar por adelantado, no solo llevar la cuenta
-/// en memoria:** el contador vive en `Meta::write_counter`, que solo se
-/// persiste al final de un `commit` real. Si una transacción sellara
-/// páginas usando contadores que nadie ha hecho durables todavía y el
-/// proceso muriera antes de confirmar, esos contadores nunca quedarían
-/// registrados como "ya quemados" — la siguiente transacción, tras
-/// reabrir, volvería a repartir los mismos valores, y el nonce se
-/// repetiría exactamente entre los restos de la transacción muerta y la
-/// nueva. Reservar (persistir un techo por adelantado, sincronizado según
-/// la política de `Sync` configurada) cierra ese hueco: cualquier
-/// contador que esta transacción llegue a usar cae por debajo del techo ya
-/// duradero, así que una futura transacción — tras una caída o no — nunca
-/// vuelve a ofrecerlo.
-///
-/// **Por qué 100 000 y no "el máximo que puede escribir una transacción":**
-/// ese máximo no tiene cota superior finita razonable — un lote puede
-/// escribir millones de páginas — así que exigir que el margen lo cubra
-/// SIEMPRE por adelantado no es alcanzable con un número fijo.
-/// `WriteTxn::write_page`/`commit` en su lugar EXTIENDEN la reserva sobre
-/// la marcha (otra escritura+sincronización duradera) si una transacción
-/// agota su margen — ver `advance_counter`. 100 000 se eligió para que la
-/// extensión sea la excepción, no la norma: un lote de mil registros
-/// asigna del orden de cuatro mil páginas (comentario de `alloc`, más
-/// abajo), así que este margen cubre lotes de decenas de miles de
-/// registros sin volver a tocar disco por esto. El coste de "sobrar"
-/// margen es irrelevante frente a `u64`: mil transacciones por segundo sin
-/// parar durante un siglo consumirían del orden de 3×10¹⁷ — menos del 2 %
-/// de `u64::MAX` (≈1,8×10¹⁹) — incluso si CADA transacción quema el margen
-/// entero sin usarlo.
-const COUNTER_RESERVE: u64 = 100_000;
+/// Con el diseño corregido, esto YA NO es "cuánto se reserva por
+/// transacción": es cuánto dura cada extensión, un evento raro e
+/// independiente de los límites de transacción — la mayoría de las
+/// transacciones no llegan a disparar ni una. Elegido con la medición real
+/// de esta ronda de revisión: 45 000 `put` en una transacción quemaron
+/// 134 218 contadores (≈3 por `put`, consistente con "un lote de mil
+/// registros asigna del orden de cuatro mil páginas", ya documentado en
+/// `alloc` más abajo) y la carga de referencia de este proyecto son
+/// podas de cientos de miles de entradas por nodo y día (ver el comentario
+/// de `WriteTxn::delete_range`) — un solo `COUNTER_RESERVE` tiene que cubrir
+/// lotes de ESE orden sin extender más que alguna vez, no solo el caso de
+/// prueba de 45 000. Un millón cubre, al ritmo medido, un lote de en torno a
+/// 330 000 `put` antes de necesitar una sola extensión — muy por encima de
+/// lo medido, con margen — y sigue siendo irrelevante frente a `u64`: mil
+/// transacciones por segundo sin parar durante un siglo, si CADA una
+/// disparase una extensión (no es el caso: las extensiones son mucho menos
+/// frecuentes que las transacciones), consumirían del orden de 3×10¹⁸ — un
+/// 17 % de `u64::MAX` (≈1,8×10¹⁹) en el peor caso, exageradamente pesimista.
+const COUNTER_RESERVE: u64 = 1_000_000;
 
 pub struct WriteTxn<'db> {
     db: &'db Db,
@@ -512,15 +581,19 @@ pub struct WriteTxn<'db> {
     meta: Meta,
     slot: MetaSlot,
     /// Pares `(página, contador de nonce)` ya sellados en esta transacción
-    /// (tarea 17, ronda de revisión posterior a la primera entrega).
-    /// Comprobación defensiva, no la fuente real de la garantía de
-    /// unicidad — esa la da la construcción de `next_counter` (estrictamente
-    /// creciente, nunca se reinicia dentro de una transacción, ver
-    /// `advance_counter`) — pero convierte esa construcción de una
-    /// suposición no comprobada a algo que `write_page` verifica en cada
-    /// escritura: si algún cambio futuro rompe el incremento, esto lo
-    /// detecta con un error en vez de sellar dos páginas con el mismo
-    /// nonce en silencio.
+    /// (tarea 17). Comprobación defensiva, no la fuente real de la garantía
+    /// de unicidad — esa la da la construcción de `WriterState::live_counter`
+    /// (estrictamente creciente, nunca retrocede — ver su comentario) — pero
+    /// convierte esa construcción de una suposición no comprobada a algo que
+    /// `write_page` verifica en cada escritura: si algún cambio futuro
+    /// rompe el incremento, esto lo detecta con un error en vez de sellar
+    /// dos páginas con el mismo nonce en silencio.
+    ///
+    /// **Solo se puebla si la base está cifrada** (segunda ronda de
+    /// revisión posterior a la primera entrega, hallazgo sobre coste de
+    /// memoria: en una transacción de 45 000 `put` esto llegaba a costar
+    /// del orden de 1,6 MB, sin dar ninguna protección real a una base SIN
+    /// cifrar, donde el contador ni siquiera se usa). Ver `write_page`.
     written: BTreeSet<(PageNo, u64)>,
     /// Copia de la lista de libres tal como estaba antes de esta
     /// transacción. `alloc`/`free` mutan `guard`'s `WriterState` en el
@@ -553,30 +626,17 @@ pub struct WriteTxn<'db> {
     /// ya lo resuelve `self_allocated`.
     ///
     /// **Es precisamente lo que hace que reutilizar `txn_id` como nonce
-    /// fuera inseguro** (ronda de revisión posterior a la primera entrega,
-    /// hallazgo BLOCKER): una página que sale de aquí en `alloc` y se
-    /// vuelve a escribir con `write_page` recibe un `txn_id` — el de ESTA
-    /// transacción — idéntico al que ya tenía la primera vez que se
+    /// fuera inseguro** (primera ronda de revisión posterior a la primera
+    /// entrega, hallazgo BLOCKER): una página que sale de aquí en `alloc` y
+    /// se vuelve a escribir con `write_page` recibía un `txn_id` — el de
+    /// ESTA transacción — idéntico al que ya tenía la primera vez que se
     /// escribió, dentro de la MISMA transacción. Con un lote de cientos de
     /// `put` en una sola transacción esto no es un caso raro: es el camino
     /// normal, y una sola página puede reciclarse así decenas o cientos de
     /// veces (121 veces sobre 200 `put`, medido). De ahí que el nonce ya no
-    /// se derive de `txn_id`, sino de un contador por escritura — ver
-    /// `next_counter`/`advance_counter`.
+    /// se derive de `txn_id`, sino del contador vivo de la base — ver
+    /// `WriterState::live_counter`.
     own_free: Vec<PageNo>,
-    /// Siguiente contador de nonce a repartir (tarea 17, ronda de revisión
-    /// posterior a la primera entrega). Empieza en el `write_counter` que
-    /// ya estaba confirmado al abrir esta transacción y crece de uno en uno
-    /// en cada `write_page`/página de lista de libres — nunca se reinicia
-    /// dentro de la transacción, así que ningún par `(página, contador)`
-    /// puede repetirse dentro de ella sin importar cuántas veces se
-    /// reescriba la misma página. Ver `advance_counter`.
-    next_counter: u64,
-    /// Techo hasta el que `next_counter` puede crecer sin volver a
-    /// reservar (escribir+sincronizar una meta de reserva, ver
-    /// `Db::reserve_counters`). Se fija al reservar y se extiende sobre la
-    /// marcha si esta transacción agota el margen — ver `advance_counter`.
-    counter_ceiling: u64,
 }
 
 impl Db {
@@ -606,20 +666,13 @@ impl Db {
             .freelist
             .clone();
 
-        // Reserva un margen de contadores de nonce ANTES de devolver el
-        // `WriteTxn` — ver `reserve_counters` y `COUNTER_RESERVE`. Ninguna
-        // página de esta transacción puede sellarse con un contador hasta
-        // que esto haya quedado duradero. Solo si esta base está cifrada
-        // (`Pager::is_encrypted`, ver su comentario): sin cifrado, el
-        // contador nunca se usa, así que un techo "infinito" evita del
-        // todo la escritura+sincronización extra en el caso común.
-        let counter_base = meta.write_counter;
-        let counter_ceiling = if self.pager.is_encrypted() {
-            self.reserve_counters(&meta, slot, counter_base)?
-        } else {
-            u64::MAX
-        };
-
+        // Sin nada que hacer con el contador de nonce aquí (segunda ronda
+        // de revisión posterior a la primera entrega): a diferencia de la
+        // primera ronda, `begin_write` ya NO reserva nada — el contador
+        // vivo vive en `WriterState`, sobrevive tal cual entre
+        // transacciones (abortadas o no), y solo se extiende sobre la
+        // marcha si hace falta, dentro de `write_page`/`commit`. Ver
+        // `WriterState::live_counter`.
         Ok(WriteTxn {
             db: self,
             guard,
@@ -630,44 +683,56 @@ impl Db {
             committed: false,
             self_allocated: BTreeSet::new(),
             own_free: Vec::new(),
-            next_counter: counter_base,
-            counter_ceiling,
         })
     }
 
-    /// Escribe una meta de RESERVA — mismo contenido lógico que `meta`
-    /// (root/lista de libres/`n_pages` sin cambios), solo con
-    /// `write_counter` avanzado a `base + COUNTER_RESERVE` — en la ranura
-    /// inactiva, y la sincroniza según la política de `Sync` configurada.
+    /// Extiende el techo de contador de nonce cuando el contador vivo está
+    /// a punto de alcanzarlo (tarea 17, segunda ronda de revisión posterior
+    /// a la primera entrega). Escribe una meta que es una COPIA EXACTA de
+    /// la última meta CONFIRMADA (`self.committed`, leída aquí mismo, en el
+    /// momento de la llamada) — root, lista de libres, `n_pages`, `txn_id`,
+    /// todo sin tocar salvo `write_counter` — en la ranura inactiva
+    /// respecto a esa meta confirmada, y sincroniza de forma INCONDICIONAL,
+    /// sin mirar la política de `Sync`.
     ///
-    /// Debe llamarse, y su escritura debe quedar duradera, ANTES de que
-    /// cualquier página se selle con un contador dentro del rango
-    /// reservado (tarea 17, ronda de revisión posterior a la primera
-    /// entrega — ver `COUNTER_RESERVE`).
+    /// **Nunca la meta de la transacción en curso.** La primera ronda de
+    /// revisión encontró aquí un hallazgo BLOCKER propio: pasar la meta
+    /// DE LA TRANSACCIÓN EN CURSO (con su `root` ya cambiado a medio hacer)
+    /// hacía que, si el proceso moría antes del commit real, `Meta::load`
+    /// recuperase esa mitad de transacción como si fuera un commit legítimo
+    /// — pérdida de datos sin ni siquiera necesitar una caída, un simple
+    /// `Drop` bastaba para dejarlo en ese estado. Usar SIEMPRE la última
+    /// meta confirmada de verdad, con el `txn_id` intacto, hace que esta
+    /// escritura nunca pueda representar más que "lo que ya estaba
+    /// confirmado, con el contador más alto" — jamás una transacción a
+    /// medias.
     ///
-    /// **Por qué es segura una meta que no representa un commit real:** si
-    /// el proceso muere después de esta llamada pero antes del commit de
-    /// verdad de la transacción, `Meta::load` recuperará esta ranura al
-    /// reabrir (tiene el `txn_id` más alto de las dos, porque `meta.txn_id`
-    /// ya está incrementado en `begin_write`) — con el MISMO root/lista de
-    /// libres/`n_pages` que ya estaban confirmados, como si esta
-    /// transacción no hubiera hecho nada, salvo que el contador ya avanzó.
-    /// Cualquier página que la transacción muerta llegara a escribir queda
-    /// huérfana exactamente igual que en un aborto normal sin reserva —
-    /// `Db::open` ya recupera esas páginas comparando contra `n_pages`
-    /// (`reopening_recovers_pages_leaked_by_an_interrupted_transaction`) —
-    /// y ninguna de ellas puede estar viva en el root/lista de libres
-    /// recuperados, porque `alloc` nunca entrega a una transacción una
-    /// página que siga siendo alcanzable desde la meta confirmada (ver el
-    /// comentario de `alloc`).
-    fn reserve_counters(&self, meta: &Meta, slot: MetaSlot, base: u64) -> Result<u64> {
-        let ceiling = base.checked_add(COUNTER_RESERVE).ok_or(Error::Full)?;
-        let mut reservation = *meta;
-        reservation.write_counter = ceiling;
-        let target = slot.other();
+    /// **Por qué es seguro que las dos ranuras compartan `txn_id`.** Tras
+    /// esta llamada, la ranura activa (con `Db.committed` sin tocar) y la
+    /// inactiva (recién escrita aquí) tienen el MISMO `txn_id` pero
+    /// `write_counter` distinto — `Meta::load` necesita el desempate de
+    /// "mismo `txn_id`, prefiere el `write_counter` más alto" (ver su
+    /// comentario) precisamente para este caso: las dos describen el MISMO
+    /// árbol confirmado, así que preferir el contador más alto solo avanza
+    /// el techo, nunca adopta trabajo a medias.
+    ///
+    /// **Por qué la sincronización es incondicional.** Es la única garantía
+    /// real de que un nonce nunca se reutiliza tras una caída, sea cual sea
+    /// el modo de `Sync` elegido — `Sync::Never`/`Interval` aceptan PERDER
+    /// las últimas transacciones tras un corte, pero eso no cubre romper la
+    /// confidencialidad de páginas que sí llegaron a sobrevivir en el medio
+    /// (segunda ronda de revisión, hallazgo HIGH). Ocurre aproximadamente
+    /// una vez cada `COUNTER_RESERVE` escrituras (ver su comentario), así
+    /// que el coste es insignificante incluso para IoT.
+    fn extend_counter_ceiling(&self, from: u64) -> Result<u64> {
+        let ceiling = from.checked_add(COUNTER_RESERVE).ok_or(Error::Full)?;
+        let (committed_meta, committed_slot) = *self.committed.read().unwrap();
+        let mut extension = committed_meta;
+        extension.write_counter = ceiling;
+        let target = committed_slot.other();
         let geometry = *self.pager.geometry();
-        reservation.store_via(&self.pager, &geometry, target)?;
-        self.maybe_sync()?;
+        extension.store_via(&self.pager, &geometry, target)?;
+        self.pager.sync()?;
         Ok(ceiling)
     }
 }
@@ -888,17 +953,26 @@ impl<'db> WriteTxn<'db> {
 
     /// `bytes` debe medir `logical_page_size()`. Sella (si procede) con un
     /// contador de nonce nuevo por cada llamada — NO con `self.meta.txn_id`
-    /// (ronda de revisión posterior a la primera entrega, hallazgo
+    /// (primera ronda de revisión posterior a la primera entrega, hallazgo
     /// BLOCKER: `txn_id` es el mismo para toda la transacción, y
     /// `WriteTxn::alloc` recicla `own_free` — la MISMA página puede
     /// escribirse muchas veces dentro de una sola transacción, ver el
     /// comentario de `own_free`) — así que el par `(página, contador)`
     /// nunca se repite sin importar cuántas veces se reescriba la misma
-    /// página dentro de esta transacción.
+    /// página dentro de esta transacción. El contador en sí (`advance_counter`,
+    /// `WriterState::live_counter`) sigue avanzando en cada llamada, con
+    /// cifrado o sin él — barato, sin E/S — pero el guardián `written`, que
+    /// SÍ cuesta memoria real en una transacción grande, solo se puebla si
+    /// la base está cifrada (segunda ronda de revisión, hallazgo sobre
+    /// coste de memoria — ver el comentario de `written`).
     pub(crate) fn write_page(&mut self, page: PageNo, bytes: &[u8]) -> Result<()> {
-        let counter =
-            Self::advance_counter(self.db, &self.meta, self.slot, &mut self.next_counter, &mut self.counter_ceiling)?;
-        if !self.written.insert((page, counter)) {
+        let encrypted = self.db.pager.is_encrypted();
+        let db = self.db;
+        let counter = {
+            let state = self.state();
+            Self::advance_counter(db, &mut state.live_counter, &mut state.counter_ceiling)?
+        };
+        if encrypted && !self.written.insert((page, counter)) {
             // Matemáticamente inalcanzable si `advance_counter` incrementa
             // correctamente (ver su comentario) — comprobación defensiva,
             // no la fuente de la garantía. Ver el comentario de `written`.
@@ -910,25 +984,28 @@ impl<'db> WriteTxn<'db> {
 
     /// Núcleo de la asignación de contador de nonce, compartido por
     /// `write_page` y por el cierre que `commit` le pasa a
-    /// `Freelist::flush`. Recibe referencias sueltas, no `&mut self`: así
-    /// el compilador ve préstamos disjuntos de los campos de `WriteTxn` en
-    /// los dos sitios que lo necesitan a la vez — `commit` necesita
-    /// `&mut self.guard` (para `state.freelist.flush`) Y `&mut
-    /// self.next_counter`/`&mut self.counter_ceiling` (para el cierre que
-    /// le pasa) simultáneamente, y un método que tomara `&mut self` entero
-    /// se lo habría impedido.
-    fn advance_counter(
-        db: &Db,
-        meta: &Meta,
-        slot: MetaSlot,
-        next_counter: &mut u64,
-        counter_ceiling: &mut u64,
-    ) -> Result<u64> {
-        if *next_counter >= *counter_ceiling {
-            *counter_ceiling = db.reserve_counters(meta, slot, *counter_ceiling)?;
+    /// `Freelist::flush`. Recibe referencias sueltas a los dos campos de
+    /// `WriterState` que le hacen falta, no `&mut WriterState` entero ni
+    /// `&mut WriteTxn`: así el compilador ve préstamos disjuntos de
+    /// `state.live_counter`/`state.counter_ceiling` por un lado y
+    /// `state.freelist` por otro en `commit`, que necesita las dos cosas a
+    /// la vez (el cierre que arma para `Freelist::flush` sigue viva
+    /// mientras `state.freelist.flush(...)` está en curso).
+    ///
+    /// Comprueba `db.pager.is_encrypted()` ella misma, no cada llamador por
+    /// separado (segunda ronda de revisión posterior a la primera entrega):
+    /// así que `write_page` Y el cierre de `commit` quedan protegidos por
+    /// igual sin duplicar la comprobación — sin cifrado, `counter_ceiling`
+    /// nace en 0 igual que `live_counter` (`Db::create`), así que sin esta
+    /// comprobación la PRIMERA llamada de cualquiera de los dos dispararía
+    /// una extensión — con su sincronización incondicional — para una base
+    /// que nunca usa el contador para nada.
+    fn advance_counter(db: &Db, live_counter: &mut u64, counter_ceiling: &mut u64) -> Result<u64> {
+        if db.pager.is_encrypted() && *live_counter >= *counter_ceiling {
+            *counter_ceiling = db.extend_counter_ceiling(*counter_ceiling)?;
         }
-        let c = *next_counter;
-        *next_counter += 1;
+        let c = *live_counter;
+        *live_counter += 1;
         Ok(c)
     }
 
@@ -1199,43 +1276,43 @@ impl<'db> WriteTxn<'db> {
                 n_pages = p.checked_add(1).ok_or(Error::Full)?;
                 Ok(p)
             };
-            // Mismo contador que usa `write_page` para el resto de la
-            // transacción (tarea 17, ronda de revisión posterior a la
-            // primera entrega): las páginas de lista de libres necesitan un
-            // contador tan único como las del árbol, no uno propio — ver
-            // `advance_counter` y el comentario de `Freelist::flush` en
-            // `freelist.rs`. Los cuatro locales de abajo se extraen ANTES
-            // de pedir `self.guard.as_mut()` para que el compilador vea
-            // préstamos disjuntos de campos de `self` (`next_counter`/
-            // `counter_ceiling` aquí, `guard` más abajo), no un préstamo
-            // de `self` entero por partida doble.
+            // Mismo contador VIVO que usa `write_page` para el resto de la
+            // transacción (tarea 17): las páginas de lista de libres
+            // necesitan un contador tan único como las del árbol, no uno
+            // propio — ver `advance_counter` y el comentario de
+            // `Freelist::flush` en `freelist.rs`. `state` se obtiene UNA
+            // vez y `live_counter_ref`/`counter_ceiling_ref` reborrows de
+            // sus campos, para que el compilador vea préstamos disjuntos
+            // de `state.live_counter`/`state.counter_ceiling` (para el
+            // cierre) y `state.freelist` (para `flush`) a la vez — el
+            // cierre sigue viva durante toda la llamada a `flush`.
             let db = self.db;
-            let meta_snapshot = self.meta;
-            let slot = self.slot;
-            let next_counter_ref = &mut self.next_counter;
-            let counter_ceiling_ref = &mut self.counter_ceiling;
-            let mut next_nonce = || -> Result<u64> {
-                Self::advance_counter(db, &meta_snapshot, slot, next_counter_ref, counter_ceiling_ref)
-            };
             let state = self.guard.as_mut().expect("estado presente");
+            let live_counter_ref = &mut state.live_counter;
+            let counter_ceiling_ref = &mut state.counter_ceiling;
+            let mut next_nonce = || -> Result<u64> {
+                Self::advance_counter(db, live_counter_ref, counter_ceiling_ref)
+            };
             let (head, tail) = state.freelist.flush(pager, &mut alloc, txn_id, &mut next_nonce)?;
             self.meta.freelist_head = head;
             self.meta.freelist_tail = tail;
         }
         self.meta.n_pages = n_pages;
-        // Lleva adelante el techo de contador reservado hasta ahora (el
-        // inicial de `begin_write`, o uno mayor si `advance_counter` tuvo
-        // que extenderlo durante la transacción) — de lo contrario este
-        // commit real SOBRESCRIBIRÍA la reserva ya duradera con el valor
-        // más viejo que traía `self.meta` desde `begin_write`, perdiendo el
-        // avance y dejando que una futura transacción vuelva a repartir
-        // contadores ya usados por esta. Solo si está cifrada: sin
-        // cifrado, `counter_ceiling` es `u64::MAX` (ver `begin_write`), y
-        // escribirlo tal cual dejaría un valor sin significado en el
-        // fichero — `write_counter` se queda como estaba, que es
-        // exactamente correcto porque nada lo usa.
+        // Escribe un techo FRESCO — `live_counter` tal como quedó tras
+        // TODA la actividad de esta transacción (árbol y lista de libres)
+        // más `COUNTER_RESERVE` — en la meta que este commit YA iba a
+        // escribir. Es puramente "de balde, para una futura apertura
+        // limpia más precisa": esta escritura NO alimenta
+        // `state.counter_ceiling` (el que de verdad protege contra
+        // reutilización, ver su comentario) porque, bajo `Sync::Interval`/
+        // `Never`, puede no llegar a sincronizarse nunca — tratarla como
+        // si lo hubiera hecho sería reabrir el hallazgo HIGH de la segunda
+        // ronda de revisión. Sin cifrado esto no significa nada
+        // (`live_counter` nunca avanza, ver `advance_counter`), así que no
+        // se escribe.
         if self.db.pager.is_encrypted() {
-            self.meta.write_counter = self.counter_ceiling;
+            let live_counter = self.guard.as_ref().expect("estado presente").live_counter;
+            self.meta.write_counter = live_counter.checked_add(COUNTER_RESERVE).ok_or(Error::Full)?;
         }
 
         self.db.maybe_sync()?;
