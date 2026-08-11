@@ -45,6 +45,17 @@ fn child_at(page: &PageRef<'_>, i: usize) -> PageNo {
     if i < page.n_slots() { page.child(i) } else { page.extra() }
 }
 
+/// Cota de profundidad para el descenso: defensa contra un ciclo de punteros
+/// a hijos, ya sea por un fichero corrupto o por un futuro bug de división o
+/// reequilibrado que enlazara un nodo consigo mismo indirectamente.
+///
+/// Cada nodo interno tiene al menos un separador más el hijo del campo
+/// `extra`, luego al menos dos hijos: el árbol es como mínimo binario, y con
+/// números de página de 32 bits un árbol legítimo no puede tener más de
+/// `2^32` hojas, así que no puede pasar de profundidad 32. 64 duplica ese
+/// margen sin dejar de cortar un ciclo en tiempo acotado.
+const MAX_DEPTH: u32 = 64;
+
 /// Localiza la hoja donde vive o viviría `key`, y el camino de nodos internos
 /// recorrido desde la raíz. `None` si el árbol está vacío.
 pub fn descend(
@@ -57,7 +68,15 @@ pub fn descend(
     }
     let mut path = Vec::new();
     let mut current = root;
+    let mut depth = 0u32;
     loop {
+        depth += 1;
+        if depth > MAX_DEPTH {
+            return Err(crate::Error::Corrupt {
+                page: current,
+                kind: crate::CorruptKind::TreeLoop,
+            });
+        }
         let bytes = src.read_page(current)?;
         let page = PageRef::parse(&bytes, current)?;
         match page.page_type() {
@@ -186,5 +205,109 @@ mod tests {
         let (leaf, path) = descend(&r, root, b"zz").unwrap().unwrap();
         assert_eq!(path, alloc::vec![root]);
         assert_ne!(leaf, root);
+    }
+
+    /// Dos nodos internos cuyo campo `extra` se apunta el uno al otro: no hay
+    /// ninguna hoja alcanzable. Sin una cota de profundidad, `descend`
+    /// rebotaría entre ambos para siempre en vez de devolver un error.
+    #[test]
+    fn descend_returns_an_error_instead_of_looping_forever_on_a_cycle() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let a = tx.alloc().unwrap();
+        let b = tx.alloc().unwrap();
+
+        let mut ab = PageBuilder::new(512, PageType::Internal);
+        ab.set_extra(b);
+        let pa = ab.build(&[]).unwrap();
+
+        let mut bb = PageBuilder::new(512, PageType::Internal);
+        bb.set_extra(a);
+        let pb = bb.build(&[]).unwrap();
+
+        tx.write_page(a, &pa).unwrap();
+        tx.write_page(b, &pb).unwrap();
+        tx.set_root(a);
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        let err = descend(&r, r.root(), b"cualquiera").unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::TreeLoop, .. }),
+            "se esperaba TreeLoop, se obtuvo {err:?}"
+        );
+    }
+
+    /// Confirma que la cota de profundidad no molesta a un árbol legítimo de
+    /// tres niveles: raíz -> dos nodos internos -> cuatro hojas.
+    #[test]
+    fn descend_still_reaches_leaves_in_a_three_level_tree() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+
+        let leaf_a = tx.alloc().unwrap();
+        let leaf_b = tx.alloc().unwrap();
+        let leaf_c = tx.alloc().unwrap();
+        let leaf_d = tx.alloc().unwrap();
+        let mid_left = tx.alloc().unwrap();
+        let mid_right = tx.alloc().unwrap();
+        let root = tx.alloc().unwrap();
+
+        let la = PageBuilder::new(512, PageType::Leaf)
+            .build(&[
+                (b"aa".as_slice(), CellPayload::Value(b"1")),
+                (b"bb".as_slice(), CellPayload::Value(b"2")),
+            ])
+            .unwrap();
+        let lb = PageBuilder::new(512, PageType::Leaf)
+            .build(&[
+                (b"cc".as_slice(), CellPayload::Value(b"3")),
+                (b"dd".as_slice(), CellPayload::Value(b"4")),
+            ])
+            .unwrap();
+        let lc = PageBuilder::new(512, PageType::Leaf)
+            .build(&[
+                (b"mm".as_slice(), CellPayload::Value(b"5")),
+                (b"nn".as_slice(), CellPayload::Value(b"6")),
+            ])
+            .unwrap();
+        let ld = PageBuilder::new(512, PageType::Leaf)
+            .build(&[
+                (b"tt".as_slice(), CellPayload::Value(b"7")),
+                (b"zz".as_slice(), CellPayload::Value(b"8")),
+            ])
+            .unwrap();
+
+        let mut mlb = PageBuilder::new(512, PageType::Internal);
+        mlb.set_extra(leaf_b);
+        let ml = mlb.build(&[(b"cc".as_slice(), CellPayload::Child(leaf_a))]).unwrap();
+
+        let mut mrb = PageBuilder::new(512, PageType::Internal);
+        mrb.set_extra(leaf_d);
+        let mr = mrb.build(&[(b"tt".as_slice(), CellPayload::Child(leaf_c))]).unwrap();
+
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(mid_right);
+        let rt = rb.build(&[(b"mm".as_slice(), CellPayload::Child(mid_left))]).unwrap();
+
+        tx.write_page(leaf_a, &la).unwrap();
+        tx.write_page(leaf_b, &lb).unwrap();
+        tx.write_page(leaf_c, &lc).unwrap();
+        tx.write_page(leaf_d, &ld).unwrap();
+        tx.write_page(mid_left, &ml).unwrap();
+        tx.write_page(mid_right, &mr).unwrap();
+        tx.write_page(root, &rt).unwrap();
+        tx.set_root(root);
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        assert_eq!(get(&r, r.root(), b"aa").unwrap().as_deref(), Some(b"1".as_slice()));
+        assert_eq!(get(&r, r.root(), b"dd").unwrap().as_deref(), Some(b"4".as_slice()));
+        assert_eq!(get(&r, r.root(), b"mm").unwrap().as_deref(), Some(b"5".as_slice()));
+        assert_eq!(get(&r, r.root(), b"zz").unwrap().as_deref(), Some(b"8".as_slice()));
+
+        let (leaf, path) = descend(&r, r.root(), b"zz").unwrap().unwrap();
+        assert_eq!(leaf, leaf_d);
+        assert_eq!(path, alloc::vec![root, mid_right]);
     }
 }

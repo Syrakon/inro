@@ -40,6 +40,9 @@ pub enum CorruptKind {
     SlotOffset,
     CellBounds,
     FreelistLoop,
+    /// El descenso del árbol superó la profundidad máxima legítima sin
+    /// alcanzar una hoja: un ciclo de punteros a hijos, no un árbol válido.
+    TreeLoop,
     MetaMismatch,
 }
 
