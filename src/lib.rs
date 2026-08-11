@@ -13,8 +13,10 @@ extern crate alloc;
 pub mod error;
 pub(crate) mod crc32;
 pub(crate) mod varint;
+pub mod storage;
 
 pub use error::{CorruptKind, Error, IoError, Result};
+pub use storage::Storage;
 
 /// Número de página. El fichero direcciona 2^32 páginas: 2 TB con páginas de
 /// 512 bytes, 16 TB con páginas de 4 KB.
