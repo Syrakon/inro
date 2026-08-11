@@ -5322,4 +5322,90 @@ mod range_accounting_tests {
             "se esperaba CellBounds, se obtuvo {err:?}"
         );
     }
+
+    /// Ronda 2 de revisión de la tarea 15 ("también corregir"), sin
+    /// prueba hasta ahora: el colapso de `delete_rec`
+    /// (`page.n_slots() == 0`) usaba `page.children_plain()` — el valor
+    /// VIEJO, releído de la página corrupta — en vez de `children_plain`,
+    /// la variable local que sí incorpora el resultado fresco del hijo que
+    /// esta llamada acaba de tocar. Nada de lo que existe hoy puede
+    /// alcanzar esta rama por fuzzing: un árbol bien formado nunca produce
+    /// un nodo interno con cero entradas (`emit` nunca construye uno así)
+    /// — exactamente por qué el defecto sobrevivió hasta que corregir el
+    /// comentario lo expuso, y por qué hace falta construir la corrupción
+    /// a mano, como aquí.
+    ///
+    /// Construcción: una raíz corrupta con `n_slots() == 0` (así que
+    /// CUALQUIER clave enruta a su `extra`, per `child_index` — ver el
+    /// comentario de la corrección en `delete_rec`) y `children_plain`
+    /// puesto a `true` — la mentira exacta del hallazgo. Su `extra` es un
+    /// nodo interno BIEN FORMADO (dos hojas planas, sin overflow) con
+    /// suficientes claves para que borrar una no lo colapse — así que su
+    /// propio resultado es `Removal::Updated`, no `Gone`. Al ser un nodo
+    /// INTERNO, ese resultado SIEMPRE lleva `plain = false`
+    /// (`entries_are_plain` exige `PageType::Leaf`), sea cual sea el
+    /// estado de sus propios hijos: es la señal fresca que debería
+    /// prevalecer sobre el `children_plain` viejo y corrupto de la raíz.
+    #[test]
+    fn delete_rec_uses_the_fresh_result_not_the_stale_bit_when_promoting_a_touched_child() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+
+        // Hoja con dos claves: tras borrar una, sigue teniendo la otra —
+        // el nodo interno que la contiene no colapsa, así que su propio
+        // resultado es `Updated`, no `Gone`.
+        let leaf_a = tx.alloc().unwrap();
+        let leaf_a_bytes = PageBuilder::new(512, PageType::Leaf)
+            .build(&[
+                (b"a1".as_slice(), CellPayload::Value(b"1")),
+                (b"a2".as_slice(), CellPayload::Value(b"2")),
+            ])
+            .unwrap();
+        tx.write_page(leaf_a, &leaf_a_bytes).unwrap();
+
+        let leaf_b = tx.alloc().unwrap();
+        let leaf_b_bytes = PageBuilder::new(512, PageType::Leaf)
+            .build(&[(b"b1".as_slice(), CellPayload::Value(b"3"))])
+            .unwrap();
+        tx.write_page(leaf_b, &leaf_b_bytes).unwrap();
+
+        // Nodo interno BIEN FORMADO: dos hojas planas, sin overflow.
+        // `children_plain` correcto aquí (`true`) no importa para lo que
+        // se está probando — lo que importa es que este nodo ES interno,
+        // así que su propio resultado siempre lleva `plain = false`.
+        let child_internal = tx.alloc().unwrap();
+        let mut cb = PageBuilder::new(512, PageType::Internal);
+        cb.set_extra(leaf_b);
+        cb.set_children_plain(true);
+        let child_bytes = cb.build(&[(b"b".as_slice(), CellPayload::Child(leaf_a))]).unwrap();
+        tx.write_page(child_internal, &child_bytes).unwrap();
+
+        // La raíz CORRUPTA: cero separadores (`emit` nunca construye
+        // esto), así que cualquier clave enruta a `extra` — el nodo
+        // interno de arriba. `children_plain` puesto a `true` con un hijo
+        // interno como único hijo: la mentira exacta del hallazgo.
+        let root = tx.alloc().unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(child_internal);
+        rb.set_children_plain(true);
+        let root_bytes = rb.build(&[]).unwrap();
+        tx.write_page(root, &root_bytes).unwrap();
+
+        match delete_rec(&mut tx, root, b"a1", 1).unwrap() {
+            Removal::Updated(_, plain) => assert!(
+                !plain,
+                "el hijo promovido en el colapso es un nodo INTERNO, nunca una hoja \
+                 plana: `plain` debería ser `false`; se obtuvo `true` — se está usando \
+                 el `children_plain` viejo de la raíz corrupta en vez del resultado \
+                 fresco del hijo que sí se tocó"
+            ),
+            Removal::Unchanged => panic!(
+                "se esperaba Removal::Updated: la construcción de la prueba no borró nada"
+            ),
+            Removal::Gone => panic!(
+                "se esperaba Removal::Updated, no Gone: la construcción de la prueba \
+                 colapsó de más"
+            ),
+        }
+    }
 }
