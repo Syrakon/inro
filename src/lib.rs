@@ -19,6 +19,8 @@ pub mod meta;
 pub mod page;
 #[cfg(feature = "std")]
 pub mod pager;
+#[cfg(feature = "std")]
+pub mod freelist;
 
 pub use error::{CorruptKind, Error, IoError, Result};
 pub use storage::Storage;
