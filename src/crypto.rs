@@ -139,7 +139,7 @@ impl core::fmt::Debug for Encryption {
 /// Nonce derivado, nunca almacenado. Su unicidad depende de que `counter`
 /// nunca se repita para una misma `page` — ver `crate::tx::WriteTxn`, que es
 /// quien garantiza eso reservando un tramo de contadores por adelantado
-/// (`Db::reserve_counters`) en vez de derivar de `txn_id` (ronda de revisión
+/// (`Db::extend_counter_ceiling`) en vez de derivar de `txn_id` (ronda de revisión
 /// posterior a la primera entrega: `txn_id` es el mismo para TODAS las
 /// páginas de una transacción, y `own_free` — tarea 12 — puede hacer que la
 /// MISMA página se escriba varias veces dentro de una sola transacción,
@@ -380,6 +380,108 @@ mod tests {
         opts_with(key, Algorithm::ChaCha20Poly1305)
     }
 
+    /// Una escritura física tal como llegó al medio: offset y bytes
+    /// completos.
+    type PhysWrite = (u64, Vec<u8>);
+
+    /// Todas las pruebas de este módulo usan `Options::default()`
+    /// (`page_size` 512, meta A en la página 1, meta B en la 8) — ver
+    /// `opts_with`.
+    const TEST_PAGE_SIZE: u64 = 512;
+
+    /// Primera página que no es cabecera ni ranura de meta: la primera que
+    /// puede pasar por `write_encrypted`. Misma fórmula que `meta_b_page`
+    /// en `tx.rs`.
+    fn first_data_page() -> u64 {
+        core::cmp::max(2, 4096 / TEST_PAGE_SIZE) + 1
+    }
+
+    /// `(página, contador, texto cifrado)` de cada escritura que de verdad
+    /// pasó por `Pager::write_encrypted`. El contador viaja en claro en los
+    /// ocho primeros bytes de una página sellada (ver `seal`), así que el
+    /// par `(página, contador)` ES el nonce, leído del fichero igual que lo
+    /// leería un atacante.
+    fn sealed_writes(writes: &[PhysWrite]) -> Vec<(PageNo, u64, &[u8])> {
+        let floor = first_data_page() * TEST_PAGE_SIZE;
+        writes
+            .iter()
+            .filter(|(o, b)| *o >= floor && b.len() == TEST_PAGE_SIZE as usize)
+            .map(|(o, b)| {
+                let page = (*o / TEST_PAGE_SIZE) as PageNo;
+                let counter = u64::from_le_bytes(b[..8].try_into().unwrap());
+                (page, counter, &b[CIPHER_PREFIX..])
+            })
+            .collect()
+    }
+
+    /// Porcentaje de bytes CERO del XOR de dos textos cifrados. Es el
+    /// detector que pide la tercera ronda de revisión, y no es una
+    /// heurística: con el mismo nonce y la misma clave, el flujo de clave
+    /// es idéntico, así que `C1 XOR C2 == P1 XOR P2` — y dos páginas de
+    /// este motor comparten casi todos sus bytes (relleno a cero, misma
+    /// cabecera de página), de modo que ese XOR sale casi todo ceros. Con
+    /// nonces distintos el XOR es de dos flujos de clave independientes:
+    /// un byte cero cae con probabilidad 1/256, ~0,39 %.
+    fn xor_zero_pct(a: &[u8], b: &[u8]) -> f64 {
+        let n = core::cmp::min(a.len(), b.len());
+        let zeros = (0..n).filter(|&i| a[i] ^ b[i] == 0).count();
+        100.0 * zeros as f64 / n as f64
+    }
+
+    /// Veredicto sobre TODAS las escrituras selladas de una corrida.
+    #[derive(Debug)]
+    struct NonceAudit {
+        /// Escrituras que pasaron por `write_encrypted`.
+        sealed: usize,
+        /// Nonces `(página, contador)` usados por más de una escritura.
+        reused_nonces: usize,
+        /// El peor par con nonce repetido, si lo hay: porcentaje de bytes
+        /// cero de `C1 XOR C2`.
+        worst_xor_zero_pct: f64,
+        /// Línea base sobre pares con nonces DISTINTOS, para contrastar.
+        baseline_xor_zero_pct: f64,
+    }
+
+    fn audit_nonces(writes: &[PhysWrite]) -> NonceAudit {
+        let sealed = sealed_writes(writes);
+        let mut by_nonce: alloc::collections::BTreeMap<(PageNo, u64), Vec<&[u8]>> =
+            alloc::collections::BTreeMap::new();
+        for (page, counter, ct) in &sealed {
+            by_nonce.entry((*page, *counter)).or_default().push(ct);
+        }
+
+        let mut reused = 0usize;
+        let mut worst = 0.0f64;
+        for texts in by_nonce.values() {
+            if texts.len() < 2 {
+                continue;
+            }
+            reused += 1;
+            for i in 0..texts.len() {
+                for j in i + 1..texts.len() {
+                    worst = worst.max(xor_zero_pct(texts[i], texts[j]));
+                }
+            }
+        }
+
+        // Línea base: pares consecutivos con nonces distintos.
+        let mut base_sum = 0.0f64;
+        let mut base_n = 0usize;
+        for w in sealed.windows(2) {
+            if (w[0].0, w[0].1) != (w[1].0, w[1].1) {
+                base_sum += xor_zero_pct(w[0].2, w[1].2);
+                base_n += 1;
+            }
+        }
+
+        NonceAudit {
+            sealed: sealed.len(),
+            reused_nonces: reused,
+            worst_xor_zero_pct: worst,
+            baseline_xor_zero_pct: if base_n == 0 { 0.0 } else { base_sum / base_n as f64 },
+        }
+    }
+
     /// Permite conservar el medio tras cerrar la base, para reabrirla. Cada
     /// módulo de pruebas define su propia copia local (ver `tx.rs`,
     /// `tree.rs`, `index.rs`): es un tipo diminuto y sin estado propio del
@@ -412,10 +514,10 @@ mod tests {
     /// medido. El nonce ahora se deriva de un contador monótono por
     /// escritura (`page || contador`, nunca `txn_id`), así que el mismo
     /// escenario ya no colisiona — ver el comentario de `nonce` y de
-    /// `Db::reserve_counters` en `tx.rs`.
+    /// `Db::extend_counter_ceiling` en `tx.rs`.
     struct RecordingStorage {
         inner: MemStorage,
-        writes: Mutex<Vec<(u64, [u8; 8])>>,
+        writes: Mutex<Vec<PhysWrite>>,
     }
 
     impl RecordingStorage {
@@ -423,8 +525,27 @@ mod tests {
             Self { inner: MemStorage::new(), writes: Mutex::new(Vec::new()) }
         }
 
-        fn nonces(&self) -> Vec<(u64, [u8; 8])> {
+        /// Escrituras físicas completas (offset y TODOS los bytes), no solo
+        /// los ocho primeros (tercera ronda de revisión): el detector
+        /// estadístico `audit_nonces` necesita el texto cifrado entero para
+        /// poder xorear dos sellados que compartan nonce — el par
+        /// `(offset, contador)` prueba que el nonce se repitió, pero es el
+        /// XOR el que demuestra qué se pierde cuando eso pasa.
+        fn raw_writes(&self) -> Vec<PhysWrite> {
             self.writes.lock().unwrap().clone()
+        }
+
+        fn nonces(&self) -> Vec<(u64, [u8; 8])> {
+            self.writes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(o, b)| {
+                    let mut first8 = [0u8; 8];
+                    first8.copy_from_slice(&b[..8]);
+                    (*o, first8)
+                })
+                .collect()
         }
 
         /// Solo los pares que de verdad representan `(página, contador de
@@ -432,10 +553,9 @@ mod tests {
         /// posterior a la primera entrega: `nonces()` sin filtrar hacía
         /// fallar esta prueba por una razón que NO es un nonce repetido).
         ///
-        /// `Db::reserve_counters`/`WriteTxn::commit` escriben la MISMA
-        /// ranura de meta dos veces por transacción cifrada — la reserva al
-        /// principio y el commit real al final — con el MISMO `txn_id` en
-        /// claro en sus primeros 8 bytes (`Meta::encode` los pone ahí,
+        /// `Db::extend_counter_ceiling`/`WriteTxn::commit` escriben
+        /// ranuras de meta con el MISMO `txn_id` en claro en sus primeros
+        /// 8 bytes (`Meta::encode` los pone ahí,
         /// nada que ver con el contador de nonce: la meta nunca pasa por
         /// `write_encrypted`, ver el comentario de `wrap_key`). Eso
         /// produce, a propósito, un `(offset, primeros 8 bytes)` repetido
@@ -465,9 +585,7 @@ mod tests {
             // menos de 8. El guard es solo defensivo, para no entrar en
             // pánico si algún día deja de ser cierto.
             if b.len() >= 8 {
-                let mut first8 = [0u8; 8];
-                first8.copy_from_slice(&b[..8]);
-                self.writes.lock().unwrap().push((o, first8));
+                self.writes.lock().unwrap().push((o, b.to_vec()));
             }
             self.inner.write_at(o, b)
         }
@@ -693,6 +811,14 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), nonces.len(), "nonce repetido");
+
+        // Y el mismo veredicto por la otra vía, la estadística (tercera
+        // ronda de revisión): `sealed > 0` no es decoración — sin él, un
+        // cambio que dejara de registrar escrituras haría pasar
+        // "cero nonces repetidos" sin haber mirado ni una sola página.
+        let audit = audit_nonces(&s.raw_writes());
+        assert!(audit.sealed > 0, "el auditor no vio ninguna pagina sellada: {audit:?}");
+        assert_eq!(audit.reused_nonces, 0, "{audit:?}");
     }
 
     /// Complementa la prueba de arriba con el otro eje: muchas
@@ -835,11 +961,34 @@ mod tests {
     /// viven las dos ranuras sin tener que leer la cabecera primero.
     struct PowerLossStorage {
         inner: MemStorage,
-        writes: Mutex<Vec<(u64, [u8; 8])>>,
+        writes: Mutex<Vec<PhysWrite>>,
         last_synced_meta: Mutex<[[u8; 512]; 2]>,
+        /// Desgarro armado: ver `arm_meta_tear`.
+        tear: Mutex<Option<Tear>>,
+        /// Imagen del plato en el instante del corte, o `None` si la
+        /// máquina sigue viva. Ver `arm_meta_tear`.
+        dead: Mutex<Option<Vec<u8>>>,
+    }
+
+    /// Escritura de meta que se corta a medias. `skip` es cuántas
+    /// escrituras de meta faltan todavía antes de la que se desgarra.
+    struct Tear {
+        skip: usize,
+        prefix: usize,
     }
 
     const META_OFFSETS: [u64; 2] = [512, 4096];
+
+    /// Cuántos bytes de una escritura de meta desgarrada llegan al plato.
+    /// 104 no es arbitrario: cae DENTRO de `write_counter` (bytes 100..108)
+    /// y por debajo del CRC (108..112), así que la ranura queda siempre con
+    /// un contenido mezclado y un CRC viejo — ilegible, pase lo que pase.
+    /// Un prefijo más corto solo desgarra de verdad las escrituras cuyos
+    /// primeros bytes cambian (las de un commit, que trae `txn_id` y `root`
+    /// nuevos), y deja intacta la de una extensión, que solo toca
+    /// `write_counter` y el CRC. `write_at` lo comprueba en cada desgarro
+    /// en vez de confiar en que quien escribe la prueba lo tenga presente.
+    const TORN_PREFIX: usize = 104;
 
     impl PowerLossStorage {
         fn new() -> Self {
@@ -847,26 +996,78 @@ mod tests {
                 inner: MemStorage::new(),
                 writes: Mutex::new(Vec::new()),
                 last_synced_meta: Mutex::new([[0u8; 512]; 2]),
+                tear: Mutex::new(None),
+                dead: Mutex::new(None),
             }
         }
 
-        /// Descarta cualquier escritura de meta posterior al último
-        /// `sync()` real — simula perder los búferes del sistema operativo
-        /// no vaciados a disco. Las páginas de datos/lista de libres NO se
-        /// tocan: ya "llegaron al medio" sin condición, como en la vida
-        /// real.
+        /// Arma un corte de corriente EN MITAD de una escritura de meta
+        /// (tercera ronda de revisión — el agujero del arnés). La
+        /// `skip`-ésima escritura de meta a partir de ahora deposita solo
+        /// sus primeros `prefix` bytes; el resto de la ranura conserva el
+        /// contenido anterior, así que el CRC de `Meta::decode` falla y esa
+        /// ranura queda ILEGIBLE, que es exactamente lo que el diseño de
+        /// dos ranuras existe para sobrevivir. La versión anterior de este
+        /// ayudante solo sabía restaurar una ranura ENTERA a su último
+        /// contenido sincronizado — modela "la escritura no llegó nunca",
+        /// jamás "la escritura llegó a medias", así que las seis
+        /// combinaciones de `Sync` pasaban bajo un modelo que excluía el
+        /// único modo de fallo que importa.
+        ///
+        /// A partir de ese instante el medio queda MUERTO: se fotografía el
+        /// plato y nada de lo que el proceso escriba después llega a él ni
+        /// se registra como observable. Es la diferencia entre modelar un
+        /// corte de corriente y modelar una escritura parcial que el
+        /// proceso sobrevive — lo segundo no existe: si `sync()` devolvió
+        /// éxito el dato es duradero, y si una escritura se desgarró es
+        /// porque la máquina murió justo ahí, así que no pudo ejecutar ni
+        /// una línea más. Sin esta parte del modelo el arnés atribuiría al
+        /// motor reutilizaciones de contador que ningún atacante puede
+        /// observar, porque esos bytes nunca existieron. Las lecturas SÍ
+        /// siguen funcionando: el proceso de la prueba tiene que poder
+        /// terminar su función sin errores de E/S artificiales.
+        ///
+        /// `simulate_power_loss` es el "reinicio" que restaura esa foto.
+        fn arm_meta_tear(&self, skip: usize, prefix: usize) {
+            *self.tear.lock().unwrap() = Some(Tear { skip, prefix });
+        }
+
+        /// Reinicio tras el corte. Restaura el plato a la foto del instante
+        /// del corte (si lo hubo) y descarta cualquier escritura de meta
+        /// posterior al último `sync()` real — simula perder los búferes
+        /// del sistema operativo no vaciados a disco. Las páginas de
+        /// datos/lista de libres NO se revierten: se tratan como si
+        /// hubieran llegado al medio sin condición, que es el supuesto
+        /// PESIMISTA correcto para esta pregunta (cuanto más texto cifrado
+        /// sobreviva, más material tiene un atacante para explotar un nonce
+        /// repetido).
         fn simulate_power_loss(&self) {
+            if let Some(platter) = self.dead.lock().unwrap().take() {
+                self.inner.restore(platter);
+            }
             let saved = *self.last_synced_meta.lock().unwrap();
             for (i, &offset) in META_OFFSETS.iter().enumerate() {
                 self.inner.write_at(offset, &saved[i]).unwrap();
             }
         }
 
+        fn raw_writes(&self) -> Vec<PhysWrite> {
+            self.writes.lock().unwrap().clone()
+        }
+
         fn encrypted_page_nonces(&self) -> Vec<(u64, [u8; 8])> {
-            let page_size = 512u64;
-            let meta_b_page = core::cmp::max(2, 4096 / page_size);
-            let first_data_page_offset = (meta_b_page + 1) * page_size;
-            self.writes.lock().unwrap().iter().copied().filter(|(o, _)| *o >= first_data_page_offset).collect()
+            let floor = first_data_page() * TEST_PAGE_SIZE;
+            self.writes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(o, _)| *o >= floor)
+                .map(|(o, b)| {
+                    let mut first8 = [0u8; 8];
+                    first8.copy_from_slice(&b[..8]);
+                    (*o, first8)
+                })
+                .collect()
         }
     }
 
@@ -876,15 +1077,73 @@ mod tests {
         }
 
         fn write_at(&self, o: u64, b: &[u8]) -> Result<()> {
+            if self.dead.lock().unwrap().is_some() {
+                // La máquina ya murió: esto no llega al plato (la foto de
+                // `arm_meta_tear` se restaura en el reinicio) ni lo ve
+                // nadie, así que tampoco se registra. Sigue escribiéndose
+                // en `inner` solo para que las lecturas posteriores del
+                // proceso ya muerto no fallen con un error de E/S que en la
+                // vida real nadie llegaría a ver.
+                return self.inner.write_at(o, b);
+            }
+
+            let meta_slot = META_OFFSETS
+                .iter()
+                .position(|&m| m == o && b.len() == TEST_PAGE_SIZE as usize);
+            if let Some(i) = meta_slot {
+                let torn = {
+                    let mut tear = self.tear.lock().unwrap();
+                    match tear.as_mut() {
+                        Some(t) if t.skip == 0 => {
+                            let prefix = t.prefix;
+                            *tear = None;
+                            Some(prefix)
+                        }
+                        Some(t) => {
+                            t.skip -= 1;
+                            None
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(prefix) = torn {
+                    self.writes.lock().unwrap().push((o, b[..prefix].to_vec()));
+                    self.inner.write_at(o, &b[..prefix])?;
+                    // Lo que sí llegó al plato es DURADERO: sobrevive al
+                    // `simulate_power_loss` posterior, a diferencia de una
+                    // escritura de meta completa sin sincronizar.
+                    let mut landed = [0u8; 512];
+                    self.inner.read_at(o, &mut landed)?;
+                    // El arnés comprueba SU PROPIA premisa: si el prefijo
+                    // elegido deja la ranura todavía legible, esta prueba no
+                    // está modelando ningún desgarro y pasaría por la razón
+                    // equivocada. Ocurre de verdad: la meta de una extensión
+                    // solo difiere de la anterior en `write_counter`
+                    // (100..108) y el CRC (108..112), así que un prefijo de
+                    // 56 bytes la deja byte a byte idéntica a lo que ya
+                    // había — un desgarro que no desgarra nada. Ver
+                    // `TORN_PREFIX`.
+                    assert!(
+                        crate::meta::Meta::decode(&landed).is_err(),
+                        "el prefijo de {prefix} bytes deja la ranura de meta en {o} todavia \
+                         legible: esta prueba no esta modelando ningun desgarro"
+                    );
+                    self.last_synced_meta.lock().unwrap()[i] = landed;
+                    *self.dead.lock().unwrap() = Some(self.inner.snapshot());
+                    return Ok(());
+                }
+            }
+
             if b.len() >= 8 {
-                let mut first8 = [0u8; 8];
-                first8.copy_from_slice(&b[..8]);
-                self.writes.lock().unwrap().push((o, first8));
+                self.writes.lock().unwrap().push((o, b.to_vec()));
             }
             self.inner.write_at(o, b)
         }
 
         fn sync(&self) -> Result<()> {
+            if self.dead.lock().unwrap().is_some() {
+                return Ok(());
+            }
             let mut saved = self.last_synced_meta.lock().unwrap();
             for (i, &offset) in META_OFFSETS.iter().enumerate() {
                 let mut buf = [0u8; 512];
@@ -1090,6 +1349,279 @@ mod tests {
         std::eprintln!("sin cifrar: {unenc_per_tx} syncs/tx; cifrado: {enc_per_tx} syncs/tx");
         assert_eq!(unenc_per_tx, 2.0);
         assert_eq!(enc_per_tx, 2.0, "el cifrado no debe anadir sincronizaciones por transaccion en el caso comun");
+    }
+
+    /// El coste que la sonda 4 NO medía (tercera ronda de revisión): esa
+    /// mide transacciones sobre una base recién CREADA, donde `Db::create`
+    /// ya siembra el techo y ninguna transacción extiende. Sobre una base
+    /// REABIERTA la historia es distinta: `live_counter == counter_ceiling`
+    /// al abrir (no hay forma de saber cuánto del margen llegó a usar la
+    /// sesión anterior antes de morir, así que se asume el peor caso), de
+    /// modo que la primera escritura cifrada de CADA sesión extiende el
+    /// techo — dos escrituras de meta y dos `fsync` incondicionales.
+    ///
+    /// Eso es inherente, no un descuido: antes de sellar una página con el
+    /// contador C tiene que existir en disco un registro que ponga el suelo
+    /// por encima de C, o una caída dejaría a la sesión siguiente
+    /// repartiendo C otra vez. Lo que esta prueba fija es que el coste sea
+    /// CONSTANTE POR SESIÓN y no por transacción: la diferencia contra la
+    /// base sin cifrar tiene que ser la misma con 100 transacciones que con
+    /// 500.
+    #[test]
+    fn a_reopened_encrypted_database_pays_its_extension_once_per_session() {
+        fn syncs_after_reopen(n: u64, encrypted: bool) -> u64 {
+            let s = Arc::new(SyncCountingStorage::new());
+            let mk_opts = || if encrypted { opts([62; 32]) } else { Options::default() };
+            {
+                let db =
+                    Db::create(Box::new(ArcSyncCounting(Arc::clone(&s))), mk_opts()).unwrap();
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, b"antes", b"confirmado").unwrap();
+                tx.commit().unwrap();
+            }
+            let before = s.sync_count();
+            let db = Db::open(Box::new(ArcSyncCounting(Arc::clone(&s))), mk_opts()).unwrap();
+            for i in 0..n as u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+                tx.commit().unwrap();
+            }
+            s.sync_count() - before
+        }
+
+        let (a_plain, a_enc) = (syncs_after_reopen(100, false), syncs_after_reopen(100, true));
+        let (b_plain, b_enc) = (syncs_after_reopen(500, false), syncs_after_reopen(500, true));
+        std::eprintln!(
+            "reapertura, 100 tx: sin cifrar {a_plain}, cifrado {a_enc} (+{}); \
+             500 tx: sin cifrar {b_plain}, cifrado {b_enc} (+{})",
+            a_enc - a_plain,
+            b_enc - b_plain
+        );
+        assert_eq!(a_plain, 200, "dos sincronizaciones por transaccion, como siempre");
+        assert_eq!(b_plain, 1000);
+        assert_eq!(
+            a_enc - a_plain,
+            b_enc - b_plain,
+            "el sobrecoste del cifrado tiene que ser por SESION, no por transaccion"
+        );
+        assert_eq!(a_enc - a_plain, 2, "una extension por sesion: dos escrituras, dos fsync");
+    }
+
+    /// Meta CONFIRMADA tal como está en el fichero ahora mismo, sin pasar
+    /// por `Db`: la usan las pruebas de fuga de páginas para comprobar que
+    /// una transacción abortada no cambió nada de lo confirmado.
+    fn on_disk_meta(s: &MemStorage) -> crate::meta::Meta {
+        let g = crate::header::Geometry::read(s).unwrap();
+        crate::meta::Meta::load(s, &g).unwrap().0
+    }
+
+    /// **BLOCKER de la tercera ronda de revisión.** El registro duradero
+    /// del techo de contador tiene que sobrevivir a CUALQUIER escritura
+    /// desgarrada, y antes de esta ronda no lo hacía: la extensión
+    /// (`Db::extend_counter_ceiling`) escribía en `committed_slot.other()`
+    /// y el commit siguiente escribe ESA MISMA ranura, así que el registro
+    /// del techo sobrevivía exactamente una escritura de meta. Y como
+    /// `live_counter == counter_ceiling` al abrir, TODA reapertura extiende
+    /// en su primera escritura cifrada: la ventana se abría en cada sesión.
+    ///
+    /// La reproducción: crear y confirmar; reabrir (extiende); desgarrar la
+    /// escritura de meta del commit; reabrir otra vez y volver a escribir.
+    /// Con el defecto, la sesión 3 arranca del `write_counter` VIEJO que
+    /// quedó en la otra ranura y vuelve a repartir los contadores que la
+    /// sesión 2 ya quemó sellando páginas que SÍ están en el fichero.
+    ///
+    /// El desgarro se arma justo antes de `commit()`, no por un índice fijo
+    /// de escritura de meta: así la prueba apunta a "la escritura de meta
+    /// del commit" sin depender de cuántas escrituras haga la extensión.
+    #[test]
+    fn a_torn_commit_meta_write_after_an_extension_reuses_no_counter() {
+        let s = Arc::new(PowerLossStorage::new());
+        let master = [71u8; 32];
+
+        {
+            let db = Db::create(Box::new(ArcPowerLoss(Arc::clone(&s))), opts(master)).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"antes", b"confirmado").unwrap();
+            tx.commit().unwrap();
+        }
+
+        {
+            let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), opts(master)).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..5u32 {
+                tx.put(0x02, &i.to_be_bytes(), b"sesion dos").unwrap();
+            }
+            // 56 de 512 bytes: el CRC de `Meta::decode` cubre 0..108, así
+            // que una ranura con 56 bytes nuevos y el resto viejos falla la
+            // comprobación y queda ilegible.
+            s.arm_meta_tear(0, 56);
+            tx.commit().unwrap();
+        }
+
+        s.simulate_power_loss();
+
+        {
+            let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), opts(master)).unwrap();
+            assert_eq!(
+                db.begin_read().get(0x01, b"antes").unwrap().as_deref(),
+                Some(b"confirmado".as_slice()),
+                "el commit desgarrado no debe llevarse por delante lo ya confirmado"
+            );
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..5u32 {
+                tx.put(0x02, &i.to_be_bytes(), b"sesion tres").unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let audit = audit_nonces(&s.raw_writes());
+        std::eprintln!("{audit:?}");
+        assert!(audit.sealed > 0, "el auditor no vio ninguna pagina sellada: {audit:?}");
+        assert_eq!(
+            audit.reused_nonces, 0,
+            "nonce reutilizado tras un commit desgarrado: {audit:?} \
+             (XOR de textos cifrados con el mismo nonce: {:.2} % de bytes cero, \
+              linea base con nonces distintos: {:.2} %)",
+            audit.worst_xor_zero_pct, audit.baseline_xor_zero_pct
+        );
+    }
+
+    /// **MEDIUM de la tercera ronda de revisión: fuga de páginas sin cota.**
+    /// `Db::open` subía `meta.n_pages` hasta la extensión real del fichero y
+    /// guardaba ESO en `self.committed`, así que `committed` describía un
+    /// estado que nunca se confirmó: las páginas recuperadas vivían solo en
+    /// la lista de libres EN MEMORIA. Como `extend_counter_ceiling` copia
+    /// `self.committed`, una transacción abortada dejaba en disco un
+    /// `n_pages` por encima del último commit con una lista de libres que no
+    /// posee la diferencia — y esas páginas se perdían para siempre, ciclo
+    /// tras ciclo, sin cota.
+    ///
+    /// Doce ciclos abrir-extender-abortar. El control sin cifrar no escribe
+    /// ninguna meta durante una transacción abortada, así que es el patrón
+    /// exacto contra el que comparar.
+    #[test]
+    fn open_extend_abort_cycles_leak_no_pages() {
+        for encrypted in [false, true] {
+            let s = Arc::new(MemStorage::new());
+            let mk_opts = || if encrypted { opts([81; 32]) } else { Options::default() };
+            {
+                let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), mk_opts()).unwrap();
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, b"antes", b"confirmado").unwrap();
+                tx.commit().unwrap();
+            }
+            let before = on_disk_meta(&s);
+
+            for _ in 0..12 {
+                let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), mk_opts()).unwrap();
+                let mut tx = db.begin_write().unwrap();
+                for i in 0..3u32 {
+                    tx.put(0x02, &i.to_be_bytes(), b"a medias").unwrap();
+                }
+                // Se descarta sin commit.
+            }
+
+            let after = on_disk_meta(&s);
+            assert_eq!(
+                after.n_pages, before.n_pages,
+                "cifrado={encrypted}: n_pages confirmado subio de {} a {} sin ningun commit: \
+                 {} paginas perdidas",
+                before.n_pages,
+                after.n_pages,
+                after.n_pages - before.n_pages
+            );
+            assert_eq!(
+                (after.txn_id, after.root, after.freelist_head, after.freelist_tail),
+                (before.txn_id, before.root, before.freelist_head, before.freelist_tail),
+                "cifrado={encrypted}: abortar no debe cambiar nada de la meta confirmada \
+                 salvo el techo de contador"
+            );
+            // Y lo confirmado sigue legible.
+            let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), mk_opts()).unwrap();
+            assert_eq!(
+                db.begin_read().get(0x01, b"antes").unwrap().as_deref(),
+                Some(b"confirmado".as_slice())
+            );
+        }
+    }
+
+    /// La matriz completa: cada política de `Sync` contra un desgarro en
+    /// CADA una de las escrituras de meta que hace una sesión que extiende
+    /// el techo, más el caso sin desgarro. Es la prueba que el arnés
+    /// anterior no podía hacer (solo sabía descartar una ranura entera, ver
+    /// `arm_meta_tear`).
+    ///
+    /// Dos propiedades por caso, no una:
+    /// - **ningún contador se reutiliza** — el objetivo de la tarea;
+    /// - **bajo `Sync::Commit`, lo ya confirmado sigue ahí** — sin esto, un
+    ///   diseño que escriba las dos ranuras "de una tacada" con una sola
+    ///   sincronización al final pasaría la primera comprobación y perdería
+    ///   un commit entero: si la escritura de la ranura ACTIVA se desgarra
+    ///   antes de que la de la INACTIVA sea duradera, no queda ninguna
+    ///   ranura con el último estado confirmado.
+    #[test]
+    fn every_sync_policy_survives_a_torn_meta_write_at_every_point() {
+        for policy in [Sync::Commit, Sync::Interval(Duration::from_secs(3600)), Sync::Never] {
+            for tear_at in [None, Some(0), Some(1), Some(2)] {
+                let s = Arc::new(PowerLossStorage::new());
+                let master = [91u8; 32];
+                let mk_opts = || Options { sync: policy, ..opts(master) };
+
+                {
+                    let db =
+                        Db::create(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
+                    let mut tx = db.begin_write().unwrap();
+                    tx.put(0x01, b"antes", b"confirmado").unwrap();
+                    tx.commit().unwrap();
+                }
+                // Bajo `Sync::Never`/`Interval` largo, el commit de la
+                // sesión 1 no se sincroniza; este `sync()` de la propia
+                // prueba lo fija como duradero para que las tres políticas
+                // partan del mismo estado y la comprobación de
+                // supervivencia del dato sea comparable.
+                s.sync().unwrap();
+
+                {
+                    let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
+                    if let Some(k) = tear_at {
+                        s.arm_meta_tear(k, TORN_PREFIX);
+                    }
+                    let mut tx = db.begin_write().unwrap();
+                    for i in 0..5u32 {
+                        tx.put(0x02, &i.to_be_bytes(), b"sesion dos").unwrap();
+                    }
+                    tx.commit().unwrap();
+                }
+
+                s.simulate_power_loss();
+
+                let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
+                assert_eq!(
+                    db.begin_read().get(0x01, b"antes").unwrap().as_deref(),
+                    Some(b"confirmado".as_slice()),
+                    "{policy:?} / desgarro en {tear_at:?}: se perdio un commit ya duradero"
+                );
+                {
+                    let mut tx = db.begin_write().unwrap();
+                    for i in 0..5u32 {
+                        tx.put(0x03, &i.to_be_bytes(), b"sesion tres").unwrap();
+                    }
+                    tx.commit().unwrap();
+                }
+                drop(db);
+
+                let audit = audit_nonces(&s.raw_writes());
+                assert!(
+                    audit.sealed > 0,
+                    "{policy:?} / desgarro en {tear_at:?}: el auditor no vio ninguna pagina \
+                     sellada, asi que 'cero nonces repetidos' no dice nada: {audit:?}"
+                );
+                assert_eq!(
+                    audit.reused_nonces, 0,
+                    "{policy:?} / desgarro en {tear_at:?}: {audit:?}"
+                );
+            }
+        }
     }
 
     /// Cobertura de ejecución real para AES-256-GCM (ronda de revisión

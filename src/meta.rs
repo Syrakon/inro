@@ -60,9 +60,17 @@ pub struct Meta {
     /// "el último contador usado": es "ningún contador por debajo de este
     /// valor se ofrece jamás a una transacción futura", incluso si el
     /// contador real usado por la última transacción fue mucho menor — ver
-    /// `Db::reserve_counters` en `tx.rs`, que es quien mantiene esa
+    /// `Db::extend_counter_ceiling` en `tx.rs`, que es quien mantiene esa
     /// propiedad. Sin significado en una base sin cifrar (queda en 0, sin
     /// que nada lo lea).
+    ///
+    /// **Las DOS ranuras lo llevan siempre** (tarea 17, tercera ronda de
+    /// revisión): una extensión escribe este campo en ambas, con una
+    /// sincronización tras cada una. Si viviera en una sola, el commit
+    /// siguiente — que escribe justo esa — dejaría el registro del techo a
+    /// merced de una única escritura desgarrada, y la ranura superviviente
+    /// devolvería un contador VIEJO que la sesión siguiente volvería a
+    /// repartir.
     pub write_counter: u64,
 }
 
@@ -147,21 +155,29 @@ impl Meta {
     ///
     /// **Desempate por `write_counter` a igualdad de `txn_id`** (tarea 17,
     /// segunda ronda de revisión posterior a la primera entrega):
-    /// `Db::extend_counter_ceiling` puede dejar las dos ranuras con el
-    /// MISMO `txn_id` (copia exacta de la última meta confirmada, solo con
-    /// `write_counter` avanzado, escrita en la ranura inactiva mientras una
-    /// transacción está en curso — ver su comentario en `tx.rs`). Sin este
+    /// `Db::extend_counter_ceiling` deja las dos ranuras con el MISMO
+    /// `txn_id` — cada una una copia exacta de la última meta confirmada,
+    /// solo con `write_counter` avanzado — y las escribe una detrás de otra
+    /// mientras una transacción está en curso (ver su comentario en
+    /// `tx.rs`). Entre las dos escrituras hay una ventana en la que las
+    /// ranuras comparten `txn_id` y difieren en `write_counter`. Sin este
     /// desempate, `meta.txn_id > b.txn_id` es estrictamente falso a
     /// igualdad y la ranura A (procesada primero) gana siempre — que
     /// podría ser precisamente la que tiene el `write_counter` más VIEJO,
     /// dejando que una futura transacción reparta de nuevo contadores que
-    /// la extensión ya había dejado fuera de circulación. Es seguro
-    /// preferir el `write_counter` mayor en este caso, y solo en este caso:
-    /// a igualdad de `txn_id` las dos ranuras describen el MISMO árbol
-    /// confirmado (mismo `root`/lista de libres/`n_pages` — así construye
-    /// `extend_counter_ceiling` la copia), así que quedarse con el
-    /// contador más alto nunca adopta trabajo a medias, solo avanza el
-    /// techo de nonce.
+    /// la extensión ya había dejado fuera de circulación.
+    ///
+    /// Es seguro preferir el `write_counter` mayor en este caso, y solo en
+    /// este caso, porque a igualdad de `txn_id` las dos ranuras describen
+    /// el MISMO estado confirmado: `root`, lista de libres y `n_pages`
+    /// coinciden byte a byte, porque las dos salen de copiar la misma meta
+    /// confirmada. Y esa premisa es hoy exacta (tarea 17, TERCERA ronda de
+    /// revisión): hasta esa ronda, `Db::open` subía el `n_pages` de la meta
+    /// que guardaba en memoria hasta la extensión real del fichero, así que
+    /// la copia que escribía una extensión podía diferir de la ranura
+    /// hermana en un campo que NO era el contador — el único camino vivo
+    /// por el que este desempate llegaba a elegir entre dos estados
+    /// distintos. Ver el comentario del campo `Db::committed` en `tx.rs`.
     pub fn load(storage: &dyn Storage, g: &Geometry) -> Result<(Meta, MetaSlot)> {
         let mut best: Option<(Meta, MetaSlot)> = None;
         for slot in [MetaSlot::A, MetaSlot::B] {

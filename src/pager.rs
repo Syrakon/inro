@@ -97,7 +97,8 @@ impl Pager {
     /// Si esta base tiene cifrado por página activo. `Db::begin_write`
     /// (`tx.rs`, tarea 17, ronda de revisión posterior a la primera
     /// entrega) la usa para saltarse por completo la reserva duradera de
-    /// contadores de nonce (`Db::reserve_counters`) cuando no hace falta:
+    /// contadores de nonce (`Db::extend_counter_ceiling`) cuando no hace
+    /// falta:
     /// sin cifrado, ningún contador se usa nunca (`write_encrypted` con
     /// `self.encryption == None` ignora el que se le pase), así que
     /// reservarlo sería una escritura+sincronización de meta por cada
@@ -216,7 +217,8 @@ impl Pager {
     /// invariante de la que depende TODA la confidencialidad de este
     /// esquema — es responsabilidad de quien llama (`WriteTxn::write_page`,
     /// `Freelist::flush`, ambos en `tx.rs`/`freelist.rs`, vía
-    /// `Db::reserve_counters`): un mismo par `(page_no, counter)` no debe
+    /// `Db::extend_counter_ceiling`): un mismo par `(page_no, counter)` no
+    /// debe
     /// pasar nunca dos veces por esta función. `Pager` no tiene forma de
     /// comprobarlo por sí mismo — no es una precondición vacía: la primera
     /// versión de este esquema usaba `txn_id` aquí, que SÍ podía repetirse

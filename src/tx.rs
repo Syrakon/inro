@@ -61,6 +61,27 @@ impl Default for Options {
 
 pub struct Db {
     pager: Pager,
+    /// La meta CONFIRMADA y la ranura donde vive, siempre fieles byte a
+    /// byte a lo que hay en el fichero: esto es exactamente lo que
+    /// devolvería un `Meta::load` ahora mismo, nunca un estado "mejorado"
+    /// en memoria.
+    ///
+    /// **No es una sutileza de estilo** (tarea 17, tercera ronda de
+    /// revisión, hallazgo MEDIUM): `Db::extend_counter_ceiling` copia esta
+    /// meta y la ESCRIBE en el fichero a mitad de una transacción, sin que
+    /// haya ningún commit de por medio. Cualquier campo que aquí valiera
+    /// más de lo que hay en disco se publicaría como si estuviera
+    /// confirmado. Eso es justo lo que pasaba con `n_pages`: `Db::open` lo
+    /// subía hasta la extensión real del fichero (las páginas recuperadas
+    /// de una transacción interrumpida) y lo guardaba aquí, mientras esas
+    /// páginas vivían solo en la lista de libres EN MEMORIA — así que una
+    /// extensión seguida de un aborto dejaba en disco un `n_pages` alto con
+    /// una lista de libres que no poseía la diferencia, y esas páginas se
+    /// perdían para siempre. Doce ciclos abrir-extender-abortar: `n_pages`
+    /// de 10 a 22, doce páginas fugadas, sin cota. La extensión recuperada
+    /// vive ahora en `WriterState::n_pages_floor`, que es donde de verdad
+    /// pertenece: es el punto de partida de la PRÓXIMA transacción, no algo
+    /// que ya esté confirmado.
     committed: RwLock<(Meta, MetaSlot)>,
     write_lock: Mutex<Option<WriterState>>,
     readers: Mutex<BTreeMap<TxnId, u32>>,
@@ -106,6 +127,23 @@ struct WriterState {
     /// avance de `counter_ceiling` en el que se puede confiar es el que ya
     /// se demostró en disco.
     counter_ceiling: u64,
+    /// Suelo de `n_pages` para la próxima transacción: la extensión REAL
+    /// del fichero tal como la vio `Db::open`, incluidas las páginas que
+    /// dejó una transacción interrumpida y que la recuperación metió en
+    /// `freelist` (tarea 17, tercera ronda de revisión — ver el comentario
+    /// del campo `Db::committed`).
+    ///
+    /// Vive aquí, y no en la meta confirmada, porque describe el estado del
+    /// FICHERO, no el del último commit: `alloc` no puede repartir por
+    /// extensión desde un `n_pages` que ya se quedó corto — entregaría por
+    /// segunda vez una página que la lista de libres en memoria también va
+    /// a ofrecer — pero tampoco puede escribirse en disco como si estuviera
+    /// confirmado mientras la lista de libres que lo respalda solo existe
+    /// en memoria. `begin_write` toma el máximo de los dos, así que la
+    /// transacción arranca con la cota correcta y solo un commit real —
+    /// que sí vuelca la lista de libres a disco a la vez — llega a
+    /// grabarla.
+    n_pages_floor: u32,
 }
 
 /// Página de la meta B: debe caer en un sector físico de 4 KB distinto al de
@@ -184,13 +222,16 @@ impl Db {
             freelist: Freelist::empty(),
             live_counter: 0,
             counter_ceiling: meta.write_counter,
+            // Fichero recién creado: no hay ninguna página más allá de lo
+            // que la meta ya declara, así que el suelo coincide con ella.
+            n_pages_floor: meta.n_pages,
         };
         Ok(Self::assemble(storage, geometry, meta, MetaSlot::A, opts, writer_state, encryption))
     }
 
     pub fn open(storage: Box<dyn Storage>, opts: Options) -> Result<Self> {
         let geometry = Geometry::read(storage.as_ref())?;
-        let (mut meta, slot) = Meta::load(storage.as_ref(), &geometry)?;
+        let (meta, slot) = Meta::load(storage.as_ref(), &geometry)?;
         // Se desenvuelve ANTES de construir el `Pager` provisional que lee
         // la lista de libres, no solo el definitivo de `assemble`: si la
         // base está cifrada, sus páginas de lista de libres también lo
@@ -214,7 +255,15 @@ impl Db {
         // páginas recuperadas, el camino de extensión de `alloc` volvería a
         // repartir desde el `n_pages` viejo y entregaría por segunda vez una
         // página que ya está en uso. Es corrupción silenciosa, no una fuga.
-        meta.n_pages = core::cmp::max(meta.n_pages, file_pages);
+        //
+        // Pero ese avance NO va a `meta` (tarea 17, tercera ronda de
+        // revisión): la meta que se guarda en `self.committed` tiene que
+        // seguir siendo byte a byte la que está en disco, porque
+        // `extend_counter_ceiling` la copia y la escribe sin ningún commit
+        // de por medio — ver los comentarios de `Db::committed` y de
+        // `WriterState::n_pages_floor`. El suelo viaja en `WriterState` y
+        // `begin_write` lo aplica.
+        let n_pages_floor = core::cmp::max(meta.n_pages, file_pages);
 
         // El contador VIVO arranca en el TECHO recuperado, no en "lo último
         // que se usó" (tarea 17, segunda ronda de revisión posterior a la
@@ -230,6 +279,7 @@ impl Db {
             freelist,
             live_counter: meta.write_counter,
             counter_ceiling: meta.write_counter,
+            n_pages_floor,
         };
 
         let storage = pager.into_storage();
@@ -660,11 +710,21 @@ impl Db {
         };
         let (mut meta, slot) = *self.committed.read().unwrap();
         meta.txn_id += 1;
-        let pre_freelist = guard
-            .as_ref()
-            .expect("el estado del escritor siempre está presente")
-            .freelist
-            .clone();
+        let state = guard.as_ref().expect("el estado del escritor siempre está presente");
+        let pre_freelist = state.freelist.clone();
+
+        // La transacción arranca desde la extensión REAL del fichero, no
+        // desde el `n_pages` de la meta confirmada (tarea 17, tercera ronda
+        // de revisión): las páginas que `Db::open` recuperó de una
+        // transacción interrumpida ya están en `state.freelist`, así que
+        // extender desde el `n_pages` viejo entregaría por segunda vez una
+        // página que la lista de libres también va a ofrecer. Es el mismo
+        // avance que antes hacía `Db::open` sobre la meta confirmada; lo
+        // que cambia es CUÁNDO se aplica — aquí, sobre la meta de esta
+        // transacción, que solo llega a disco si esta transacción confirma
+        // (y entonces la lista de libres viaja con ella) — ver
+        // `WriterState::n_pages_floor`.
+        meta.n_pages = core::cmp::max(meta.n_pages, state.n_pages_floor);
 
         // Sin nada que hacer con el contador de nonce aquí (segunda ronda
         // de revisión posterior a la primera entrega): a diferencia de la
@@ -691,9 +751,56 @@ impl Db {
     /// a la primera entrega). Escribe una meta que es una COPIA EXACTA de
     /// la última meta CONFIRMADA (`self.committed`, leída aquí mismo, en el
     /// momento de la llamada) — root, lista de libres, `n_pages`, `txn_id`,
-    /// todo sin tocar salvo `write_counter` — en la ranura inactiva
-    /// respecto a esa meta confirmada, y sincroniza de forma INCONDICIONAL,
-    /// sin mirar la política de `Sync`.
+    /// todo sin tocar salvo `write_counter` — en LAS DOS ranuras, con una
+    /// sincronización INCONDICIONAL tras cada una, sin mirar la política de
+    /// `Sync`.
+    ///
+    /// **Por qué las dos ranuras, y no solo la inactiva** (tercera ronda de
+    /// revisión, hallazgo BLOCKER). Escribiendo solo la inactiva, el
+    /// registro duradero del techo vivía en una única ranura — y el commit
+    /// siguiente escribe ESA MISMA ranura (`self.slot.other()`, calculado
+    /// desde la misma meta confirmada). El registro sobrevivía exactamente
+    /// una escritura de meta: si esa escritura se DESGARRABA (llegaron unos
+    /// bytes, no todos: el CRC falla y la ranura queda ilegible),
+    /// `Meta::load` caía en la otra ranura, que conserva el `write_counter`
+    /// VIEJO, y la siguiente sesión volvía a repartir contadores que la
+    /// sesión muerta ya había usado para sellar páginas que SÍ están en el
+    /// fichero. Y como `live_counter == counter_ceiling` al abrir (ver
+    /// `Db::open`), TODA reapertura extiende en su primera escritura
+    /// cifrada: la ventana se abría una vez por sesión, no en un caso raro.
+    /// Reproducido y medido: cinco pares `(página, contador)` repetidos, con
+    /// un 95,90 % de bytes cero en el XOR de los textos cifrados que
+    /// comparten nonce, contra un 0,33 % de línea base — ver
+    /// `a_torn_commit_meta_write_after_an_extension_reuses_no_counter` en
+    /// `crypto.rs`.
+    ///
+    /// Con las dos ranuras portando el techo, cualquier escritura de meta
+    /// posterior — commit o extensión — puede desgarrarse sin que el techo
+    /// retroceda: la ranura que esa escritura no toca sigue llevándolo.
+    ///
+    /// **Por qué DOS sincronizaciones y no una al final.** La primera
+    /// escritura va a la ranura inactiva y la segunda a la ACTIVA — la que
+    /// ahora mismo es el único registro válido del último estado
+    /// confirmado. Sobrescribirla solo es seguro si la inactiva ya lleva un
+    /// registro equivalente Y DURADERO de ese mismo estado: sin la
+    /// sincronización intermedia, un corte con las dos escrituras en vuelo
+    /// puede dejar la activa desgarrada y la inactiva sin materializar, y
+    /// entonces no queda NINGUNA ranura con el último commit — pérdida de
+    /// datos, no solo del techo. Con la sincronización intermedia, en todo
+    /// instante hay al menos una ranura válida que describe el estado
+    /// confirmado: la activa mientras se escribe la inactiva, y la inactiva
+    /// (ya duradera) mientras se escribe la activa. Lo comprueba
+    /// `every_sync_policy_survives_a_torn_meta_write_at_every_point`, que
+    /// desgarra cada una de las escrituras de meta de la sesión, una por
+    /// corrida.
+    ///
+    /// Las dos ranuras quedan con el MISMO `txn_id` y el MISMO
+    /// `write_counter`, byte a byte idénticas. La ventana entre las dos
+    /// escrituras es el único momento en que dos ranuras comparten
+    /// `txn_id` con `write_counter` distinto — para eso está el desempate
+    /// de `Meta::load` — y, al ser copias exactas de la misma meta
+    /// confirmada, el resto de sus campos coincide siempre: ese desempate
+    /// nunca puede elegir entre dos estados distintos.
     ///
     /// **Nunca la meta de la transacción en curso.** La primera ronda de
     /// revisión encontró aquí un hallazgo BLOCKER propio: pasar la meta
@@ -729,10 +836,26 @@ impl Db {
         let (committed_meta, committed_slot) = *self.committed.read().unwrap();
         let mut extension = committed_meta;
         extension.write_counter = ceiling;
-        let target = committed_slot.other();
         let geometry = *self.pager.geometry();
-        extension.store_via(&self.pager, &geometry, target)?;
+
+        // Primero la INACTIVA: mientras se escribe, la activa sigue siendo
+        // el registro válido del último commit.
+        extension.store_via(&self.pager, &geometry, committed_slot.other())?;
         self.pager.sync()?;
+        // Y solo entonces la ACTIVA: ahora la inactiva ya lleva, de forma
+        // duradera, ese mismo estado confirmado con el techo nuevo, así que
+        // desgarrar esta segunda escritura no puede dejar el fichero sin
+        // ninguna meta válida. Ver el razonamiento completo arriba.
+        extension.store_via(&self.pager, &geometry, committed_slot)?;
+        self.pager.sync()?;
+
+        // `self.committed` debe seguir describiendo, byte a byte, lo que hay
+        // en la ranura confirmada — es la invariante de la que depende que
+        // una extensión no publique nada que no estuviera ya confirmado (ver
+        // el comentario del campo `committed`). La ranura NO cambia: las dos
+        // llevan ahora el mismo contenido, así que el commit siguiente sigue
+        // alternando exactamente igual que antes de esta llamada.
+        self.committed.write().unwrap().0.write_counter = ceiling;
         Ok(ceiling)
     }
 }
@@ -1579,6 +1702,83 @@ mod tests {
             assert!(seen.insert(p), "la página {p} se repartió dos veces");
         }
         tx.commit().unwrap();
+    }
+
+    /// Tarea 17, tercera ronda de revisión (hallazgo BLOCKER), en caja
+    /// blanca: una extensión del techo de contador tiene que dejar LAS DOS
+    /// ranuras de meta llevando ese techo, y las dos describiendo el mismo
+    /// estado confirmado. Es la invariante entera del arreglo, comprobada
+    /// directamente sobre los bytes del fichero en vez de a través de un
+    /// escenario de caída — si solo una ranura lo llevara, el commit
+    /// siguiente (que escribe justo esa) dejaría el registro del techo a
+    /// merced de una única escritura desgarrada.
+    ///
+    /// No necesita la feature `encryption`: `extend_counter_ceiling`
+    /// escribe metas, que nunca van cifradas. Lo que sí depende del cifrado
+    /// es QUIÉN la llama (`advance_counter`, solo si `is_encrypted`).
+    #[test]
+    fn extending_the_counter_ceiling_leaves_both_meta_slots_carrying_it() {
+        let (s, db) = fresh();
+        // Un commit primero, para que la ranura activa no sea la A y el
+        // caso "se escribe también la ranura activa" quede de verdad
+        // ejercitado en las dos direcciones.
+        let mut tx = db.begin_write().unwrap();
+        let p = tx.alloc().unwrap();
+        tx.write_page(p, &alloc::vec![7u8; 512]).unwrap();
+        tx.set_root(p);
+        tx.commit().unwrap();
+
+        let committed = db.committed.read().unwrap().0;
+        let geometry = *db.pager.geometry();
+        let mut ceiling = 500u64;
+        // Dos extensiones seguidas: el camino que una transacción enorme
+        // recorre más de una vez, y en el que la segunda sobrescribe dos
+        // ranuras que ya eran idénticas entre sí.
+        for _ in 0..2 {
+            let previous = ceiling;
+            ceiling = db.extend_counter_ceiling(previous).unwrap();
+            assert_eq!(ceiling, previous + COUNTER_RESERVE);
+
+            for slot in [MetaSlot::A, MetaSlot::B] {
+                let mut buf = alloc::vec![0u8; 512];
+                s.read_at(slot.page(&geometry) as u64 * 512, &mut buf).unwrap();
+                let m = Meta::decode(&buf).expect("las dos ranuras siguen siendo legibles");
+                assert_eq!(
+                    m.write_counter, ceiling,
+                    "la ranura {slot:?} no lleva el techo: una escritura desgarrada la dejaria \
+                     como unico registro superviviente, con un contador viejo"
+                );
+                assert_eq!(
+                    (m.txn_id, m.root, m.n_pages, m.freelist_head, m.freelist_tail),
+                    (
+                        committed.txn_id,
+                        committed.root,
+                        committed.n_pages,
+                        committed.freelist_head,
+                        committed.freelist_tail
+                    ),
+                    "la ranura {slot:?} no describe el ultimo estado confirmado"
+                );
+            }
+
+            // `committed` sigue fiel byte a byte a lo que hay en disco (ver
+            // su comentario): es de lo que depende que la PRÓXIMA extensión
+            // no publique nada sin confirmar.
+            let (meta, slot) = *db.committed.read().unwrap();
+            assert_eq!(meta.write_counter, ceiling);
+            let mut buf = alloc::vec![0u8; 512];
+            s.read_at(slot.page(&geometry) as u64 * 512, &mut buf).unwrap();
+            assert_eq!(Meta::decode(&buf).unwrap(), meta);
+        }
+
+        // Y el commit siguiente sigue alternando como siempre: lo
+        // confirmado antes de la extensión sigue ahí y lo nuevo también.
+        let mut tx = db.begin_write().unwrap();
+        let q = tx.alloc().unwrap();
+        tx.write_page(q, &alloc::vec![8u8; 512]).unwrap();
+        tx.set_root(q);
+        tx.commit().unwrap();
+        assert_eq!(db.begin_read().root(), q);
     }
 
     #[test]
