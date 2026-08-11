@@ -46,23 +46,50 @@ fn child_at(page: &PageRef<'_>, i: usize) -> PageNo {
 }
 
 /// Cota de profundidad para el descenso: defensa contra un ciclo de punteros
-/// a hijos, ya sea por un fichero corrupto o por un futuro bug de división o
-/// reequilibrado que enlazara un nodo consigo mismo indirectamente.
+/// a hijos, ya sea por un fichero corrupto o por un futuro bug de división,
+/// borrado o reequilibrado que enlazara un nodo consigo mismo indirectamente.
 ///
-/// Cada nodo interno tiene al menos un separador más el hijo del campo
-/// `extra`, luego al menos dos hijos: el árbol es como mínimo binario, y con
-/// números de página de 32 bits un árbol legítimo no puede tener más de
-/// `2^32` hojas, así que no puede pasar de profundidad 32. 64 duplica ese
-/// margen sin dejar de cortar un ciclo en tiempo acotado.
+/// El argumento "cada nodo interno rama en al menos dos, luego con páginas de
+/// 32 bits la profundidad no puede pasar de 32" — que sostuvo este número
+/// cuando solo existía inserción — YA NO VALE por sí solo. Ese argumento
+/// asume un árbol balanceado en altura, y `delete_rec` rompe esa suposición a
+/// propósito: cuando un nodo interno queda con un solo hijo, lo descarta y
+/// empalma ese hijo un nivel más arriba (ver el comentario junto a
+/// `entries.is_empty()` en `delete_rec`), pero **no** funde páginas
+/// infrautilizadas con sus hermanas — alcance deliberado de la tarea 12,
+/// documentado también en el brief. El resultado es que ramas distintas del
+/// mismo árbol pueden tener profundidades distintas: unas se quedan cortas
+/// donde colapsó una hoja, otras siguen creciendo donde se sigue insertando,
+/// y nada las vuelve a igualar.
 ///
-/// Esta premisa — todo nodo interno rama en al menos dos — depende de que
-/// `put` rechace claves mayores que `page_size / 4` antes de tocar ninguna
-/// página (ver el chequeo al principio de `put`). Sin ese límite, dividir un
-/// nodo interno con solo dos entradas deja una mitad sin separador propio: un
-/// nodo de un solo hijo que no ramifica y falsearía esta cuenta. Si algún día
-/// se toca ese límite, hay que revisar este comentario, no solo confiar en el
-/// número.
-const MAX_DEPTH: u32 = 64;
+/// Medido, no derivado: construir un árbol y luego someterlo a churn
+/// sostenido (borrar y reinsertar sin nunca fundir páginas — exactamente el
+/// patrón de una carga de retención con desorden) da una profundidad que
+/// crece aproximadamente como `1,65·log₂(n) − 4,5`, bastante por encima del
+/// `log₂(n)` de un árbol balanceado. `churn_grows_depth_but_stays_within_the_measured_ceiling`
+/// en `delete_invariant_tests` ejercita el mismo fenómeno a menor escala (800
+/// claves, 15 000 ciclos) y confirma que la profundidad SÍ crece con el
+/// churn, no solo que se queda acotada. Extrapolando esa fórmula al mayor
+/// número de páginas direccionable (`n = 2^32`) da profundidad ≈ 50 — todavía
+/// por debajo de 64, pero con un margen de solo ~1,3×, no el ~2× que
+/// sugería el argumento del árbol balanceado, y sin cota superior demostrada:
+/// es una extrapolación de una fórmula empírica, no una prueba. Lo que
+/// restauraría la derivación limpia es fundir páginas infrautilizadas con
+/// sus hermanas en vez de solo colapsar el caso de un único hijo — trabajo de
+/// fase 2, no de esta tarea.
+///
+/// 128 duplica el margen real medido sin coste apreciable: el único precio es
+/// que detectar un ciclo genuino tarda 128 lecturas de página en vez de 64,
+/// seguimos hablando de microsegundos, no de una degradación perceptible.
+///
+/// Esta cuenta también depende de que `put` rechace claves mayores que
+/// `page_size / 4` antes de tocar ninguna página (ver el chequeo al
+/// principio de `put`): sin ese límite, dividir un nodo interno con pocas
+/// entradas puede dejar una mitad sin separador propio, un nodo de un solo
+/// hijo que no ramifica y que degenera aún más rápido de lo que ya degenera
+/// el colapso sin fusión. Si algún día se toca ese límite, o se añade fusión,
+/// hay que revisar este comentario entero, no solo el número.
+const MAX_DEPTH: u32 = 128;
 
 /// Localiza la hoja donde vive o viviría `key`, y el camino de nodos internos
 /// recorrido desde la raíz. `None` si el árbol está vacío.
