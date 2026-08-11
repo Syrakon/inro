@@ -121,7 +121,7 @@ impl Meta {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::header::{Geometry, FORMAT_MAJOR};
