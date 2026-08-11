@@ -398,6 +398,12 @@ pub fn get(src: &impl PageSource, root: PageNo, key: &[u8]) -> Result<Option<Vec
 /// Vista prestada de `entries` que le pasa `emit` a `PageBuilder::build`.
 type BorrowedEntries<'a> = [(&'a [u8], CellPayload<'a>)];
 
+/// Resultado de un punto de corte candidato que sí cupo en las dos mitades
+/// (`emit`, más abajo): los bytes ya construidos de cada mitad, si sus
+/// hijos/entradas son "planos" (`children_plain`, ver `page.rs`) y el
+/// separador que las divide.
+type SplitAttempt = (Vec<u8>, bool, Vec<u8>, Vec<u8>, bool);
+
 /// Resultado de insertar en un subárbol.
 ///
 /// **Ronda 1 de revisión de la tarea 15, hallazgos 1+2**: cada variante que
@@ -463,40 +469,42 @@ fn emit(
         return Ok(Insertion::Updated(page_no, entries_are_plain(page_type, &borrowed)));
     }
 
-    // No cabe: partir por la mitad. Con inserción ordenada esto deja la mitad
-    // izquierda llena y la derecha con sitio para lo que viene, que es el caso
-    // dominante en cargas de log.
-    let mid = entries.len() / 2;
-    // `mid == 0` solo puede pasar con una única entrada, y solo se llega aquí
-    // porque `build` ya falló para ella: no hay nada que partir, la entrada
-    // sola no cabe en una página. `put` ya rechaza claves mayores que
-    // `page_size / 4` antes de llegar aquí, así que en la práctica esto solo
-    // es alcanzable hoy por una hoja de una sola entrada cuyo VALOR es
+    // No cabe: partir en dos páginas. Con inserción ordenada, el punto medio
+    // POR CUENTA de entradas (`entries.len() / 2`) es casi siempre la
+    // división correcta — deja la mitad izquierda llena y la derecha con
+    // sitio para lo que viene, el caso dominante en cargas de log — así
+    // que se prueba primero.
+    //
+    // `mid == 0` solo puede pasar con una única entrada, y solo se llega
+    // aquí porque `build` ya falló para ella: no hay nada que partir, la
+    // entrada sola no cabe en una página. `put` ya rechaza claves mayores
+    // que `page_size / 4` antes de llegar aquí, así que en la práctica esto
+    // solo es alcanzable hoy por una hoja de una sola entrada cuyo VALOR es
     // demasiado grande (clave pequeña, valor grande) — las páginas de
-    // overflow (tarea 13) lo resolverán moviendo el valor fuera de la celda.
-    // El informe debe reflejar qué es lo que no cabe: para una hoja es la
-    // celda completa (clave + valor), no solo la clave; para un nodo interno
-    // (celda separador + hijo de 4 bytes) sigue siendo la clave, ya cubierta
-    // por el límite de `put`, así que esta rama es inalcanzable para
-    // internos, pero se deja completa por si ese límite cambiara algún día.
+    // overflow (tarea 13) lo resolverán moviendo el valor fuera de la
+    // celda. El informe debe reflejar qué es lo que no cabe: para una hoja
+    // es la celda completa (clave + valor), no solo la clave; para un nodo
+    // interno (celda separador + hijo de 4 bytes) sigue siendo la clave, ya
+    // cubierta por el límite de `put`, así que esta rama es inalcanzable
+    // para internos, pero se deja completa por si ese límite cambiara algún
+    // día.
+    let mid = entries.len() / 2;
     if mid == 0 {
         let len = match entries[0].1 {
             CellPayload::Value(v) => entries[0].0.len() + v.len(),
-            // Cuerpo fijo de 22 bytes (marca varint de 10 + 8 de longitud +
-            // 4 de primera página, ver `CellPayload::Overflow` en
-            // `page.rs`): con el límite de `page_size / 4` que ya impone
-            // `put` sobre la clave, una sola celda de overflow siempre cabe
-            // sola en una página nueva, así que esta rama es inalcanzable en
-            // la práctica — se deja completa por si ese límite cambiara.
             CellPayload::Overflow { .. } => entries[0].0.len() + 22,
             CellPayload::Child(_) => entries[0].0.len(),
         };
         return Err(Error::KeyTooLarge { len: len as u32, max: page_size });
     }
 
-    let (l, r) = borrowed.split_at(mid);
-    let sep = entries[mid].0.clone();
-
+    // Intenta construir las dos mitades para un punto de corte `mid`
+    // concreto. Devuelve `None` si ESE punto no basta — sea porque una de
+    // las dos mitades no cabe, sea porque (solo en nodos internos) la
+    // derecha se quedaría sin separador propio — para que el bucle de más
+    // abajo pruebe otro sin distinguir los dos motivos: los dos significan
+    // lo mismo, "este punto de corte no sirve, prueba otro".
+    //
     // `entries[j] = (s_j, c_j)` empareja cada separador con su hijo
     // izquierdo, y la cadena completa de hijos es `c_0, c_1, …, c_{n-1},
     // c_n(=extra)`, con `s_i` situado entre `c_i` y `c_{i+1}`. Al promover
@@ -508,60 +516,129 @@ fn emit(
     // c_mid)` no debe quedarse también ahí, o `c_mid` sería inalcanzable (la
     // izquierda nunca lo vuelve a nombrar y el padre solo enruta a la
     // derecha las claves >= `sep`, nunca las que pertenecen a `c_mid`).
-    let (left_entries, left_extra, right_entries): (&BorrowedEntries, u32, &BorrowedEntries) =
-        match page_type {
-            PageType::Internal => {
-                let promoted_child = match r[0].1 {
-                    CellPayload::Child(c) => c,
-                    CellPayload::Value(_) => unreachable!("nodo interno con valor"),
-                    CellPayload::Overflow { .. } => {
-                        unreachable!("nodo interno con valor de overflow")
+    let attempt = |mid: usize| -> Option<SplitAttempt> {
+        if mid == 0 || mid >= entries.len() {
+            return None;
+        }
+        let (l, r) = borrowed.split_at(mid);
+        let sep = entries[mid].0.clone();
+
+        let (left_entries, left_extra, right_entries): (&BorrowedEntries, u32, &BorrowedEntries) =
+            match page_type {
+                PageType::Internal => {
+                    let promoted_child = match r[0].1 {
+                        CellPayload::Child(c) => c,
+                        CellPayload::Value(_) => unreachable!("nodo interno con valor"),
+                        CellPayload::Overflow { .. } => {
+                            unreachable!("nodo interno con valor de overflow")
+                        }
+                    };
+                    let right = &r[1..];
+                    // `right` se queda sin separador propio (un nodo de un
+                    // solo hijo, que añade profundidad sin ramificar)
+                    // exactamente cuando ESTE punto de corte deja solo dos
+                    // entradas a su derecha. Antes de la búsqueda de más
+                    // abajo esto era un `debug_assert!` que asumía que solo
+                    // podía pasar en el ÚNICO punto de corte que existía
+                    // (`entries.len() / 2`); ahora es simplemente un
+                    // candidato descartado, uno más entre varios.
+                    if right.is_empty() {
+                        return None;
                     }
-                };
-                let right = &r[1..];
-                // `right` se queda sin separador propio (un nodo de un solo
-                // hijo, que añade profundidad sin ramificar) exactamente
-                // cuando la página se divide con solo dos entradas. Con el
-                // límite de tamaño de clave que impone `put`
-                // (`page_size / 4`), ninguna combinación de separador +
-                // hijo llega a ocupar suficiente página como para que dos
-                // entradas por sí solas fuercen una división — hacen falta
-                // al menos tres para que ambas mitades conserven un
-                // separador. Si esto salta, el límite de `put` tiene un
-                // agujero: no ensanchar esta comprobación, hay que cerrar
-                // ese agujero.
-                debug_assert!(
-                    !right.is_empty(),
-                    "división de nodo interno con la mitad derecha sin separador propio"
-                );
-                (l, promoted_child, right)
+                    (l, promoted_child, right)
+                }
+                _ => (l, 0, r),
+            };
+
+        // Dividir una página interna reparte sus MISMOS hijos entre las dos
+        // mitades: ninguno cambia de tipo ni gana overflow por el mero
+        // hecho de mudarse de página, así que las dos mitades heredan el
+        // mismo `children_plain` que iba a tener la página sin dividir — no
+        // hay nada que recalcular.
+        let mut lb = PageBuilder::new(page_size, page_type);
+        lb.set_extra(left_extra);
+        if page_type == PageType::Internal {
+            lb.set_children_plain(children_plain);
+        }
+        let left_bytes = lb.build(left_entries)?;
+
+        let mut rb = PageBuilder::new(page_size, page_type);
+        rb.set_extra(extra);
+        if page_type == PageType::Internal {
+            rb.set_children_plain(children_plain);
+        }
+        let right_bytes = rb.build(right_entries)?;
+
+        Some((
+            left_bytes,
+            entries_are_plain(page_type, left_entries),
+            sep,
+            right_bytes,
+            entries_are_plain(page_type, right_entries),
+        ))
+    };
+
+    // El punto medio por cuenta se prueba primero, sin ningún coste extra
+    // sobre el diseño anterior a esta corrección: si basta (el caso común,
+    // con mucha diferencia), termina aquí en dos llamadas a `build`, igual
+    // que antes.
+    //
+    // Si NO basta — tarea 19, hallazgo de las pruebas basadas en
+    // propiedades contra un oráculo `BTreeMap` — el punto medio por cuenta
+    // deja de ser sagrado. Mezclar entradas de dos espacios de claves
+    // distintos en la misma hoja o el mismo nodo interno (p. ej. catálogo +
+    // datos, o datos + un índice secundario, tarea 16 — ninguna prueba de
+    // un solo espacio de claves llega a producir esto) puede hacer que las
+    // dos mitades del punto medio ya NO compartan ningún prefijo — pierden
+    // TODA la compresión que el resto del árbol da por descontada — y
+    // entonces el punto medio por cuenta puede quedarse literalmente unos
+    // bytes corto, aunque el contenido total quepa sobrado en dos páginas
+    // cualquiera que sea el punto de corte real. Antes de esta corrección,
+    // `emit` solo probaba ESE único punto y, si cualquiera de las dos
+    // mitades no cabía, fallaba con `KeyTooLarge` — un `put` legítimo que sí
+    // cabía en dos páginas se rechazaba exactamente igual que uno que de
+    // verdad no cabe en ninguna. Reproducido de punta a punta con
+    // `a_leaf_split_that_loses_all_prefix_compression_still_succeeds`, más
+    // abajo: siete `put` sobre un `ns` con un índice secundario definido,
+    // quince entradas de tres espacios de claves distintos conviviendo en
+    // una sola hoja, el punto medio por cuenta deja la mitad izquierda un
+    // solo byte por encima de 512.
+    //
+    // La búsqueda se expande alternando hacia cada lado del punto medio —
+    // `O(n)` candidatos en el peor caso, cada uno `O(n)` para construir las
+    // dos mitades — porque el punto que sí funciona casi siempre está muy
+    // cerca del punto medio (el desajuste típico es de unos pocos bytes de
+    // compresión perdida, no una redistribución completa), así que el caso
+    // real converge en unos pocos intentos. Solo se paga este coste extra
+    // en el camino de división, ya raro de por sí, nunca en el de
+    // inserción normal — y `n` está acotado por cuántas entradas minúsculas
+    // caben en una sola página (unos cientos como mucho).
+    let mut found = attempt(mid);
+    if found.is_none() {
+        for step in 1..entries.len() {
+            if let Some(m) = mid.checked_sub(step) {
+                found = attempt(m);
+                if found.is_some() {
+                    break;
+                }
             }
-            _ => (l, 0, r),
-        };
-
-    // Dividir una página interna reparte sus MISMOS hijos entre las dos
-    // mitades: ninguno cambia de tipo ni gana overflow por el mero hecho de
-    // mudarse de página, así que las dos mitades heredan el mismo
-    // `children_plain` que iba a tener la página sin dividir — no hay nada
-    // que recalcular.
-    let mut lb = PageBuilder::new(page_size, page_type);
-    lb.set_extra(left_extra);
-    if page_type == PageType::Internal {
-        lb.set_children_plain(children_plain);
+            let m = mid + step;
+            if m < entries.len() {
+                found = attempt(m);
+                if found.is_some() {
+                    break;
+                }
+            }
+        }
     }
-    let left_bytes = lb.build(left_entries).ok_or(Error::KeyTooLarge {
-        len: entries[0].0.len() as u32,
-        max: page_size,
-    })?;
-
-    let mut rb = PageBuilder::new(page_size, page_type);
-    rb.set_extra(extra);
-    if page_type == PageType::Internal {
-        rb.set_children_plain(children_plain);
-    }
-    let right_bytes = rb.build(right_entries).ok_or(Error::KeyTooLarge {
-        len: entries[mid].0.len() as u32,
-        max: page_size,
+    // Ninguna división en dos páginas basta: el contenido combinado de
+    // verdad necesita tres o más. Fuera del alcance de esta corrección (ver
+    // el comentario de arriba, que solo cierra "una división en dos SÍ
+    // bastaba pero el punto medio por cuenta no era esa división") — sigue
+    // siendo un `Err`, nunca datos corruptos ni un pánico, la misma
+    // garantía que ya daba el código anterior a esta corrección.
+    let (left_bytes, left_plain, sep, right_bytes, right_plain) = found.ok_or_else(|| {
+        Error::KeyTooLarge { len: entries[mid].0.len() as u32, max: page_size }
     })?;
 
     let left = tx.alloc()?;
@@ -571,13 +648,7 @@ fn emit(
     if let Some(old) = old {
         tx.free(old);
     }
-    Ok(Insertion::Split {
-        left,
-        left_plain: entries_are_plain(page_type, left_entries),
-        sep,
-        right,
-        right_plain: entries_are_plain(page_type, right_entries),
-    })
+    Ok(Insertion::Split { left, left_plain, sep, right, right_plain })
 }
 
 /// Como `descend`, sigue punteros a hijos leídos del disco, así que necesita

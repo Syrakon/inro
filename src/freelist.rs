@@ -82,6 +82,49 @@ pub struct Freelist {
     /// cota defensiva contra ciclos que no sean el caso trivial de una
     /// página que se referencia a sí misma (ver su comprobación).
     hops: u32,
+    /// Cabeza de la cadena física que el `flush` MÁS RECIENTE de este mismo
+    /// `Freelist` escribió a disco, o `0` si no hay ninguna pendiente de
+    /// reciclar. **Corrección de una fuga descubierta por la tarea 19**
+    /// (propiedades contra un oráculo `BTreeMap`, `pages_are_never_lost_or_
+    /// double_allocated`): sin este campo, cada `flush` extendía el fichero
+    /// con páginas NUEVAS para serializar `groups` — nunca reutilizaba,
+    /// para no ser recursivo, ver el comentario de `flush` — pero NADA
+    /// volvía a marcar la cadena física que el `flush` ANTERIOR había
+    /// escrito como libre: `next_on_disk`/`tail_page` solo se rearman en
+    /// `load` (una vez por apertura de proceso), así que dentro de una
+    /// misma sesión — sin reabrir la base — cada `flush` sucesivo perdía
+    /// para siempre las páginas físicas del `flush` justo anterior. Medido:
+    /// +1-2 páginas por cada `commit` que liberase algo, sin cota, para
+    /// siempre — con `page_size` de 512 B, treinta `commit` de un solo
+    /// `put` hacían crecer el fichero de 4 a 59 páginas.
+    ///
+    /// El contenido lógico de esas páginas (qué números de página listaban
+    /// como libres) NUNCA se duplica: sigue viviendo, sin interrupción, en
+    /// `groups`, que `flush` nunca vacía. Solo el CONTENEDOR físico —la
+    /// página que hizo falta para volcar `groups` a disco la vez
+    /// anterior— es lo que este campo recuerda para poder reciclarlo la
+    /// PRÓXIMA vez que haga falta escribir una cadena nueva, exactamente
+    /// como `load` ya recicla la cola de una cadena heredada de una sesión
+    /// previa (`reclaimed`, más abajo). Ver el comienzo de `flush` para el
+    /// recorrido que lo consume.
+    ///
+    /// Por qué no hace falta guardar también la COLA de esta cadena: el
+    /// primer paso de `flush` (`while self.fill_from_disk(pager)? {}`) dejó
+    /// `next_on_disk` en `0` antes de que esta cadena se escribiera (es su
+    /// postcondición, ver `fill_from_disk`), así que la cadena que `flush`
+    /// construye siempre encadena su primera página con `next = 0` —
+    /// recorrerla desde la cabeza hasta encontrar `next == 0` basta, sin
+    /// necesitar saber de antemano dónde termina.
+    ///
+    /// **Reciclarla es seguro incluso si una meta más vieja y todavía
+    /// "actual" (bajo `Sync::Never`/`Interval`, la última sincronizada
+    /// puede ir varios `commit` por detrás) sigue señalando esta cadena
+    /// como su `freelist_head`/`freelist_tail`: `Db::open` degrada con
+    /// gracia si esa cadena ya no decodifica como lista de libres (ver su
+    /// comentario en `tx.rs`), así que este campo puede reciclar tan rápido
+    /// como el resto del motor recicla cualquier otra página liberada —
+    /// no necesita ninguna gestión de sincronía propia.**
+    written_head: PageNo,
     dirty: bool,
 }
 
@@ -93,6 +136,7 @@ impl Freelist {
             tail_page: 0,
             reclaimed: VecDeque::new(),
             hops: 0,
+            written_head: 0,
             dirty: false,
         }
     }
@@ -250,6 +294,33 @@ impl Freelist {
     /// recibe la misma fuente de contadores que usa el resto de la
     /// transacción (`WriterState::live_counter`, `tx.rs`), en vez de
     /// reinventar la suya.
+    ///
+    /// **Recicla dentro de la misma sesión la cadena física que el `flush`
+    /// ANTERIOR escribió** (tarea 19, hallazgo de las pruebas basadas en
+    /// propiedades: sin reciclarla, cada `flush` que libera algo dentro de
+    /// la misma apertura del proceso deja huérfano el contenedor físico
+    /// del `flush` previo — una fuga real, medida en +1-2 páginas por
+    /// commit, sin cota mientras el proceso siga abierto). Ver
+    /// `written_head`.
+    ///
+    /// **Esto puede reciclar más rápido de lo que una meta vieja aún
+    /// "vigente" tolera.** Bajo `Sync::Never` o un `Sync::Interval` largo,
+    /// la meta que sobrevive a un corte de corriente puede quedarse varias
+    /// transacciones atrás de la última escrita, y esa meta antigua
+    /// todavía puede señalar como `freelist_head`/`freelist_tail` una
+    /// página cuyo contenedor físico este reciclado ya reasignó como
+    /// página de datos en una transacción posterior no sincronizada. Sin
+    /// más, eso rompía `Db::open` con `Error::Corrupt { kind: PageType }`
+    /// al releer esa cadena — confirmado de punta a punta, la primera
+    /// versión de este reciclado hacía fallar
+    /// `crypto::tests::sync_never_or_long_interval_survives_simulated_power_loss_without_reusing_a_counter`
+    /// de forma determinista (`--features encryption` o `--features
+    /// aes`). La corrección no vive aquí: `Db::open` (`tx.rs`) degrada con
+    /// gracia si `Freelist::load` no puede decodificar la cadena heredada
+    /// — trata esa cadena concreta como irrecuperable (una fuga acotada,
+    /// solo en ese corte exacto) en vez de negarse a abrir un fichero por
+    /// lo demás legible, el mismo criterio que ya aplica la reparación de
+    /// cabecera. Ver el comentario de `Db::open` junto a esa llamada.
     pub fn flush(
         &mut self,
         pager: &Pager,
@@ -266,11 +337,50 @@ impl Freelist {
         // de RAM acotada es sobre esto último, no sobre este cierre puntual.
         while self.fill_from_disk(pager)? {}
 
-        // Las páginas de lista de libres consumidas (por `load` o por el
-        // drenaje de arriba) se incorporan aquí, antes de serializar: es la
-        // única vía por la que vuelven a quedar disponibles para `pop`, y
-        // hacerlo antes de fijar `capacity`/escribir asegura que este
-        // `flush` ya las cuenta.
+        // Recicla la cadena física que el `flush` ANTERIOR de este mismo
+        // `Freelist` escribió (`written_head`, ver su comentario): sin
+        // esto, esas páginas se pierden para siempre en cuanto ESTA llamada
+        // escribe una cadena nueva que las reemplaza — es la fuga que
+        // encontró la tarea 19. Solo recorre sus NÚMEROS de página vía
+        // `next` (`decode_freelist_page` también devuelve las entradas que
+        // listaba, aquí descartadas con `_`): ese contenido nunca dejó de
+        // vivir en `groups`, así que reincorporarlo aquí lo duplicaría —
+        // dos copias de la misma página ofreciéndose a `alloc`, un doble
+        // reparto silencioso. Solo el CONTENEDOR físico es basura nueva.
+        //
+        // Mismo guardián de ciclos que `fill_from_disk`: esta cadena la
+        // escribió este mismo `Freelist` en un `flush` anterior, así que un
+        // ciclo aquí sería un defecto de esta misma función, no corrupción
+        // externa — pero la comprobación es tan barata como la de
+        // `fill_from_disk` y sigue el mismo patrón del resto del fichero.
+        if self.written_head != 0 {
+            let mut p = self.written_head;
+            let mut hops: u32 = 0;
+            loop {
+                self.reclaimed.push_back(p);
+                hops += 1;
+                if u64::from(hops) > u64::from(pager.file_pages()?) {
+                    return Err(Error::Corrupt { page: p, kind: CorruptKind::FreelistLoop });
+                }
+                let bytes = pager.read(p)?;
+                let (_max_txn, _pages, next) = decode_freelist_page(&bytes, p)?;
+                if next == p {
+                    return Err(Error::Corrupt { page: p, kind: CorruptKind::FreelistLoop });
+                }
+                if next == 0 {
+                    break;
+                }
+                p = next;
+            }
+            self.written_head = 0;
+        }
+
+        // Las páginas de lista de libres consumidas (por `load`, por el
+        // drenaje de arriba, o por el reciclado de la cadena propia justo
+        // encima) se incorporan aquí, antes de serializar: es la única vía
+        // por la que vuelven a quedar disponibles para `pop`, y hacerlo
+        // antes de fijar `capacity`/escribir asegura que este `flush` ya
+        // las cuenta.
         while let Some(page) = self.reclaimed.pop_front() {
             self.push(page, txn);
         }
@@ -336,6 +446,13 @@ impl Freelist {
         }
 
         self.dirty = false;
+        // Recuerda la cadena que se acaba de escribir para que el PRÓXIMO
+        // `flush` de este mismo `Freelist` pueda reciclarla (ver
+        // `written_head`) — `0` si esta llamada no escribió nada (`groups`
+        // estaba vacío de punta a punta), que es exactamente el valor que
+        // ya deja sin efecto el bloque de reciclado de arriba la próxima
+        // vez.
+        self.written_head = head;
         Ok((head, tail))
     }
 
@@ -347,6 +464,57 @@ impl Freelist {
     #[allow(dead_code)]
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// Recorre TODA la cadena de libres en disco desde `head`, sin
+    /// materializar un `Freelist` ni mutar nada — a diferencia de `load`,
+    /// que solo trae a memoria cabeza y cola (ver su comentario). `visit`
+    /// recibe, por cada página física de la cadena, su propio número Y las
+    /// páginas libres que enumera.
+    ///
+    /// Único llamador: `Db::audit_pages` (tarea 19, tras la feature
+    /// `audit`), que necesita ver cada página exactamente una vez — tanto
+    /// los nodos de la propia cadena (que están "en uso" desde el punto de
+    /// vista de la contabilidad de páginas, aunque no formen parte del
+    /// árbol) como las páginas que listan (esas sí libres de verdad) — para
+    /// poder afirmar que ninguna página del fichero se pierde ni se cuenta
+    /// dos veces. Ninguna otra ruta necesita recorrer la cadena entera de
+    /// una sentada: `pop_refill` trae solo lo que hace falta, y `flush` ya
+    /// absorbe el tramo intermedio con `fill_from_disk` en bucle.
+    ///
+    /// Puramente de lectura — a diferencia del intento de reciclado que se
+    /// descartó en `flush` (ver su comentario), esto no cambia qué páginas
+    /// se ofrecen a `alloc`, así que no hereda ninguno de los problemas de
+    /// durabilidad de aquel: es sólo para el diagnóstico de `audit_pages`.
+    ///
+    /// Mismo guardián de ciclos que `fill_from_disk` (comentario ahí):
+    /// una cadena bien formada visita cada página física del fichero como
+    /// mucho una vez, así que más saltos que páginas tiene el fichero solo
+    /// puede significar un ciclo en los punteros `next`, no una lista
+    /// libre válida por grande que sea.
+    #[cfg(feature = "audit")]
+    pub(crate) fn walk_chain(
+        pager: &Pager,
+        head: PageNo,
+        mut visit: impl FnMut(PageNo, &VecDeque<PageNo>),
+    ) -> Result<()> {
+        let mut current = head;
+        let mut hops: u64 = 0;
+        let limit = u64::from(pager.file_pages()?);
+        while current != 0 {
+            hops += 1;
+            if hops > limit {
+                return Err(Error::Corrupt { page: current, kind: CorruptKind::FreelistLoop });
+            }
+            let bytes = pager.read(current)?;
+            let (_max_txn, pages, next) = decode_freelist_page(&bytes, current)?;
+            visit(current, &pages);
+            if next == current {
+                return Err(Error::Corrupt { page: current, kind: CorruptKind::FreelistLoop });
+            }
+            current = next;
+        }
+        Ok(())
     }
 
     /// Páginas libres materializadas en memoria ahora mismo (no cuenta lo

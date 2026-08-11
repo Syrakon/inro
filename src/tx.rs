@@ -297,7 +297,36 @@ impl Db {
         // misma clave para poder leerlas.
         let encryption = Self::open_data_key(&opts, &meta)?;
         let pager = Pager::new(storage, geometry, opts.cache_pages).with_encryption(encryption);
-        let mut freelist = Freelist::load(&pager, meta.freelist_head, meta.freelist_tail)?;
+        // Degrada con gracia si la cadena heredada no decodifica, en vez de
+        // propagar el error con `?` (tarea 19, autorrevisión tras el hallazgo
+        // de las pruebas basadas en propiedades). `Freelist::flush` recicla,
+        // dentro de la misma sesión, el contenedor físico que su propio
+        // `flush` anterior escribió (ver `written_head` en `freelist.rs`) —
+        // más rápido de lo que una meta antigua todavía "vigente" puede
+        // tolerar: bajo `Sync::Never` o un `Sync::Interval` largo, la meta
+        // que sobrevive a un corte de corriente puede quedarse varias
+        // transacciones atrás de la última escrita, y esa meta vieja puede
+        // seguir señalando como `freelist_head`/`freelist_tail` una página
+        // cuyo contenedor físico una transacción posterior — nunca
+        // sincronizada, así que invisible para esta apertura — ya reasignó
+        // como página de datos. Esa cadena concreta es entonces
+        // irrecuperable: sus páginas quedan perdidas (una fuga acotada,
+        // exclusiva de este corte) en vez de reincorporarse a la lista de
+        // libres, pero el resto del fichero —árbol, meta, cabecera— sigue
+        // intacto y perfectamente legible. Negarse a abrirlo por esto sería
+        // el mismo error que la reparación de cabecera de más arriba existe
+        // para evitar: un fichero legible al que el motor le niega la
+        // entrada porque una pieza SECUNDARIA de contabilidad no cuadra.
+        // Solo `Corrupt` se trata así — un `IoError` del medio subyacente
+        // (lectura fallida de verdad, no una página con el tipo cambiado)
+        // sigue siendo fatal, porque ahí no hay ninguna base razonable para
+        // asumir "esto es solo el reciclado de la tarea 19" en vez de un
+        // fallo real del almacenamiento.
+        let mut freelist = match Freelist::load(&pager, meta.freelist_head, meta.freelist_tail) {
+            Ok(f) => f,
+            Err(Error::Corrupt { .. }) => Freelist::empty(),
+            Err(e) => return Err(e),
+        };
 
         // Recuperación: las páginas más allá de `n_pages` las escribió una
         // transacción que nunca confirmó. Nadie las referencia y ningún lector
@@ -1933,6 +1962,171 @@ impl Db {
     fn indexes_for(&self, ns: u8) -> Vec<IndexDef> {
         self.indexes.lock().unwrap().iter().copied().filter(|d| d.ns == ns).collect()
     }
+}
+
+#[cfg(feature = "audit")]
+impl Db {
+    /// Comprueba que cada página de `[0, n_pages)` tiene EXACTAMENTE un
+    /// dueño (tarea 19): el prefijo fijo reservado (cabecera, meta A, meta
+    /// B en su posición actual — más el hueco que la reubicación de la
+    /// tarea 18 todavía no ha llenado, si toca), el árbol de datos completo
+    /// (recorrido desde la raíz — hojas, internos y cada cadena de overflow
+    /// que cuelgue de una hoja; TODOS los espacios de claves a la vez,
+    /// porque el catálogo y los índices secundarios viven en el mismo árbol
+    /// bajo otro prefijo de `ns`, tarea 16) o la lista de libres (los
+    /// propios nodos de la cadena Y las páginas que enumeran).
+    ///
+    /// Devuelve `Ok(false)` — no `Err` — si alguna página aparece en más de
+    /// una de esas categorías, o si alguna por debajo de `n_pages` no
+    /// aparece en ninguna: las dos son el mismo defecto de fondo ("el
+    /// asignador y el árbol o la lista de libres ya no están de acuerdo
+    /// sobre quién es dueño de esta página"), solo que en direcciones
+    /// opuestas — doble asignación y fuga. `Err` queda para corrupción de
+    /// verdad: una página que no decodifica, un tipo inesperado donde el
+    /// árbol o la lista de libres esperaban otro. Esta distinción es
+    /// deliberada: `prop_assert!(db.audit_pages().unwrap(), ...)` en
+    /// `tests/props.rs` (tarea 19) trata el `false` como el fallo que la
+    /// propiedad existe para atrapar, y deja que un `Err` — que no debería
+    /// poder ocurrir jamás sobre un árbol que este mismo motor construyó —
+    /// haga panicar el `.unwrap()`, que `proptest` captura y reduce igual.
+    ///
+    /// Recorre TODO el fichero, O(n_pages): no forma parte de ningún camino
+    /// caliente (`put`/`get`/`commit` no la llaman nunca) — es una
+    /// comprobación de integridad estilo `fsck`, para pruebas y para quien
+    /// integra este motor y quiera verificar offline que un fichero no está
+    /// corrompido. Por eso vive tras la feature `audit` en vez de sin más
+    /// bajo `std` (ver su comentario en `Cargo.toml`).
+    ///
+    /// Opera sobre la META CONFIRMADA (`self.committed`), nunca sobre una
+    /// transacción de escritura en curso: por eso es segura de llamar desde
+    /// fuera de cualquier `WriteTxn`, con el candado de escritor libre —
+    /// coherente con la firma que pide el brief, `db.audit_pages()` sobre
+    /// `&Db`, no sobre `&mut WriteTxn`.
+    pub fn audit_pages(&self) -> Result<bool> {
+        let (meta, _slot) = *self.committed.read().unwrap();
+        let n_pages = meta.n_pages;
+        let geometry = self.pager.geometry();
+
+        // Una única bolsa para las tres categorías (reservadas, árbol,
+        // lista de libres): así una página que dos de ellas reclaman a la
+        // vez — el defecto exacto que esta función existe para atrapar —
+        // se detecta sin importar en qué orden se recorran.
+        let mut seen = alloc::vec![false; n_pages as usize];
+        let mut ok = true;
+        let mut mark = |p: PageNo| match seen.get_mut(p as usize) {
+            Some(slot) if !*slot => {
+                *slot = true;
+                true
+            }
+            _ => false,
+        };
+
+        // Prefijo fijo: cabecera (0), meta A (1 — `WriteTxn::last_reserved_page`)
+        // y meta B en su posición ACTUAL (dinámica, tarea 18).
+        ok &= mark(0);
+        ok &= mark(1);
+        ok &= mark(geometry.meta_b_page);
+        // El hueco de la reubicación de la meta B, si el fichero ya lo
+        // cruzó pero la reubicación todavía no ha sucedido — mismo cálculo
+        // que `WriteTxn::pages_in_use` (ver su comentario, más arriba en
+        // este fichero): `alloc`/`commit` nunca reparten esta página
+        // (`WriteTxn::skip_meta_b_target`), así que no puede aparecer ni en
+        // el árbol ni en la lista de libres hasta que la reubicación de
+        // verdad la libere.
+        let target = WriteTxn::final_meta_b_page(geometry.page_size);
+        if target != geometry.meta_b_page && n_pages > target {
+            ok &= mark(target);
+        }
+
+        if meta.root != 0 {
+            ok &= audit_walk_tree(&self.pager, meta.root, &mut mark)?;
+        }
+
+        if meta.freelist_head != 0 {
+            let mut freelist_ok = true;
+            Freelist::walk_chain(&self.pager, meta.freelist_head, |chain_page, entries| {
+                freelist_ok &= mark(chain_page);
+                for &p in entries {
+                    freelist_ok &= mark(p);
+                }
+            })?;
+            ok &= freelist_ok;
+        }
+
+        Ok(ok && seen.iter().all(|&b| b))
+    }
+}
+
+/// Recorre el árbol de datos desde `page_no`, marcando con `mark` cada
+/// página que alcanza — hojas, internos y cada cadena de overflow que
+/// cuelgue de una hoja. Función libre, no método de `Db` (tarea 19, mismo
+/// patrón que ya usa el resto de este fichero con `tree.rs`): así
+/// `Db::audit_pages` puede pasarle el mismo cierre `mark` que ya alimentó
+/// con el prefijo reservado, sin pelearse con el comprobador de préstamos
+/// por tenerlo capturado dos veces a la vez dentro de un método.
+///
+/// Corta en cuanto `mark` dice "ya vista" — no sigue explorando desde ahí —
+/// así que una página que aparece dos veces en el árbol (un DAG corrupto
+/// con hijos compartidos) nunca hace recorrer el mismo subárbol dos veces:
+/// la profundidad de la recursión queda acotada por `n_pages`, sin
+/// necesitar un contador de saltos aparte como `tree::RangeBudget`.
+#[cfg(feature = "audit")]
+fn audit_walk_tree(
+    pager: &Pager,
+    page_no: PageNo,
+    mark: &mut impl FnMut(PageNo) -> bool,
+) -> Result<bool> {
+    if !mark(page_no) {
+        return Ok(false);
+    }
+    let bytes = pager.read(page_no)?;
+    let page = crate::page::PageRef::parse(&bytes, page_no)?;
+    let mut ok = true;
+    match page.page_type() {
+        crate::page::PageType::Leaf => {
+            for i in 0..page.n_slots() {
+                if let crate::page::LeafValue::Overflow { first, .. } = page.leaf_value(i) {
+                    ok &= audit_walk_overflow(pager, first, mark)?;
+                }
+            }
+        }
+        crate::page::PageType::Internal => {
+            for i in 0..page.n_slots() {
+                ok &= audit_walk_tree(pager, page.child(i), mark)?;
+            }
+            ok &= audit_walk_tree(pager, page.extra(), mark)?;
+        }
+        _ => return Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::PageType }),
+    }
+    Ok(ok)
+}
+
+/// Recorre una cadena de overflow desde `first`, marcando cada página con
+/// `mark`. A diferencia de `audit_walk_tree`, iterativa y no recursiva: una
+/// cadena de overflow puede tener cientos de páginas para un solo valor
+/// grande (tarea 13), y nada limita su longitud a la profundidad de un
+/// árbol bien formado.
+#[cfg(feature = "audit")]
+fn audit_walk_overflow(
+    pager: &Pager,
+    first: PageNo,
+    mark: &mut impl FnMut(PageNo) -> bool,
+) -> Result<bool> {
+    let mut ok = true;
+    let mut current = first;
+    while current != 0 {
+        if !mark(current) {
+            ok = false;
+            break;
+        }
+        let bytes = pager.read(current)?;
+        let page = crate::page::PageRef::parse(&bytes, current)?;
+        if page.page_type() != crate::page::PageType::Overflow {
+            return Err(Error::Corrupt { page: current, kind: crate::CorruptKind::PageType });
+        }
+        current = page.extra();
+    }
+    Ok(ok)
 }
 
 #[cfg(all(test, feature = "std"))]

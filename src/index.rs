@@ -766,4 +766,81 @@ mod tests {
         let wide = r.scan_index(1, b"madrid", &wide_to).unwrap();
         assert_eq!(wide, alloc::vec![b"aaa".to_vec(), b"\xff\xff\xff".to_vec()], "un límite con margen sí las ve a las dos");
     }
+
+    /// Regresión de la tarea 19 (pruebas basadas en propiedades contra un
+    /// oráculo `BTreeMap`): una hoja que mezcla entradas de TRES espacios
+    /// de claves distintos — catálogo, datos y un índice secundario —
+    /// puede perder TODA la compresión de prefijo compartida entre ellas
+    /// (cada espacio empieza por un byte de `ns` distinto), y entonces el
+    /// punto de corte por CUENTA de entradas que usaba `tree::emit` al
+    /// dividir una hoja podía quedarse literalmente un byte corto — aunque
+    /// el contenido combinado cupiera de sobra en dos páginas — y fallar
+    /// con `Error::KeyTooLarge` en un `put` perfectamente legítimo.
+    ///
+    /// Extraído de `proptest` (`tests/props.rs`,
+    /// `the_secondary_index_matches_a_recomputed_index_after_every_op`),
+    /// que lo encuentra de forma fiable con un puñado de casos aleatorios —
+    /// reproducido aquí con `PROPTEST_CASES=300
+    /// PROPTEST_MAX_SHRINK_ITERS=200000 cargo test --test props
+    /// the_secondary_index_matches_a_recomputed_index_after_every_op` y
+    /// reducido a mano desde ahí hasta estos nueve `put`. **El nombre del
+    /// índice importa tanto como las claves y valores**: forma parte del
+    /// registro de catálogo (`ns` 0x00) que comparte hoja con los demás, así
+    /// que cambiar su longitud en un solo byte desplaza el presupuesto justo
+    /// lo suficiente para dejar de reproducir el fallo — confirmado de
+    /// primera mano: una versión anterior de esta prueba usaba `"cubo"` (4
+    /// bytes) en vez de `"bucket"` (6, el mismo nombre que usa la propiedad)
+    /// y pasaba sin ejercitar nada, con o sin la corrección de `emit`.
+    #[test]
+    fn a_leaf_split_that_loses_all_prefix_compression_still_succeeds() {
+        fn bucket_of(_key: &[u8], value: &[u8]) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+            alloc::vec![alloc::vec![value.first().copied().unwrap_or(0)]]
+        }
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        db.define_index(IndexDef {
+            id: 1,
+            name: "bucket",
+            version: 1,
+            ns: 0x01,
+            unique: false,
+            extract: bucket_of,
+        })
+        .unwrap();
+
+        // `vfirst` es el único byte no nulo de cada valor: como `bucket_of`
+        // solo mira el primer byte, sigue eligiendo a qué cubo del índice
+        // cae cada fila sin necesitar un valor de verdad — el resto de
+        // bytes son de relleno, para llegar al tamaño exacto que hace falta
+        // para que la hoja combinada (catálogo + datos + índice) se quede
+        // corta con el punto de corte por CUENTA de entradas.
+        let ops: &[(&[u8], usize, u8)] = &[
+            (&[0], 77, 0),
+            (&[0, 0, 0, 0], 78, 74),
+            (&[], 21, 74),
+            (&[0, 0, 0, 1], 92, 0),
+            (&[2], 122, 64),
+            (&[3], 8, 64),
+            (&[2, 0, 0], 111, 64),
+            (&[5], 89, 0),
+            (&[2, 0], 110, 0),
+        ];
+        for (k, vlen, vfirst) in ops {
+            let mut v = alloc::vec![0u8; *vlen];
+            if !v.is_empty() {
+                v[0] = *vfirst;
+            }
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, k, &v).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let r = db.begin_read();
+        for (k, vlen, _) in ops {
+            assert_eq!(
+                r.get(0x01, k).unwrap().map(|v| v.len()),
+                Some(*vlen),
+                "clave {k:?} no sobrevivió a la división"
+            );
+        }
+    }
 }

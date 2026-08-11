@@ -39,8 +39,34 @@ unsafe_code = "forbid"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
 aes-gcm = { version = "0.10", default-features = false, features = ["alloc", "aes"], optional = true }
 
+# Solo para pruebas (tarea 19): las dependencias de desarrollo no cuentan
+# contra la regla de cero dependencias de runtime — no viajan al binario del
+# usuario, `cargo build` (sin `--tests`) ni siquiera las resuelve — y no
+# llegan al paquete publicado en crates.io (ver `include`, arriba: `tests/`
+# no está en la lista blanca). `tests/props.rs` es el único consumidor.
+[dev-dependencies]
+proptest = "1"
+
 [features]
-default = ["std"]
+default = ["std", "audit"]
 std = []
 encryption = ["dep:chacha20poly1305"]
 aes = ["encryption", "dep:aes-gcm"]
+# `Db::audit_pages` (tarea 19): recorre TODO el fichero — árbol, cadenas de
+# overflow y lista de libres — para comprobar que cada página tiene
+# exactamente un dueño. Coste O(n_pages), nada que ver con el camino
+# caliente de `put`/`get`/`commit`, así que se ofrece como una decisión de
+# compilación aparte en vez de colgarla sin más de `std` — coherente con el
+# resto de este `Cargo.toml`, donde cada feature es una elección explícita,
+# no una comodidad activada por defecto sin que nadie la pidiera. Va en
+# `default` de todos modos: las cinco combinaciones de compilación que este
+# proyecto verifica en cada tarea (`cargo test`, `--features encryption`,
+# `--features aes`, `--no-default-features`, `cargo build
+# --no-default-features`) la ejercitan sin necesitar `--features audit` en
+# ningún comando — solo queda fuera si alguien pide explícitamente
+# `--no-default-features` (que ya deja fuera `std`, y con él `Db` entero) o
+# construye a mano con `--no-default-features --features std` para no
+# pagar ni el código de esta comprobación en un binario final. Depende de
+# `std`, no al revés: pedir `audit` sin más ya activa `std`, porque
+# `audit_pages` vive en `tx.rs`, que no existe sin esa feature.
+audit = ["std"]
