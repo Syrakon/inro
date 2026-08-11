@@ -2,6 +2,20 @@ use crate::{crc32, varint, CorruptKind, Error, PageNo, Result};
 
 pub const PAGE_HEADER_SIZE: usize = 20;
 
+/// Longitud de valor imposible en línea: marca una referencia de overflow.
+/// Una celda de hoja normal guarda `[len_valor varint][bytes]`; una de
+/// overflow guarda `[OVERFLOW_MARKER varint][len_real u64][primera página
+/// u32]`. Un valor de longitud cero real se distingue sin ambigüedad porque
+/// `0 != OVERFLOW_MARKER`: la celda termina justo tras el varint, como
+/// cualquier otro valor en línea.
+///
+/// Es una marca, no una deducción a partir del tamaño de la celda: deducirlo
+/// crearía una dependencia circular, porque `cell_end` necesitaría saber si
+/// la celda es de overflow para calcular su tamaño, y saberlo requeriría ya
+/// conocer `cell_end`. Cabe en diez bytes de varint, pero solo aparece en
+/// celdas de overflow, que son minoría, así que el coste es irrelevante.
+const OVERFLOW_MARKER: u64 = u64::MAX;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PageType {
@@ -103,7 +117,14 @@ impl<'a> PageRef<'a> {
             PageType::Leaf => {
                 let b = self.bytes.get(after_suffix..)?;
                 let (value_len, n2) = varint::read(b)?;
-                let end = after_suffix.checked_add(n2)?.checked_add(value_len as usize)?;
+                let body = after_suffix.checked_add(n2)?;
+                let end = if value_len == OVERFLOW_MARKER {
+                    // `[len_real u64][primera página u32]`, no el valor
+                    // inline: ver `OVERFLOW_MARKER`.
+                    body.checked_add(12)?
+                } else {
+                    body.checked_add(value_len as usize)?
+                };
                 (end <= self.bytes.len()).then_some(end)
             }
             PageType::Internal => {
@@ -126,7 +147,9 @@ impl<'a> PageRef<'a> {
         &self.bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + self.prefix_len]
     }
 
-    /// En nodos internos, el hijo más a la derecha. Cero en el resto de tipos.
+    /// En nodos internos, el hijo más a la derecha. En páginas de overflow,
+    /// la siguiente página de la cadena (cero si es la última). Cero en el
+    /// resto de tipos.
     pub fn extra(&self) -> u32 {
         u32::from_le_bytes(self.bytes[12..16].try_into().unwrap())
     }
@@ -164,13 +187,37 @@ impl<'a> PageRef<'a> {
         Err(lo)
     }
 
-    /// Valor de la celda `i`. Solo válido en páginas hoja.
+    /// Valor de la celda `i`, asumiendo que está en línea. Solo válido en
+    /// páginas hoja, y solo en celdas que no son de overflow: sobre una
+    /// celda de overflow, `value_len` es `OVERFLOW_MARKER` y este método
+    /// intentaría tomar un slice de ese tamaño, saliéndose de la página.
+    /// Desde la tarea 13, una hoja puede mezclar ambos tipos de celda; el
+    /// llamante debe usar `leaf_value` para distinguirlos antes de decidir
+    /// cuál de los dos leer.
     pub fn value(&self, i: usize) -> &'a [u8] {
         let off = self.slot(i);
         let (suffix_len, n1) = varint::read(&self.bytes[off..]).expect("validado en parse");
         let after = off + n1 + suffix_len as usize;
         let (value_len, n2) = varint::read(&self.bytes[after..]).expect("validado en parse");
         &self.bytes[after + n2..after + n2 + value_len as usize]
+    }
+
+    /// Valor de la celda `i`, distinguiendo si está en línea o es una
+    /// referencia a una cadena de páginas de overflow. Es la variante segura
+    /// de `value` para hojas que puedan contener celdas de overflow.
+    pub fn leaf_value(&self, i: usize) -> LeafValue<'a> {
+        let off = self.slot(i);
+        let (suffix_len, n1) = varint::read(&self.bytes[off..]).expect("validado en parse");
+        let after = off + n1 + suffix_len as usize;
+        let (value_len, n2) = varint::read(&self.bytes[after..]).expect("validado en parse");
+        let body = after + n2;
+        if value_len == OVERFLOW_MARKER {
+            let len = u64::from_le_bytes(self.bytes[body..body + 8].try_into().unwrap());
+            let first = u32::from_le_bytes(self.bytes[body + 8..body + 12].try_into().unwrap());
+            LeafValue::Overflow { len, first }
+        } else {
+            LeafValue::Inline(&self.bytes[body..body + value_len as usize])
+        }
     }
 
     /// Hijo izquierdo del separador `i`. Solo válido en nodos internos.
@@ -191,10 +238,21 @@ impl<'a> PageRef<'a> {
     }
 }
 
+/// Valor de una celda de hoja: en línea, o referencia a una cadena de
+/// páginas de overflow (tarea 13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafValue<'a> {
+    Inline(&'a [u8]),
+    Overflow { len: u64, first: PageNo },
+}
+
 /// Carga útil de una celda, según el tipo de página.
 #[derive(Debug, Clone, Copy)]
 pub enum CellPayload<'a> {
     Value(&'a [u8]),
+    /// Valor de hoja que ya vive en una cadena de overflow: la celda solo
+    /// guarda la referencia (`len`, `first`), no los bytes.
+    Overflow { len: u64, first: PageNo },
     Child(PageNo),
 }
 
@@ -273,6 +331,10 @@ impl PageBuilder {
             let n1 = varint::write(&mut tmp, suffix.len() as u64);
             let body_len = match payload {
                 CellPayload::Value(v) => varint::len(v.len() as u64) + v.len(),
+                // `varint::len(OVERFLOW_MARKER)` es siempre 10 (u64::MAX
+                // necesita los 10 bytes completos de un varint LEB128), más
+                // los 12 bytes de `[len_real u64][primera página u32]`.
+                CellPayload::Overflow { .. } => varint::len(OVERFLOW_MARKER) + 12,
                 CellPayload::Child(_) => 4,
             };
             let cell_len = n1 + suffix.len() + body_len;
@@ -292,6 +354,14 @@ impl PageBuilder {
                     b[at..at + n2].copy_from_slice(&tmp[..n2]);
                     at += n2;
                     b[at..at + v.len()].copy_from_slice(v);
+                }
+                CellPayload::Overflow { len, first } => {
+                    let n2 = varint::write(&mut tmp, OVERFLOW_MARKER);
+                    b[at..at + n2].copy_from_slice(&tmp[..n2]);
+                    at += n2;
+                    b[at..at + 8].copy_from_slice(&len.to_le_bytes());
+                    at += 8;
+                    b[at..at + 4].copy_from_slice(&first.to_le_bytes());
                 }
                 CellPayload::Child(c) => {
                     b[at..at + 4].copy_from_slice(&c.to_le_bytes());

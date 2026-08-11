@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 
-use crate::page::{CellPayload, PageBuilder, PageRef, PageType};
+use crate::page::{CellPayload, LeafValue, PageBuilder, PageRef, PageType, PAGE_HEADER_SIZE};
 use crate::tx::{PageSource, WriteTxn};
-use crate::{Error, PageNo, Result};
+use crate::{CorruptKind, Error, PageNo, Result};
 
 /// Posición de `key` entre las claves de la página, teniendo en cuenta el
 /// prefijo común.
@@ -130,6 +130,189 @@ pub fn descend(
     }
 }
 
+/// Umbral a partir del cual un valor va a páginas de overflow: un cuarto de
+/// página, de modo que siempre quepan al menos cuatro entradas por hoja y la
+/// división pueda avanzar. Mismo límite, por la misma razón, que `put` le
+/// impone al tamaño de una clave (ver el chequeo al principio de `put`):
+/// mantener los dos iguales los mantiene comprensibles.
+pub fn overflow_threshold(page_size: u32) -> usize {
+    page_size as usize / 4
+}
+
+/// Bytes de datos que caben en una página de overflow: la página menos su
+/// cabecera estándar, cuyo campo `extra` encadena con la siguiente.
+fn overflow_capacity(page_size: u32) -> usize {
+    page_size as usize - PAGE_HEADER_SIZE
+}
+
+/// Escribe `value` en una cadena nueva de páginas de overflow y devuelve su
+/// longitud real y la primera página de la cadena: la referencia que
+/// `insert_rec` guarda en la celda de hoja.
+///
+/// Se asignan todas las páginas antes de escribir ninguna, para poder
+/// enlazar cada una con la siguiente (su `next`, en el campo `extra` de la
+/// cabecera) en una sola pasada.
+pub fn write_overflow(tx: &mut WriteTxn, value: &[u8]) -> Result<(u64, PageNo)> {
+    let page_size = tx.page_size();
+    let capacity = overflow_capacity(page_size);
+    let chunks: Vec<&[u8]> = value.chunks(capacity).collect();
+
+    let mut pages = Vec::with_capacity(chunks.len());
+    for _ in 0..chunks.len() {
+        pages.push(tx.alloc()?);
+    }
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let next = pages.get(i + 1).copied().unwrap_or(0);
+        let mut b = alloc::vec![0u8; page_size as usize];
+        b[0] = PageType::Overflow as u8;
+        b[12..16].copy_from_slice(&next.to_le_bytes());
+        b[4..6].copy_from_slice(&(PAGE_HEADER_SIZE as u16).to_le_bytes());
+        b[6..8].copy_from_slice(&(page_size as u16).to_le_bytes());
+        b[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + chunk.len()].copy_from_slice(chunk);
+        let mut h = crate::crc32::Hasher::new();
+        h.update(&b[..8]);
+        h.update(&b[12..]);
+        b[8..12].copy_from_slice(&h.finish().to_le_bytes());
+        tx.write_page(pages[i], &b)?;
+    }
+
+    // `pages.first()`, no `pages[0]`: con `value` vacío, `chunks` (y por
+    // tanto `pages`) está vacío. `insert_rec` nunca llama a esta función con
+    // un valor así — solo lo hace por encima de `overflow_threshold`, que
+    // nunca es cero — pero `write_overflow` es pública y nada impide a otro
+    // llamante pasarle `&[]`; con `pages[0]` eso entraría en pánico en vez
+    // de devolver, con sentido, `(0, 0)`: longitud real cero, sin cadena.
+    Ok((value.len() as u64, pages.first().copied().unwrap_or(0)))
+}
+
+/// Lee de vuelta los `len` bytes de una cadena de overflow que empieza en
+/// `first`.
+///
+/// Acotado en el número de páginas que recorre, no solo en el resultado: es
+/// el mismo requisito que ya vale para `descend` (todo recorrido de punteros
+/// leídos de disco debe estarlo), pero aquí hay una cota más ajustada que la
+/// de `descend` porque `len` se conoce de antemano. Una cadena legítima
+/// nunca necesita más páginas que `ceil(len / capacidad_por_página)` —
+/// exactamente las que trocea `write_overflow`, ni una más — así que
+/// superar esa cifra sin haber reunido `len` bytes es un ciclo en los
+/// punteros `next`, no una cadena válida. La capacidad se calcula a partir
+/// del tamaño real de la primera página leída: todas las páginas del mismo
+/// fichero comparten tamaño, así que basta calcularla una vez.
+pub fn read_overflow(src: &impl PageSource, len: u64, first: PageNo) -> Result<Vec<u8>> {
+    // Sin `with_capacity(len as usize)`: `len` viene de una celda leída de
+    // disco, y si esa celda está corrompida (deliberadamente o no, pero con
+    // CRC válido) `len` puede ser arbitrariamente grande — hasta `u64::MAX`.
+    // Reservar esa cantidad de golpe intentaría una asignación enorme antes
+    // de leer una sola página de la cadena, mucho antes de que la cota de
+    // pasos de abajo tuviera ocasión de detectar nada. Crecer con
+    // `extend_from_slice` reparte el coste entre iteraciones reales.
+    let mut out = Vec::new();
+    let mut current = first;
+    let mut hops: u64 = 0;
+    let mut max_hops: Option<u64> = None;
+    while current != 0 && (out.len() as u64) < len {
+        let bytes = src.read_page(current)?;
+        let page = PageRef::parse(&bytes, current)?;
+        if page.page_type() != PageType::Overflow {
+            return Err(Error::Corrupt { page: current, kind: CorruptKind::PageType });
+        }
+        let available = bytes.len() - PAGE_HEADER_SIZE;
+        let max = *max_hops.get_or_insert_with(|| {
+            let capacity = core::cmp::max(available as u64, 1);
+            len.div_ceil(capacity).max(1)
+        });
+        hops += 1;
+        if hops > max {
+            return Err(Error::Corrupt { page: first, kind: CorruptKind::OverflowLoop });
+        }
+        let remaining = (len - out.len() as u64) as usize;
+        let take = core::cmp::min(remaining, available);
+        out.extend_from_slice(&bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + take]);
+        current = page.extra();
+    }
+    if out.len() as u64 != len {
+        return Err(Error::Corrupt { page: first, kind: CorruptKind::CellBounds });
+    }
+    Ok(out)
+}
+
+/// Libera toda la cadena de páginas de overflow que empieza en `first`.
+///
+/// Acotado en el número de páginas que recorre, igual que `read_overflow` y
+/// por la misma razón general (`descend`), pero sin su cota ajustada: esta
+/// función, fijada por la interfaz de la tarea, solo recibe `first`, no la
+/// longitud del valor, así que no puede calcular cuántas páginas *debería*
+/// tener la cadena. La cota disponible sin cambiar la firma es
+/// `tx.n_pages()`: el fichero entero no puede tener más páginas *distintas*
+/// que las que existen en él, así que una cadena acíclica jamás la supera —
+/// superarla es la prueba de un ciclo en los punteros `next`.
+///
+/// Si un ciclo dispara el `Err` de más abajo, esta función ya habrá llamado
+/// a `tx.free()` varias veces sobre las mismas páginas repetidas del ciclo —
+/// no hay forma de evitarlo sin memoria adicional para recordar qué páginas
+/// se han visto. Es inofensivo solo porque el contrato ya establecido para
+/// cualquier `Err` de esta transacción (ver la nota de `put`) es abandonarla
+/// sin `commit`: `own_free`, donde van a parar esas liberaciones repetidas
+/// por ser páginas asignadas por esta misma transacción, es puramente local
+/// a `WriteTxn` y desaparece con ella si nunca confirma.
+pub fn free_overflow(tx: &mut WriteTxn, first: PageNo) -> Result<()> {
+    let max_hops = u64::from(tx.n_pages());
+    let mut current = first;
+    let mut hops: u64 = 0;
+    while current != 0 {
+        hops += 1;
+        if hops > max_hops {
+            return Err(Error::Corrupt { page: first, kind: CorruptKind::OverflowLoop });
+        }
+        let bytes = tx.read_page(current)?;
+        let page = PageRef::parse(&bytes, current)?;
+        // Como en `read_overflow`: sin comprobar el tipo, una cadena `first`
+        // corrupta que apuntara a una página viva del árbol (hoja o
+        // interna) liberaría esa página en vez de fallar — el campo
+        // `extra()` existe en todos los tipos de página, así que seguiría
+        // "avanzando" sobre estructura que no es una cadena de overflow en
+        // absoluto.
+        if page.page_type() != PageType::Overflow {
+            return Err(Error::Corrupt { page: current, kind: CorruptKind::PageType });
+        }
+        let next = page.extra();
+        tx.free(current);
+        current = next;
+    }
+    Ok(())
+}
+
+/// Valor de hoja pendiente de escribir tras reconstruir sus entradas:
+/// copiado en memoria si está en línea, o solo la referencia si ya vive en
+/// una cadena de overflow. Reconstruir una hoja para tocar UNA entrada no
+/// debe copiar los bytes de un valor grande de otra entrada que ni siquiera
+/// cambia — con overflow esos bytes pueden ser megabytes.
+enum LeafPayload {
+    Inline(Vec<u8>),
+    Overflow { len: u64, first: PageNo },
+}
+
+impl LeafPayload {
+    fn as_cell_payload(&self) -> CellPayload<'_> {
+        match self {
+            LeafPayload::Inline(v) => CellPayload::Value(v.as_slice()),
+            LeafPayload::Overflow { len, first } => {
+                CellPayload::Overflow { len: *len, first: *first }
+            }
+        }
+    }
+}
+
+impl<'a> From<LeafValue<'a>> for LeafPayload {
+    fn from(v: LeafValue<'a>) -> Self {
+        match v {
+            LeafValue::Inline(b) => LeafPayload::Inline(b.to_vec()),
+            LeafValue::Overflow { len, first } => LeafPayload::Overflow { len, first },
+        }
+    }
+}
+
 /// Valor asociado a `key`, o `None` si no existe.
 pub fn get(src: &impl PageSource, root: PageNo, key: &[u8]) -> Result<Option<Vec<u8>>> {
     let Some((leaf, _)) = descend(src, root, key)? else {
@@ -138,7 +321,10 @@ pub fn get(src: &impl PageSource, root: PageNo, key: &[u8]) -> Result<Option<Vec
     let bytes = src.read_page(leaf)?;
     let page = PageRef::parse(&bytes, leaf)?;
     match search_key(&page, key) {
-        Ok(i) => Ok(Some(page.value(i).to_vec())),
+        Ok(i) => Ok(Some(match page.leaf_value(i) {
+            LeafValue::Inline(v) => v.to_vec(),
+            LeafValue::Overflow { len, first } => read_overflow(src, len, first)?,
+        })),
         Err(_) => Ok(None),
     }
 }
@@ -198,6 +384,13 @@ fn emit(
     if mid == 0 {
         let len = match entries[0].1 {
             CellPayload::Value(v) => entries[0].0.len() + v.len(),
+            // Cuerpo fijo de 22 bytes (marca varint de 10 + 8 de longitud +
+            // 4 de primera página, ver `CellPayload::Overflow` en
+            // `page.rs`): con el límite de `page_size / 4` que ya impone
+            // `put` sobre la clave, una sola celda de overflow siempre cabe
+            // sola en una página nueva, así que esta rama es inalcanzable en
+            // la práctica — se deja completa por si ese límite cambiara.
+            CellPayload::Overflow { .. } => entries[0].0.len() + 22,
             CellPayload::Child(_) => entries[0].0.len(),
         };
         return Err(Error::KeyTooLarge { len: len as u32, max: page_size });
@@ -223,6 +416,9 @@ fn emit(
                 let promoted_child = match r[0].1 {
                     CellPayload::Child(c) => c,
                     CellPayload::Value(_) => unreachable!("nodo interno con valor"),
+                    CellPayload::Overflow { .. } => {
+                        unreachable!("nodo interno con valor de overflow")
+                    }
                 };
                 let right = &r[1..];
                 // `right` se queda sin separador propio (un nodo de un solo
@@ -289,32 +485,55 @@ fn insert_rec(
 
     match page.page_type() {
         PageType::Leaf => {
+            // Convertir el valor entrante antes de tocar las entradas de la
+            // hoja: si es grande, escribe su propia cadena de overflow y
+            // aquí solo se guarda la referencia. `Option` porque se consume
+            // una única vez, al insertarlo en su posición final más abajo
+            // (en `Ok(i)` reemplaza; en `Err(i)` se inserta nuevo) —
+            // moverlo evita clonar un valor potencialmente enorme.
+            let mut new_payload = Some(if value.len() > overflow_threshold(tx.page_size()) {
+                let (len, first) = write_overflow(tx, value)?;
+                LeafPayload::Overflow { len, first }
+            } else {
+                LeafPayload::Inline(value.to_vec())
+            });
+
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page.n_slots() + 1);
-            let mut values: Vec<Vec<u8>> = Vec::with_capacity(page.n_slots() + 1);
+            let mut payloads: Vec<LeafPayload> = Vec::with_capacity(page.n_slots() + 1);
             match search_key(&page, key) {
                 Ok(i) => {
                     for j in 0..page.n_slots() {
                         keys.push(page.key(j));
-                        values.push(if j == i { value.to_vec() } else { page.value(j).to_vec() });
+                        if j == i {
+                            // Se reemplaza esta entrada: su cadena de
+                            // overflow anterior, si tenía una, ya no la
+                            // referencia nadie.
+                            if let LeafValue::Overflow { first, .. } = page.leaf_value(j) {
+                                free_overflow(tx, first)?;
+                            }
+                            payloads.push(new_payload.take().expect("se consume una sola vez"));
+                        } else {
+                            payloads.push(LeafPayload::from(page.leaf_value(j)));
+                        }
                     }
                 }
                 Err(i) => {
                     for j in 0..i {
                         keys.push(page.key(j));
-                        values.push(page.value(j).to_vec());
+                        payloads.push(LeafPayload::from(page.leaf_value(j)));
                     }
                     keys.push(key.to_vec());
-                    values.push(value.to_vec());
+                    payloads.push(new_payload.take().expect("se consume una sola vez"));
                     for j in i..page.n_slots() {
                         keys.push(page.key(j));
-                        values.push(page.value(j).to_vec());
+                        payloads.push(LeafPayload::from(page.leaf_value(j)));
                     }
                 }
             }
             let entries: Vec<(Vec<u8>, CellPayload)> = keys
                 .iter()
-                .zip(values.iter())
-                .map(|(k, v)| (k.clone(), CellPayload::Value(v.as_slice())))
+                .zip(payloads.iter())
+                .map(|(k, p)| (k.clone(), p.as_cell_payload()))
                 .collect();
             emit(tx, Some(page_no), PageType::Leaf, 0, &entries)
         }
@@ -392,7 +611,19 @@ pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<
     }
 
     if root == 0 {
-        let entries = alloc::vec![(key.to_vec(), CellPayload::Value(value))];
+        // Árbol vacío: este camino no pasa por `insert_rec`, así que tiene
+        // que convertir el valor a overflow por su cuenta — de lo
+        // contrario, la primera inserción de un valor grande en una base
+        // nueva reconstruiría la hoja con el valor entero en línea y
+        // `emit` la rechazaría con `KeyTooLarge`, exactamente el defecto
+        // que este árbol de páginas de overflow existe para evitar.
+        let payload = if value.len() > overflow_threshold(page_size) {
+            let (len, first) = write_overflow(tx, value)?;
+            CellPayload::Overflow { len, first }
+        } else {
+            CellPayload::Value(value)
+        };
+        let entries = alloc::vec![(key.to_vec(), payload)];
         return match emit(tx, None, PageType::Leaf, 0, &entries)? {
             Insertion::Updated(p) => Ok(p),
             Insertion::Split { .. } => unreachable!(
@@ -442,22 +673,29 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
             let Ok(hit) = search_key(&page, key) else {
                 return Ok(Removal::Unchanged);
             };
+            // La cadena de overflow de la entrada borrada, si tenía una, ya
+            // no la referencia nadie: liberarla en los dos caminos de
+            // salida (hoja que se queda vacía, y hoja que se reconstruye
+            // sin ella).
+            if let LeafValue::Overflow { first, .. } = page.leaf_value(hit) {
+                free_overflow(tx, first)?;
+            }
             if page.n_slots() == 1 {
                 tx.free(page_no);
                 return Ok(Removal::Gone);
             }
             let mut keys = Vec::with_capacity(page.n_slots() - 1);
-            let mut values = Vec::with_capacity(page.n_slots() - 1);
+            let mut payloads: Vec<LeafPayload> = Vec::with_capacity(page.n_slots() - 1);
             for j in 0..page.n_slots() {
                 if j != hit {
                     keys.push(page.key(j));
-                    values.push(page.value(j).to_vec());
+                    payloads.push(LeafPayload::from(page.leaf_value(j)));
                 }
             }
             let entries: Vec<(Vec<u8>, CellPayload)> = keys
                 .iter()
-                .zip(values.iter())
-                .map(|(k, v)| (k.clone(), CellPayload::Value(v.as_slice())))
+                .zip(payloads.iter())
+                .map(|(k, p)| (k.clone(), p.as_cell_payload()))
                 .collect();
             match emit(tx, Some(page_no), PageType::Leaf, 0, &entries)? {
                 Insertion::Updated(p) => Ok(Removal::Updated(p)),
@@ -505,7 +743,7 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
                         // realidad sería corrupción, no un caso normal más.
                         match entries.pop() {
                             Some((_, CellPayload::Child(c))) => extra = c,
-                            Some((_, CellPayload::Value(_))) => {
+                            Some((_, CellPayload::Value(_) | CellPayload::Overflow { .. })) => {
                                 unreachable!("nodo interno con valor: `entries` solo contiene `CellPayload::Child`")
                             }
                             None => {
@@ -912,25 +1150,24 @@ mod put_tests {
         assert_eq!(get(&tx, root, &key).unwrap().as_deref(), Some(b"v".as_slice()));
     }
 
-    /// Regresión del hallazgo 3 de la revisión: cuando `emit` no puede
-    /// construir una hoja de una sola entrada porque el VALOR es demasiado
-    /// grande (no la clave, que aquí es diminuta y pasa de sobra el chequeo
-    /// de `put`), el error debe reportar la longitud de la celda completa
-    /// (clave + valor), no solo la de la clave — si no, quien reciba el error
-    /// no puede saber qué recortar.
+    /// Regresión del hallazgo 3 de la revisión de la tarea 11, ACTUALIZADA
+    /// por la tarea 13. Entonces, cuando `emit` no podía construir una hoja
+    /// de una sola entrada porque el VALOR era demasiado grande (no la
+    /// clave, diminuta aquí), `put` fallaba con `KeyTooLarge` reportando la
+    /// longitud de la celda completa. Con páginas de overflow ese camino ya
+    /// no es alcanzable para un valor por sí solo: `put` lo convierte en una
+    /// referencia de ~22 bytes (ver `overflow_threshold`) antes de que
+    /// `emit` llegue a verlo, así que la inserción debe tener éxito y el
+    /// valor debe leerse de vuelta intacto — la propiedad que comprueba
+    /// ahora esta prueba. Se conserva el valor de 2000 bytes del caso
+    /// original para que quede constancia de qué escenario dejó de fallar.
     #[test]
-    fn key_too_large_from_an_oversized_value_reports_the_combined_length() {
+    fn a_value_too_large_for_a_single_page_now_succeeds_via_overflow() {
         let db = db();
         let mut tx = db.begin_write().unwrap();
         let huge_value = alloc::vec![0u8; 2000];
-        let err = put(&mut tx, 0, b"k", &huge_value).unwrap_err();
-        match err {
-            crate::Error::KeyTooLarge { len, max } => {
-                assert_eq!(len, 1 + 2000, "debe reportar clave + valor, no solo la clave");
-                assert_eq!(max, 512);
-            }
-            other => panic!("se esperaba KeyTooLarge, se obtuvo {other:?}"),
-        }
+        let root = put(&mut tx, 0, b"k", &huge_value).unwrap();
+        assert_eq!(get(&tx, root, b"k").unwrap().unwrap(), huge_value);
     }
 
     /// Regresión del hallazgo 1 de la revisión: con claves cerca del límite
@@ -2044,5 +2281,267 @@ mod delete_invariant_tests {
 
         let mut visited = alloc::collections::BTreeSet::new();
         check_invariants(&tx, root, None, None, &mut visited);
+    }
+}
+
+/// Nota sobre `#[cfg]`: el brief de la tarea 13 escribe este módulo con
+/// `#[cfg(test)]` a secas. Se usa aquí `#[cfg(all(test, feature = "std"))]`
+/// en su lugar, igual que el resto de módulos de prueba de este fichero
+/// (`tests`, `put_tests`, `invariant_tests`, `delete_tests`,
+/// `delete_invariant_tests`): `tree.rs` entero solo se compila con la
+/// característica `std` (ver `lib.rs`), así que es redundante en la
+/// práctica, pero mantiene el fichero consistente consigo mismo.
+#[cfg(all(test, feature = "std"))]
+mod overflow_tests {
+    use super::*;
+    use crate::storage::MemStorage;
+    use crate::tx::{Db, Options};
+
+    fn db() -> Db {
+        Db::create(Box::new(MemStorage::new()), Options::default()).unwrap()
+    }
+
+    #[test]
+    fn threshold_is_a_quarter_of_the_page() {
+        assert_eq!(overflow_threshold(512), 128);
+        assert_eq!(overflow_threshold(4096), 1024);
+    }
+
+    #[test]
+    fn a_large_value_roundtrips_through_the_overflow_chain() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let big: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let root = put(&mut tx, 0, b"grande", &big).unwrap();
+        assert_eq!(get(&tx, root, b"grande").unwrap().unwrap(), big);
+    }
+
+    #[test]
+    fn an_empty_value_is_not_treated_as_overflow() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let root = put(&mut tx, 0, b"vacio", b"").unwrap();
+        assert_eq!(get(&tx, root, b"vacio").unwrap().as_deref(), Some(b"".as_slice()));
+    }
+
+    #[test]
+    fn overwriting_a_large_value_frees_the_old_chain() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let big = alloc::vec![7u8; 5000];
+        let root = put(&mut tx, 0, b"k", &big).unwrap();
+        let before = tx.pages_in_use();
+        let root = put(&mut tx, root, b"k", b"pequeno").unwrap();
+        assert!(tx.pages_in_use() < before, "la cadena antigua se libera");
+        assert_eq!(get(&tx, root, b"k").unwrap().as_deref(), Some(b"pequeno".as_slice()));
+    }
+
+    #[test]
+    fn deleting_a_large_value_frees_the_chain() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let big = alloc::vec![7u8; 20_000];
+        let root = put(&mut tx, 0, b"k", &big).unwrap();
+        let before = tx.pages_in_use();
+        let (root, _) = delete(&mut tx, root, b"k").unwrap();
+        assert_eq!(root, 0);
+        assert!(tx.pages_in_use() < before);
+    }
+
+    /// Contrato completo del auto-review de la tarea 13: sustituir un valor
+    /// grande por uno pequeño, ese por otro grande, y borrarlo, no debe
+    /// dejar ni una página de más (fuga) ni de menos (liberación doble)
+    /// respecto al árbol vacío del que se partió. `baseline` se toma ANTES
+    /// del primer `put`, no después: comparar contra el estado
+    /// verdaderamente vacío es lo que hace la aserción final exacta
+    /// (`==`), no solo una cota.
+    #[test]
+    fn replacing_large_with_small_then_large_again_then_deleting_returns_to_baseline() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let baseline = tx.pages_in_use();
+
+        let big1 = alloc::vec![1u8; 5000];
+        let root = put(&mut tx, 0, b"k", &big1).unwrap();
+        let after_big1 = tx.pages_in_use();
+        assert!(after_big1 > baseline, "la cadena de overflow de big1 debe consumir páginas");
+
+        let root = put(&mut tx, root, b"k", b"pequeno").unwrap();
+        assert_eq!(get(&tx, root, b"k").unwrap().as_deref(), Some(b"pequeno".as_slice()));
+        let after_small = tx.pages_in_use();
+        assert!(after_small < after_big1, "la cadena de big1 debe liberarse al reemplazarlo");
+
+        let big2 = alloc::vec![2u8; 9000];
+        let root = put(&mut tx, root, b"k", &big2).unwrap();
+        assert_eq!(get(&tx, root, b"k").unwrap().unwrap(), big2);
+        let after_big2 = tx.pages_in_use();
+        assert!(after_big2 > after_small, "la nueva cadena grande debe consumir páginas");
+
+        let (root, existed) = delete(&mut tx, root, b"k").unwrap();
+        assert!(existed);
+        assert_eq!(root, 0);
+        let after_delete = tx.pages_in_use();
+        assert_eq!(
+            after_delete, baseline,
+            "tras sustituir un valor grande por uno pequeño, por otro grande, y borrarlo, no \
+             debe quedar ni una página de más ni de menos respecto al árbol vacío original"
+        );
+    }
+
+    /// Borrar una hoja entera con VARIOS valores grandes debe liberar TODAS
+    /// sus cadenas, no solo la de la primera clave que se borre. Las tres
+    /// claves son de un solo byte y comparten hoja (caben de sobra en una
+    /// sola página: cada celda de overflow ocupa un puñado de bytes fijos,
+    /// nunca el valor entero).
+    #[test]
+    fn deleting_a_leaf_with_several_large_values_frees_every_chain() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let mut root = 0;
+        let keys = [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()];
+        let values: Vec<Vec<u8>> =
+            (0..keys.len()).map(|i| alloc::vec![(i + 1) as u8; 3000]).collect();
+        for (k, v) in keys.iter().zip(values.iter()) {
+            root = put(&mut tx, root, k, v).unwrap();
+        }
+        for (k, v) in keys.iter().zip(values.iter()) {
+            assert_eq!(get(&tx, root, k).unwrap().as_deref(), Some(v.as_slice()));
+        }
+        let before = tx.pages_in_use();
+        for k in keys.iter() {
+            let (r, existed) = delete(&mut tx, root, k).unwrap();
+            assert!(existed, "clave {k:?}");
+            root = r;
+        }
+        assert_eq!(root, 0);
+        let after = tx.pages_in_use();
+        // Cota floja a propósito (no exacta): lo que importa es que se
+        // libere bastante más que solo las hojas — cada valor de 3000
+        // bytes necesita varias páginas de overflow (492 bytes de
+        // capacidad por página a 512 de tamaño de página) — no una idea
+        // frágil de cuántas exactas.
+        assert!(
+            after + 6 <= before,
+            "borrar tres valores de ~3000 bytes debe liberar bastante más que solo la hoja: \
+             antes {before}, después {after}"
+        );
+    }
+
+    /// Frontera del umbral: un valor de exactamente `overflow_threshold`
+    /// bytes se guarda EN LÍNEA, no en overflow — el límite es `>`, no
+    /// `>=`, igual que el que `put` ya le impone a las claves (tarea 11).
+    /// `pages_in_use` lo delata: en línea, reemplazar el valor solo cambia
+    /// la hoja (copy-on-write, +1/-1 páginas); con overflow, además
+    /// consume página(s) de cadena.
+    #[test]
+    fn value_exactly_at_the_threshold_stays_inline_one_byte_over_goes_to_overflow() {
+        let db = db();
+        assert_eq!(overflow_threshold(512), 128);
+
+        let mut tx = db.begin_write().unwrap();
+        let baseline = tx.pages_in_use();
+        let at_threshold = alloc::vec![9u8; 128];
+        let root = put(&mut tx, 0, b"k", &at_threshold).unwrap();
+        assert_eq!(get(&tx, root, b"k").unwrap().as_deref(), Some(at_threshold.as_slice()));
+        let pages_inline = tx.pages_in_use();
+        assert_eq!(pages_inline, baseline + 1, "128 bytes en línea: solo la página de la hoja");
+
+        let over_threshold = alloc::vec![9u8; 129];
+        let root = put(&mut tx, root, b"k", &over_threshold).unwrap();
+        assert_eq!(get(&tx, root, b"k").unwrap().unwrap(), over_threshold);
+        let pages_overflow = tx.pages_in_use();
+        assert!(
+            pages_overflow > pages_inline,
+            "129 bytes debe ir a overflow y consumir al menos una página más que 128 en línea"
+        );
+    }
+
+    /// Un byte por debajo del umbral también se queda en línea: mismo coste
+    /// en páginas que en el límite exacto (solo la hoja).
+    #[test]
+    fn value_one_byte_under_the_threshold_stays_inline() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let baseline = tx.pages_in_use();
+        let under = alloc::vec![9u8; 127];
+        let root = put(&mut tx, 0, b"k", &under).unwrap();
+        assert_eq!(get(&tx, root, b"k").unwrap().as_deref(), Some(under.as_slice()));
+        assert_eq!(tx.pages_in_use(), baseline + 1, "127 bytes en línea: solo la página de la hoja");
+    }
+
+    /// Construye a mano una página de overflow cruda, con el mismo formato
+    /// que produce `write_overflow`, para poder fabricar cadenas corruptas
+    /// (un ciclo) que ese código nunca produciría por sí solo.
+    fn raw_overflow_page(page_size: u32, next: PageNo, data: &[u8]) -> Vec<u8> {
+        let mut b = alloc::vec![0u8; page_size as usize];
+        b[0] = PageType::Overflow as u8;
+        b[12..16].copy_from_slice(&next.to_le_bytes());
+        b[4..6].copy_from_slice(&(PAGE_HEADER_SIZE as u16).to_le_bytes());
+        b[6..8].copy_from_slice(&(page_size as u16).to_le_bytes());
+        b[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + data.len()].copy_from_slice(data);
+        let mut h = crate::crc32::Hasher::new();
+        h.update(&b[..8]);
+        h.update(&b[12..]);
+        b[8..12].copy_from_slice(&h.finish().to_le_bytes());
+        b
+    }
+
+    /// Dos páginas de overflow que se apuntan la una a la otra: no hay
+    /// ninguna página con `next == 0` alcanzable. `free_overflow` no recibe
+    /// ninguna longitud (a diferencia de `read_overflow`, que se autolimita
+    /// por `len`), así que sin la cota de `tx.n_pages()` este bucle sería
+    /// literalmente infinito, no solo lento.
+    #[test]
+    fn free_overflow_returns_an_error_instead_of_looping_forever_on_a_cycle() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let a = tx.alloc().unwrap();
+        let b = tx.alloc().unwrap();
+        let page_size = tx.page_size();
+
+        tx.write_page(a, &raw_overflow_page(page_size, b, b"aa")).unwrap();
+        tx.write_page(b, &raw_overflow_page(page_size, a, b"bb")).unwrap();
+
+        let err = free_overflow(&mut tx, a).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: CorruptKind::OverflowLoop, .. }),
+            "se esperaba OverflowLoop, se obtuvo {err:?}"
+        );
+    }
+
+    /// Misma cadena cíclica que la prueba anterior, pero ejercitando
+    /// `read_overflow`. A diferencia de `free_overflow`, `read_overflow` ya
+    /// se autolimita por `len` incluso sin la cota explícita de saltos: con
+    /// todas las páginas del fichero del mismo tamaño, cada vuelta del
+    /// ciclo aporta la misma cantidad fija de bytes tanto si la página es
+    /// nueva como si es una repetida, así que `out.len()` alcanza `len` en
+    /// como mucho `ceil(len / capacidad)` iteraciones SIEMPRE — la cota
+    /// explícita nunca llega a dispararse en este caso concreto, aunque sí
+    /// protege (ver su comentario) contra una fuente de páginas que no
+    /// garantice ese tamaño uniforme. Lo que esta prueba puede afirmar de
+    /// verdad es más modesto pero real: `read_overflow` TERMINA sobre un
+    /// ciclo — no se cuelga — y punto; que el resultado sea `Ok` con bytes
+    /// repetidos (dato incorrecto, no detectado como corrupción) es una
+    /// limitación conocida, documentada aquí y en el informe de la tarea,
+    /// no una sorpresa.
+    #[test]
+    fn read_overflow_terminates_on_a_cycle_instead_of_hanging() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let a = tx.alloc().unwrap();
+        let b = tx.alloc().unwrap();
+        let page_size = tx.page_size();
+
+        tx.write_page(a, &raw_overflow_page(page_size, b, b"aa")).unwrap();
+        tx.write_page(b, &raw_overflow_page(page_size, a, b"bb")).unwrap();
+
+        let capacity = (page_size as usize - PAGE_HEADER_SIZE) as u64;
+        let len = capacity * 5;
+        // Lo único que se afirma: que esta llamada retorna. Un bucle
+        // infinito real dejaría el `cargo test` colgado en vez de fallar
+        // este `assert`.
+        let result = read_overflow(&tx, len, a);
+        assert!(result.is_ok(), "se esperaba que el ciclo, de páginas uniformes, completara \
+                 con Ok (dato incorrecto pero sin colgarse); se obtuvo {result:?}");
     }
 }

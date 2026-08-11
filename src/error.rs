@@ -43,6 +43,13 @@ pub enum CorruptKind {
     /// El descenso del árbol superó la profundidad máxima legítima sin
     /// alcanzar una hoja: un ciclo de punteros a hijos, no un árbol válido.
     TreeLoop,
+    /// El recorrido de una cadena de páginas de overflow (tarea 13) superó
+    /// el número de páginas que le corresponden sin terminar: un ciclo en
+    /// los punteros `next`, no una cadena válida. Ni `FreelistLoop` ni
+    /// `TreeLoop` encajan: no es la lista de libres ni el descenso del
+    /// árbol, es un tercer tipo de cadena de punteros con su propio
+    /// recorrido acotado.
+    OverflowLoop,
     MetaMismatch,
 }
 

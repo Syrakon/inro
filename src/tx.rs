@@ -344,6 +344,38 @@ impl<'db> WriteTxn<'db> {
         self.db.pager.geometry().page_size
     }
 
+    /// Número total de páginas que el fichero conoce en este momento,
+    /// asignadas o libres. Cota superior natural para cualquier cadena
+    /// acíclica de páginas leída de disco: no puede tener más eslabones
+    /// distintos que páginas existen. `free_overflow` (tarea 13) la usa para
+    /// acotar el recorrido de una cadena de overflow corrupta que ciclara,
+    /// a falta de una cota más ajustada — su firma, fijada por la interfaz
+    /// de la tarea, no recibe la longitud del valor como sí hace
+    /// `read_overflow`.
+    pub fn n_pages(&self) -> u32 {
+        self.meta.n_pages
+    }
+
+    /// Páginas en uso ahora mismo: asignadas menos libres. Solo para
+    /// pruebas, para poder afirmar sobre liberaciones (p. ej. que borrar o
+    /// reemplazar un valor de overflow libera de verdad su cadena vieja).
+    ///
+    /// Cuenta las DOS bolsas de páginas libres, no solo `state().freelist`:
+    /// una página que esta misma transacción asignó y ya liberó ella misma
+    /// va a `own_free`, no a la lista persistente (ver `free`), así que
+    /// contar solo la lista persistente sobrestima "en uso" en exactamente
+    /// ese número — precisamente el patrón de todas las pruebas de esta
+    /// función (`alloc` y `free` dentro de la misma transacción sin
+    /// confirmar, como al sustituir o borrar un valor de overflow que la
+    /// propia transacción acaba de escribir). Sin esto, ninguna de esas
+    /// pruebas vería bajar el conteo nunca, con o sin fuga real.
+    #[cfg(test)]
+    pub fn pages_in_use(&mut self) -> u32 {
+        let n = self.meta.n_pages;
+        let free = self.state().freelist.len() as u32 + self.own_free.len() as u32;
+        n - free
+    }
+
     /// Toma una página libre reutilizable o extiende el fichero.
     ///
     /// Dos fuentes, en orden. Primero el conjunto propio (`own_free`):
