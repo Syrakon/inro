@@ -44,10 +44,18 @@ impl PageType {
 pub struct PageRef<'a> {
     bytes: &'a [u8],
     page_type: PageType,
+    flags: u8,
     n_slots: usize,
     prefix_len: usize,
     slots_at: usize,
 }
+
+/// Bit de `flags` (byte 1 de la cabecera) que, solo en páginas internas,
+/// marca "todos mis hijos DIRECTOS son hojas sin ninguna entrada de
+/// overflow, así que pueden liberarse sin abrirlos". Tarea 15, ronda de
+/// revisión 1: ver `children_plain` más abajo y el comentario de
+/// `free_subtree` en `tree.rs` para la corrección que este bit cierra.
+const CHILDREN_PLAIN_FLAG: u8 = 0x01;
 
 impl<'a> PageRef<'a> {
     pub fn parse(bytes: &'a [u8], page_no: PageNo) -> Result<Self> {
@@ -68,6 +76,7 @@ impl<'a> PageRef<'a> {
         }
 
         let page_type = PageType::from_u8(bytes[0]).ok_or_else(|| corrupt(CorruptKind::PageType))?;
+        let flags = bytes[1];
         let n_slots = u16::from_le_bytes(bytes[2..4].try_into().unwrap()) as usize;
         let free_start = u16::from_le_bytes(bytes[4..6].try_into().unwrap()) as usize;
         let cell_start = u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize;
@@ -86,7 +95,7 @@ impl<'a> PageRef<'a> {
             return Err(corrupt(CorruptKind::CellBounds));
         }
 
-        let page = Self { bytes, page_type, n_slots, prefix_len, slots_at };
+        let page = Self { bytes, page_type, flags, n_slots, prefix_len, slots_at };
 
         // Cada slot debe apuntar dentro del área de celdas, y cada celda debe
         // decodificarse entera dentro de la página.
@@ -137,6 +146,20 @@ impl<'a> PageRef<'a> {
 
     pub fn page_type(&self) -> PageType {
         self.page_type
+    }
+
+    /// Solo tiene sentido en páginas internas (`PageType::Internal`): `true`
+    /// significa que TODOS los hijos DIRECTOS de esta página son hojas sin
+    /// ninguna entrada de overflow, así que `free_subtree` (`tree.rs`) puede
+    /// liberarlos volcando sus números de página a la lista de libres sin
+    /// abrirlos. `false` no afirma lo contrario con certeza — es la lectura
+    /// conservadora por defecto de cualquier página construida antes de
+    /// que se supiera con seguridad que sus hijos eran así (ver
+    /// `PageBuilder::set_children_plain` y su comentario) — solo dice "no
+    /// hay garantía, compruébalo". En páginas hoja el bit está siempre a
+    /// cero (`PageBuilder` nunca lo pone en una hoja) y no significa nada.
+    pub fn children_plain(&self) -> bool {
+        self.flags & CHILDREN_PLAIN_FLAG != 0
     }
 
     pub fn n_slots(&self) -> usize {
@@ -290,6 +313,21 @@ impl PageBuilder {
 
     pub fn set_extra(&mut self, extra: u32) -> &mut Self {
         self.extra = extra;
+        self
+    }
+
+    /// Marca, en una página INTERNA, si todos sus hijos directos son hojas
+    /// planas (sin overflow) — ver `PageRef::children_plain`. Sin efecto en
+    /// hojas: `build` solo copia `self.flags` tal cual al byte 1 de la
+    /// cabecera, así que llamar a esto sobre un `PageBuilder` de tipo `Leaf`
+    /// no rompe nada, pero tampoco significa nada — el llamante (`emit`,
+    /// `tree.rs`) solo lo invoca para construcciones internas.
+    pub fn set_children_plain(&mut self, plain: bool) -> &mut Self {
+        if plain {
+            self.flags |= CHILDREN_PLAIN_FLAG;
+        } else {
+            self.flags &= !CHILDREN_PLAIN_FLAG;
+        }
         self
     }
 
@@ -563,6 +601,31 @@ mod builder_tests {
         assert_eq!(p.extra(), 12);
         assert_eq!(p.child(0), 10);
         assert_eq!(p.child(1), 11);
+    }
+
+    /// Tarea 15, ronda 1 de revisión, hallazgos 1+2: `children_plain` debe
+    /// sobrevivir un ciclo `build`/`parse` completo en los dos sentidos, y
+    /// `false` (el valor por defecto de un `PageBuilder` nuevo, `flags: 0`
+    /// en `new`) debe ser el resultado si nadie lo toca — la lectura
+    /// conservadora, "no hay garantía", que `free_subtree` (`tree.rs`)
+    /// necesita como caso por defecto seguro.
+    #[test]
+    fn children_plain_flag_roundtrips_and_defaults_to_false() {
+        let entries: Vec<(&[u8], CellPayload)> =
+            alloc::vec![(b"m".as_slice(), CellPayload::Child(10))];
+
+        let raw_default = PageBuilder::new(512, PageType::Internal).build(&entries).unwrap();
+        assert!(!PageRef::parse(&raw_default, 1).unwrap().children_plain());
+
+        let mut b_false = PageBuilder::new(512, PageType::Internal);
+        b_false.set_children_plain(false);
+        let raw_false = b_false.build(&entries).unwrap();
+        assert!(!PageRef::parse(&raw_false, 1).unwrap().children_plain());
+
+        let mut b_true = PageBuilder::new(512, PageType::Internal);
+        b_true.set_children_plain(true);
+        let raw_true = b_true.build(&entries).unwrap();
+        assert!(PageRef::parse(&raw_true, 1).unwrap().children_plain());
     }
 
     /// Precondición de `build`: entradas ordenadas y sin duplicados. Con

@@ -399,22 +399,51 @@ pub fn get(src: &impl PageSource, root: PageNo, key: &[u8]) -> Result<Option<Vec
 type BorrowedEntries<'a> = [(&'a [u8], CellPayload<'a>)];
 
 /// Resultado de insertar en un subárbol.
+///
+/// **Ronda 1 de revisión de la tarea 15, hallazgos 1+2**: cada variante que
+/// produce una página nueva lleva además `plain: bool` — "¿es esta página (o,
+/// en `Split`, esta mitad) una HOJA sin ninguna entrada de overflow?" — sin
+/// coste de lectura adicional: `emit` YA conoce `page_type` (es su propio
+/// parámetro) y YA tiene `entries` en memoria, así que calcularlo es gratis.
+/// Es la información que permite a la llamada de nivel superior mantener al
+/// día, también gratis, el bit `children_plain` (`page.rs`) del nodo interno
+/// que está reconstruyendo — ver el comentario de `free_subtree`, que es
+/// quien de verdad consume ese bit.
 enum Insertion {
     /// El subárbol sigue cabiendo en una página; esta es la nueva.
-    Updated(PageNo),
+    Updated(PageNo, bool),
     /// El subárbol se dividió. `sep` es la primera clave de `right`.
-    Split { left: PageNo, sep: Vec<u8>, right: PageNo },
+    Split { left: PageNo, left_plain: bool, sep: Vec<u8>, right: PageNo, right_plain: bool },
+}
+
+/// `true` si `entries` (los que va a recibir una página de tipo `page_type`)
+/// no contienen ninguna entrada de overflow — solo puede ser cierto para
+/// hojas, nunca para nodos internos (cuyas celdas son punteros a hijos, no
+/// valores). Compartido por las dos ramas de `emit` (cabe entera / se
+/// divide) para no repetir la lógica.
+fn entries_are_plain(page_type: PageType, entries: &BorrowedEntries) -> bool {
+    page_type == PageType::Leaf
+        && entries.iter().all(|(_, p)| !matches!(p, CellPayload::Overflow { .. }))
 }
 
 /// Escribe `entries` en una página nueva, o en dos si no caben, liberando la
 /// página `old`. Es el único punto del árbol que asigna páginas de nodo, de
 /// modo que la política de división vive en un solo sitio.
+///
+/// `children_plain` solo importa cuando `page_type == PageType::Internal`:
+/// es el bit que el LLAMANTE ya calculó (ver el comentario de `Insertion`)
+/// para los hijos de la página que está reconstruyendo, y `emit` se limita a
+/// guardarlo en la cabecera (`PageBuilder::set_children_plain`) — `emit` no
+/// tiene forma de calcularlo por sí mismo, porque `entries` para un nodo
+/// interno solo trae `CellPayload::Child(PageNo)`, sin el tipo del hijo. Se
+/// ignora sin efecto para cualquier otro `page_type`.
 fn emit(
     tx: &mut WriteTxn,
     old: Option<PageNo>,
     page_type: PageType,
     extra: u32,
     entries: &[(Vec<u8>, CellPayload)],
+    children_plain: bool,
 ) -> Result<Insertion> {
     let page_size = tx.page_size();
     let borrowed: Vec<(&[u8], CellPayload)> =
@@ -422,13 +451,16 @@ fn emit(
 
     let mut builder = PageBuilder::new(page_size, page_type);
     builder.set_extra(extra);
+    if page_type == PageType::Internal {
+        builder.set_children_plain(children_plain);
+    }
     if let Some(bytes) = builder.build(&borrowed) {
         let page_no = tx.alloc()?;
         tx.write_page(page_no, &bytes)?;
         if let Some(old) = old {
             tx.free(old);
         }
-        return Ok(Insertion::Updated(page_no));
+        return Ok(Insertion::Updated(page_no, entries_are_plain(page_type, &borrowed)));
     }
 
     // No cabe: partir por la mitad. Con inserción ordenada esto deja la mitad
@@ -507,8 +539,16 @@ fn emit(
             _ => (l, 0, r),
         };
 
+    // Dividir una página interna reparte sus MISMOS hijos entre las dos
+    // mitades: ninguno cambia de tipo ni gana overflow por el mero hecho de
+    // mudarse de página, así que las dos mitades heredan el mismo
+    // `children_plain` que iba a tener la página sin dividir — no hay nada
+    // que recalcular.
     let mut lb = PageBuilder::new(page_size, page_type);
     lb.set_extra(left_extra);
+    if page_type == PageType::Internal {
+        lb.set_children_plain(children_plain);
+    }
     let left_bytes = lb.build(left_entries).ok_or(Error::KeyTooLarge {
         len: entries[0].0.len() as u32,
         max: page_size,
@@ -516,6 +556,9 @@ fn emit(
 
     let mut rb = PageBuilder::new(page_size, page_type);
     rb.set_extra(extra);
+    if page_type == PageType::Internal {
+        rb.set_children_plain(children_plain);
+    }
     let right_bytes = rb.build(right_entries).ok_or(Error::KeyTooLarge {
         len: entries[mid].0.len() as u32,
         max: page_size,
@@ -528,7 +571,13 @@ fn emit(
     if let Some(old) = old {
         tx.free(old);
     }
-    Ok(Insertion::Split { left, sep, right })
+    Ok(Insertion::Split {
+        left,
+        left_plain: entries_are_plain(page_type, left_entries),
+        sep,
+        right,
+        right_plain: entries_are_plain(page_type, right_entries),
+    })
 }
 
 /// Como `descend`, sigue punteros a hijos leídos del disco, así que necesita
@@ -601,7 +650,9 @@ fn insert_rec(
                 .zip(payloads.iter())
                 .map(|(k, p)| (k.clone(), p.as_cell_payload()))
                 .collect();
-            emit(tx, Some(page_no), PageType::Leaf, 0, &entries)
+            // `children_plain` no significa nada en una hoja: `emit` lo
+            // ignora salvo para `PageType::Internal` (ver su comentario).
+            emit(tx, Some(page_no), PageType::Leaf, 0, &entries, false)
         }
 
         PageType::Internal => {
@@ -611,20 +662,31 @@ fn insert_rec(
 
             let mut entries: Vec<(Vec<u8>, CellPayload)> = Vec::with_capacity(page.n_slots() + 2);
             let mut extra = page.extra();
+            // Punto de partida conservador: si ya no todos los hijos de
+            // ESTA página eran planos, tocar uno solo no puede demostrar
+            // que los demás también lo sean sin volver a comprobarlos —
+            // se queda en `false` y punto. Si SÍ lo eran, insertar no
+            // puede haber convertido a un hermano no tocado en algo
+            // distinto de una hoja plana (ver el comentario de
+            // `Insertion`), así que solo el resultado del hijo tocado
+            // puede bajarlo a `false`.
+            let mut children_plain = page.children_plain();
 
             for j in 0..page.n_slots() {
                 entries.push((page.key(j), CellPayload::Child(page.child(j))));
             }
 
             match result {
-                Insertion::Updated(new_child) => {
+                Insertion::Updated(new_child, plain) => {
+                    children_plain &= plain;
                     if idx < page.n_slots() {
                         entries[idx].1 = CellPayload::Child(new_child);
                     } else {
                         extra = new_child;
                     }
                 }
-                Insertion::Split { left, sep, right } => {
+                Insertion::Split { left, left_plain, sep, right, right_plain } => {
+                    children_plain &= left_plain && right_plain;
                     if idx < page.n_slots() {
                         // c_i se parte: (sep, left) hereda las claves bajas y
                         // (s_i, right) el resto del rango original.
@@ -640,7 +702,7 @@ fn insert_rec(
                 }
             }
 
-            emit(tx, Some(page_no), PageType::Internal, extra, &entries)
+            emit(tx, Some(page_no), PageType::Internal, extra, &entries, children_plain)
         }
 
         _ => Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::PageType }),
@@ -690,8 +752,8 @@ pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<
             CellPayload::Value(value)
         };
         let entries = alloc::vec![(key.to_vec(), payload)];
-        return match emit(tx, None, PageType::Leaf, 0, &entries)? {
-            Insertion::Updated(p) => Ok(p),
+        return match emit(tx, None, PageType::Leaf, 0, &entries, false)? {
+            Insertion::Updated(p, _) => Ok(p),
             Insertion::Split { .. } => unreachable!(
                 "emit con una sola entrada nunca divide: cabe (Updated) o falla dentro de \
                  emit (Err), nunca Split"
@@ -700,12 +762,18 @@ pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<
     }
 
     match insert_rec(tx, root, key, value, 1)? {
-        Insertion::Updated(p) => Ok(p),
-        Insertion::Split { left, sep, right } => {
+        Insertion::Updated(p, _) => Ok(p),
+        Insertion::Split { left, left_plain, sep, right, right_plain } => {
             // El árbol crece por arriba: raíz nueva con un solo separador.
+            // Sus dos hijos son exactamente `left`/`right`, la partición de
+            // lo que antes era la raíz — `left_plain && right_plain`, que
+            // `insert_rec` ya calculó sin coste adicional (ver el
+            // comentario de `Insertion`), es exactamente si esos dos hijos
+            // son ambos hojas planas.
             let entries = alloc::vec![(sep, CellPayload::Child(left))];
-            match emit(tx, None, PageType::Internal, right, &entries)? {
-                Insertion::Updated(p) => Ok(p),
+            let children_plain = left_plain && right_plain;
+            match emit(tx, None, PageType::Internal, right, &entries, children_plain)? {
+                Insertion::Updated(p, _) => Ok(p),
                 Insertion::Split { .. } => unreachable!("una raíz de una entrada siempre cabe"),
             }
         }
@@ -713,11 +781,16 @@ pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<
 }
 
 /// Resultado de borrar en un subárbol.
+///
+/// Como `Insertion` (ronda 1 de revisión de la tarea 15, hallazgos 1+2),
+/// `Updated` lleva `plain: bool` — la página resultante, ¿es una hoja sin
+/// overflow? — para que el nivel de arriba mantenga al día, sin lecturas
+/// extra, el bit `children_plain` del nodo interno que reconstruye.
 enum Removal {
     /// Sin cambios: la clave no estaba. La página original sigue siendo válida.
     Unchanged,
     /// El subárbol sigue existiendo en esta página nueva.
-    Updated(PageNo),
+    Updated(PageNo, bool),
     /// El subárbol quedó vacío y su página ya está liberada.
     Gone,
 }
@@ -763,8 +836,8 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
                 .zip(payloads.iter())
                 .map(|(k, p)| (k.clone(), p.as_cell_payload()))
                 .collect();
-            match emit(tx, Some(page_no), PageType::Leaf, 0, &entries)? {
-                Insertion::Updated(p) => Ok(Removal::Updated(p)),
+            match emit(tx, Some(page_no), PageType::Leaf, 0, &entries, false)? {
+                Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
                 // Quitar una entrada nunca puede hacer que las restantes dejen
                 // de caber donde ya cabían.
                 Insertion::Split { .. } => unreachable!("borrar no divide"),
@@ -784,9 +857,16 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
                 entries.push((page.key(j), CellPayload::Child(page.child(j))));
             }
             let mut extra = page.extra();
+            // Como en `insert_rec`: conservador por defecto, solo el
+            // resultado del hijo tocado puede bajarlo a `false` (nunca
+            // subirlo — borrar tampoco puede "des-mezclar" un nodo que ya
+            // era mixto sin volver a comprobar los hermanos que no se
+            // tocan).
+            let mut children_plain = page.children_plain();
 
             match result {
-                Removal::Updated(new_child) => {
+                Removal::Updated(new_child, plain) => {
+                    children_plain &= plain;
                     if idx < page.n_slots() {
                         entries[idx].1 = CellPayload::Child(new_child);
                     } else {
@@ -825,13 +905,28 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
             // Un nodo interno sin separadores tiene un único hijo: sobra como
             // nivel. Se descarta y el padre apunta directamente al nieto. Así
             // el árbol encoge por arriba sin código específico de raíz.
+            //
+            // El hijo que se promueve (`extra`) es siempre uno que esta
+            // llamada NO tocó — el que sí se tocó es el que acaba de
+            // desaparecer (`Removal::Gone`, más arriba) — así que su
+            // "planitud" es exactamente la que ya tenía ESTA página antes
+            // de la operación (`page.children_plain()`), sin necesidad de
+            // volver a comprobarlo.
             if entries.is_empty() {
                 tx.free(page_no);
-                return Ok(if extra == 0 { Removal::Gone } else { Removal::Updated(extra) });
+                return Ok(if extra == 0 {
+                    Removal::Gone
+                } else {
+                    Removal::Updated(extra, page.children_plain())
+                });
             }
 
-            match emit(tx, Some(page_no), PageType::Internal, extra, &entries)? {
-                Insertion::Updated(p) => Ok(Removal::Updated(p)),
+            // `plain` que devuelve `emit` aquí es siempre `false` (un nodo
+            // interno nunca es él mismo una hoja plana, ver
+            // `entries_are_plain`): se reenvía tal cual, no hace falta
+            // recalcularlo.
+            match emit(tx, Some(page_no), PageType::Internal, extra, &entries, children_plain)? {
+                Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
                 Insertion::Split { .. } => unreachable!("borrar no divide"),
             }
         }
@@ -847,7 +942,7 @@ pub fn delete(tx: &mut WriteTxn, root: PageNo, key: &[u8]) -> Result<(PageNo, bo
     }
     match delete_rec(tx, root, key, 1)? {
         Removal::Unchanged => Ok((root, false)),
-        Removal::Updated(p) => Ok((p, true)),
+        Removal::Updated(p, _) => Ok((p, true)),
         Removal::Gone => Ok((0, true)),
     }
 }
@@ -896,9 +991,22 @@ pub fn delete(tx: &mut WriteTxn, root: PageNo, key: &[u8]) -> Result<(PageNo, bo
 /// millón de páginas para hacer saltar el error, lo consigue en ~20
 /// niveles (2^20 ≈ 1×10⁶) — muy por debajo de `MAX_DEPTH` — no en un
 /// número de niveles que dependa de cuántas páginas reales tenga el
-/// fichero. Se captura una sola vez al principio de `delete_range`, no en
-/// cada llamada: ni `delete_range_rec` ni `free_subtree` asignan páginas
-/// (solo liberan), así que `n_pages()` no cambia durante el recorrido.
+/// fichero.
+///
+/// **Corrección, ronda 1 de revisión de la tarea 15, hallazgo 4.** Esta
+/// nota afirmaba antes que "ni `delete_range_rec` ni `free_subtree`
+/// asignan páginas (solo liberan)" para justificar capturar `n_pages()`
+/// una sola vez al principio de `delete_range`. Es cierto para
+/// `free_subtree` (que nunca llama a `alloc`), pero es FALSO para
+/// `delete_range_rec`: su rama que reconstruye una hoja o un nodo interno
+/// parcialmente conservado llama a `emit`, que sí asigna páginas nuevas
+/// (`tx.alloc()`, más arriba). Capturar `n_pages()` una sola vez sigue
+/// siendo correcto, pero por otra razón: una página que ESTA llamada asigna
+/// nunca vuelve a leerla ELLA MISMA — `emit` la escribe y devuelve su
+/// número, y ni `delete_range_rec` ni `free_subtree` la abren de nuevo
+/// dentro de la misma operación — así que las páginas nuevas no compiten
+/// por presupuesto de lectura, solo las que YA existían al empezar. El
+/// `n_pages()` capturado al principio sigue acotando exactamente eso.
 struct RangeBudget {
     work: u32,
     max: u32,
@@ -923,18 +1031,77 @@ impl RangeBudget {
     }
 }
 
-/// Libera un subárbol completo. Solo lee nodos internos: los números de
-/// página de las hojas están en sus padres, así que se vuelcan a la lista
-/// de libres sin abrirlas — el ahorro que existe esta tarea para conseguir.
+/// Verifica que `child`, leído de un nodo interno, es un número de página
+/// plausible antes de fiarse de él para liberar (`free_subtree`) o para
+/// descender (`delete_range_rec`).
 ///
-/// El árbol está equilibrado: todos los hijos de un nodo interno son del
-/// mismo tipo, así que basta abrir UNO para saber si hace falta seguir
-/// descendiendo o si todos los demás se pueden liberar sin leerlos.
+/// **Ronda 1 de revisión de la tarea 15, hallazgo 3 — CRÍTICO.** Antes de
+/// esta comprobación, el camino que vuelca hijos a la lista de libres en
+/// bloque (`tx.free(child)`, sin abrir `child` para comprobar nada) no
+/// validaba el número de página en absoluto: un nodo interno corrupto con,
+/// por ejemplo, `extra == 0` hacía que `free_subtree` devolviera `Ok(())`
+/// tras empujar la página **0** — la cabecera del fichero — a la lista de
+/// libres. Confirmado de punta a punta: tras el `commit`, `alloc()` volvía
+/// a repartir `0` como página libre, y la siguiente escritura destruía la
+/// cabecera. `free_overflow` (más arriba) ya se protege de un fallo
+/// análogo, aunque de otra forma — abre la página y comprueba su tipo antes
+/// de fiarse de su `extra()` como "siguiente puntero" — porque una cadena
+/// de overflow SÍ trata `0` como un valor legítimo (fin de cadena). Un
+/// puntero a hijo de un nodo interno NUNCA es legítimamente `0`: `alloc()`
+/// jamás reparte la página `0` (reservada para la cabecera) ni ninguna
+/// anterior a `n_pages` en el momento de la asignación, así que cualquier
+/// hijo `== 0` o `>= n_pages` es, sin ambigüedad, corrupción.
+fn validate_child(tx: &WriteTxn, page_no: PageNo, child: PageNo) -> Result<()> {
+    if child == 0 || child >= tx.n_pages() {
+        return Err(Error::Corrupt { page: page_no, kind: CorruptKind::CellBounds });
+    }
+    Ok(())
+}
+
+/// Libera un subárbol completo. Cuando `children_plain` lo confirma, los
+/// hijos directos son hojas sin overflow y se vuelcan a la lista de libres
+/// sin abrirlas — el ahorro que existe esta tarea para conseguir.
 ///
-/// Las hojas con valores grandes obligan a abrirlas para liberar sus
-/// cadenas de overflow, porque esas páginas no aparecen en ningún padre. Es
-/// inevitable, y no afecta al caso de uso de logs, donde los valores son de
-/// decenas de bytes.
+/// **Ronda 1 de revisión de la tarea 15, hallazgos 1+2 — CRÍTICOS.** La
+/// versión original de esta función asumía el árbol equilibrado en altura
+/// (bastaba abrir un hijo, el `0`, para saber si TODOS eran hojas) y, si lo
+/// eran, los liberaba sin comprobar overflow. Las dos suposiciones son
+/// falsas por razones documentadas en este propio fichero:
+/// - `MAX_DEPTH` (más arriba) ya explica que `delete_rec` colapsa nodos
+///   internos de un solo hijo sin fusionarlos con sus hermanos, así que dos
+///   ramas del mismo árbol pueden acabar con profundidades distintas — y,
+///   peor para esta función, un nodo interno puede acabar con una hoja en
+///   una posición y un nodo interno en otra, si el hijo promovido en un
+///   colapso resulta ser una hoja mientras sus hermanos siguen siendo
+///   internos. Verificado por fuzzing de `put`/`delete`/`delete_range`
+///   sobre un árbol de fanout bajo: 8 semillas × 150 pasos produjeron 4
+///   pasos con fuga, 15 páginas perdidas — el caso mínimo pierde las hojas
+///   122 y 125 en un árbol con profundidades de hoja {3, 4, 5}. Con la
+///   version original, esos hermanos internos se liberaban como si fueran
+///   hojas: sus subárboles enteros quedaban huérfanos (ni alcanzables ni en
+///   la lista de libres) para siempre — la poda diaria de retención pierde
+///   páginas de forma permanente en cualquier base que alguna vez haya
+///   usado `delete`.
+/// - Aunque el árbol SÍ estuviera equilibrado, una hoja liberada sin abrir
+///   nunca comprueba si tiene valores de overflow — sus cadenas quedan
+///   huérfanas igual. Reproducido: 3000 claves con 15 valores de 2000
+///   bytes, `delete_range` sobre un tercio → 15 páginas huérfanas, exactas
+///   3 cadenas × 5 páginas cada una.
+///
+/// La corrección: `children_plain` (`PageRef`, `page.rs`) es un bit
+/// mantenido al día por CADA función que reconstruye un nodo interno
+/// (`insert_rec`, `delete_rec`, `delete_range_rec`, `put`) sin lecturas
+/// adicionales — ver el comentario de `Insertion` — que dice con certeza
+/// "todos mis hijos DIRECTOS son hojas sin overflow". Cuando es cierto, esta
+/// función libera en bloque, sin abrir nada, exactamente el atajo que
+/// justifica la tarea. Cuando NO lo es (incluye tanto "hay al menos un hijo
+/// interno" como "hay al menos una hoja con overflow" — las dos cierran en
+/// UN solo bit, no dos, porque las dos exigen la MISMA respuesta: abrir el
+/// hijo para saber qué hacer con él), recurre de verdad en cada hijo: la
+/// propia llamada recursiva lee el hijo, descubre su tipo real, y si
+/// resulta ser una hoja, su rama `PageType::Leaf` ya libera cualquier
+/// cadena de overflow que tenga — así que el camino de "no es plano" cierra
+/// los dos hallazgos a la vez con el mismo código.
 ///
 /// **Cotas.** `depth` (profundidad de recursión real, no solo un contador:
 /// esta función SÍ se llama a sí misma) se compara contra `MAX_DEPTH` antes
@@ -945,7 +1112,13 @@ impl RangeBudget {
 /// un fallo del propio proceso, no solo un cuelgue. `budget` (compartido
 /// con `delete_range_rec`, ver `RangeBudget`) acota además el trabajo
 /// TOTAL, para el caso — imposible de cerrar solo con `depth` — de un DAG
-/// corrupto acíclico con hijos compartidos.
+/// corrupto acíclico con hijos compartidos. Cada página se carga contra el
+/// presupuesto EXACTAMENTE una vez, en la línea `budget.charge(page_no)`
+/// de más arriba: a diferencia de la versión original (que además cargaba
+/// el "hijo 0" por separado al comprobarlo, contándolo dos veces si luego
+/// recurría sobre él), esta ya no necesita esa comprobación aparte —
+/// `children_plain` viene de la propia `page` ya leída, sin ninguna lectura
+/// extra.
 fn free_subtree(
     tx: &mut WriteTxn,
     page_no: PageNo,
@@ -971,19 +1144,14 @@ fn free_subtree(
             tx.free(page_no);
         }
         PageType::Internal => {
-            // El árbol está equilibrado: todos los hijos son del mismo
-            // tipo, así que basta abrir uno para saber si hay que
-            // descender.
-            let first_child = child_at(&page, 0);
-            budget.charge(first_child)?;
-            let child_bytes = tx.read_page(first_child)?;
-            let child_is_leaf =
-                PageRef::parse(&child_bytes, first_child)?.page_type() == PageType::Leaf;
-
+            let plain = page.children_plain();
             for i in 0..=page.n_slots() {
                 let child = child_at(&page, i);
-                if child_is_leaf {
-                    // Aquí está el ahorro: se liberan sin leerlas.
+                validate_child(tx, page_no, child)?;
+                if plain {
+                    // Aquí está el ahorro: se liberan sin leerlas, porque
+                    // `children_plain` ya garantiza que son hojas sin
+                    // overflow.
                     tx.free(child);
                 } else {
                     free_subtree(tx, child, depth + 1, budget)?;
@@ -1031,7 +1199,7 @@ pub fn delete_range(tx: &mut WriteTxn, root: PageNo, from: &[u8], to: &[u8]) -> 
     let bounds = Bounds { low: &[], high: None };
     match delete_range_rec(tx, root, range, bounds, 1, &mut budget)? {
         Removal::Unchanged => Ok(root),
-        Removal::Updated(p) => Ok(p),
+        Removal::Updated(p, _) => Ok(p),
         Removal::Gone => Ok(0),
     }
 }
@@ -1122,8 +1290,8 @@ fn delete_range_rec(
                 return Ok(Removal::Gone);
             }
             let entries: Vec<(Vec<u8>, CellPayload)> = keys.into_iter().zip(values).collect();
-            match emit(tx, Some(page_no), PageType::Leaf, 0, &entries)? {
-                Insertion::Updated(p) => Ok(Removal::Updated(p)),
+            match emit(tx, Some(page_no), PageType::Leaf, 0, &entries, false)? {
+                Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
                 Insertion::Split { .. } => unreachable!("borrar no divide"),
             }
         }
@@ -1166,6 +1334,7 @@ fn delete_range_rec(
             let mut results: Vec<Removal> = Vec::with_capacity(n + 1);
             for i in 0..=n {
                 let child = child_at(&page, i);
+                validate_child(tx, page_no, child)?;
                 let child_low: &[u8] = if i == 0 { bounds.low } else { &page.key(i - 1) };
                 let child_high: Option<Vec<u8>> =
                     if i == n { bounds.high.map(|h| h.to_vec()) } else { Some(page.key(i)) };
@@ -1186,40 +1355,69 @@ fn delete_range_rec(
                 return Ok(Removal::Unchanged);
             }
 
-            // El último resultado empujado corresponde a la posición `n`
-            // (el hijo `extra`); el resto, en orden, a cada separador
-            // `page.key(i)` / hijo `page.child(i)`.
+            // **Ronda 1 de revisión de la tarea 15, hallazgos 1+2**: a
+            // diferencia de `insert_rec`/`delete_rec` (que solo tocan UN
+            // hijo, así que basta un `bool` agregado que solo puede bajar a
+            // `false`), aquí puede tocarse MÁS de un hijo en la misma
+            // llamada, y el hijo que acaba promovido a `extra` en un
+            // colapso puede ser exactamente uno de los que SÍ se tocó — no
+            // siempre el hermano intacto, como en `delete_rec` (ver su
+            // comentario). Por eso aquí cada entrada lleva su propia
+            // etiqueta `plain` en vez de una sola agregada: `page.key(i)`
+            // /`page.child(i)`/`plain_i`, donde `plain_i` es el resultado
+            // fresco de la llamada recursiva si el hijo `i` se tocó, o
+            // `page.children_plain()` (lo que YA se sabía de esta página)
+            // si no se tocó — la misma aproximación conservadora que las
+            // otras dos funciones, solo que por entrada en vez de una vez.
             let extra_result = results.pop().expect("se empujaron n + 1 >= 1 resultados");
-            let mut entries: Vec<(Vec<u8>, CellPayload)> = Vec::with_capacity(results.len());
+            let mut entries: Vec<(Vec<u8>, CellPayload, bool)> = Vec::with_capacity(results.len());
             for (i, result) in results.into_iter().enumerate() {
                 match result {
-                    Removal::Unchanged => {
-                        entries.push((page.key(i), CellPayload::Child(page.child(i))))
+                    Removal::Unchanged => entries.push((
+                        page.key(i),
+                        CellPayload::Child(page.child(i)),
+                        page.children_plain(),
+                    )),
+                    Removal::Updated(p, plain) => {
+                        entries.push((page.key(i), CellPayload::Child(p), plain))
                     }
-                    Removal::Updated(p) => entries.push((page.key(i), CellPayload::Child(p))),
                     Removal::Gone => {}
                 }
             }
-            let extra = match extra_result {
-                Removal::Unchanged => page.extra(),
-                Removal::Updated(p) => p,
+            let (extra, extra_plain) = match extra_result {
+                Removal::Unchanged => (page.extra(), page.children_plain()),
+                Removal::Updated(p, plain) => (p, plain),
                 Removal::Gone => match entries.pop() {
-                    Some((_, CellPayload::Child(c))) => c,
-                    Some((_, CellPayload::Value(_) | CellPayload::Overflow { .. })) => {
+                    Some((_, CellPayload::Child(c), plain)) => (c, plain),
+                    Some((_, CellPayload::Value(_) | CellPayload::Overflow { .. }, _)) => {
                         unreachable!(
                             "nodo interno con valor: `entries` solo contiene `CellPayload::Child`"
                         )
                     }
-                    None => 0,
+                    None => (0, false),
                 },
             };
 
             if entries.is_empty() {
                 tx.free(page_no);
-                return Ok(if extra == 0 { Removal::Gone } else { Removal::Updated(extra) });
+                return Ok(if extra == 0 {
+                    Removal::Gone
+                } else {
+                    Removal::Updated(extra, extra_plain)
+                });
             }
-            match emit(tx, Some(page_no), PageType::Internal, extra, &entries)? {
-                Insertion::Updated(p) => Ok(Removal::Updated(p)),
+            let children_plain = extra_plain && entries.iter().all(|(_, _, plain)| *plain);
+            let plain_entries: Vec<(Vec<u8>, CellPayload)> =
+                entries.into_iter().map(|(k, c, _)| (k, c)).collect();
+            match emit(
+                tx,
+                Some(page_no),
+                PageType::Internal,
+                extra,
+                &plain_entries,
+                children_plain,
+            )? {
+                Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
                 Insertion::Split { .. } => unreachable!("borrar no divide"),
             }
         }
@@ -2104,6 +2302,19 @@ mod invariant_tests {
         }
     }
 
+    /// `true` si `child` es, de verdad, una hoja sin ninguna entrada de
+    /// overflow — abriéndola para comprobarlo, al contrario que
+    /// `free_subtree`, que existe precisamente para no tener que hacerlo.
+    /// Aquí, en una prueba, sí toca: es el criterio de verdad contra el que
+    /// `check_invariants` contrasta el bit `children_plain()`.
+    fn child_is_actually_plain(tx: &impl PageSource, child: PageNo) -> bool {
+        let bytes = tx.read_page(child).unwrap();
+        let page = PageRef::parse(&bytes, child).unwrap();
+        page.page_type() == PageType::Leaf
+            && (0..page.n_slots())
+                .all(|i| !matches!(page.leaf_value(i), LeafValue::Overflow { .. }))
+    }
+
     /// Recorre el árbol entero y comprueba, recursivamente, que cada
     /// separador de cada nodo interno particiona correctamente a sus hijos:
     /// c_i solo tiene claves < s_i, c_n (extra) solo tiene claves >= s_{n-1}.
@@ -2154,6 +2365,37 @@ mod invariant_tests {
                     page.n_slots() >= 1,
                     "nodo interno {page_no} sin separadores: un solo hijo, degenerado"
                 );
+                // Tarea 15, ronda 1 de revisión, hallazgos 1+2: si esta
+                // página afirma `children_plain()`, TODOS sus hijos
+                // DIRECTOS deben ser hojas sin overflow de verdad —
+                // `free_subtree` (`tree.rs`) se fía de este bit para
+                // liberarlos sin abrirlos, así que un falso positivo aquí
+                // es exactamente el defecto que causó las dos fugas
+                // críticas. Reutilizar `check_invariants` para esta
+                // comprobación es deliberado: ya se llama tras cargas de
+                // churn aleatorio extensas en varias pruebas de este
+                // fichero (inserción/borrado intercalados, órdenes
+                // aleatorios), así que cualquier caso en el que
+                // `insert_rec`/`delete_rec`/`delete_range_rec` calculen mal
+                // el bit se delata aquí, gratis, sin necesitar una prueba
+                // dedicada por cada camino que lo actualiza.
+                if page.children_plain() {
+                    for i in 0..page.n_slots() {
+                        assert!(
+                            child_is_actually_plain(tx, page.child(i)),
+                            "nodo interno {page_no} afirma children_plain() pero el hijo \
+                             {} (página {}) no es una hoja sin overflow",
+                            i,
+                            page.child(i)
+                        );
+                    }
+                    assert!(
+                        child_is_actually_plain(tx, page.extra()),
+                        "nodo interno {page_no} afirma children_plain() pero su hijo extra \
+                         (página {}) no es una hoja sin overflow",
+                        page.extra()
+                    );
+                }
                 let mut prev_sep: Option<Vec<u8>> = None;
                 for i in 0..page.n_slots() {
                     let sep = page.key(i);
@@ -3916,6 +4158,20 @@ mod range_tests {
         }
     }
 
+    /// `delete_range(ns, b"", b"\xff\xff\xff\xff")` es el idioma del brief
+    /// para "todo el espacio de claves `ns`", y se repite tal cual en varias
+    /// pruebas de este módulo. **Hallazgo 7 del informe de revisión de la
+    /// ronda 1**: NO es literalmente "todo" — deja fuera cualquier clave
+    /// `>= b"\xff\xff\xff\xff"` (por ejemplo `b"\xff\xff\xff\xff\x00"` o
+    /// `b"\xff\xff\xff\xff\xff"`), porque `to` es un límite EXCLUSIVO de 4
+    /// bytes concretos, no "infinito". Se conserva el idioma tal cual lo da
+    /// el brief — es exacto para las claves que sí siembran las pruebas de
+    /// este módulo (como mucho 7 bytes, "NNNNNN" o variantes cortas, todas
+    /// muy por debajo de ese límite) — pero el nombre de la prueba
+    /// ("_the_whole_range_", no "todo el espacio de claves posible") es la
+    /// afirmación correcta: vacía el árbol PORQUE ninguna clave sembrada
+    /// llega a `\xff\xff\xff\xff`, no porque el idioma cubra el espacio de
+    /// claves entero en general.
     #[test]
     fn deleting_the_whole_range_empties_the_tree() {
         let db = seeded(2000);
@@ -4387,6 +4643,345 @@ mod range_bound_tests {
             elapsed.as_secs() < 2,
             "con la cota de trabajo esto debe fallar rápido, no explorar 2^{k} caminos: \
              tardó {elapsed:?}"
+        );
+    }
+}
+
+/// Ronda 1 de revisión de la tarea 15: los dos hallazgos críticos (1 y 2)
+/// eran fugas de página — páginas que el asignador seguía contando como "en
+/// uso" pero que ningún camino desde la raíz alcanzaba ya. `check_invariants`
+/// (tareas 11-12), que reutiliza `range_tests`, NO podía verlas: solo
+/// recorre el árbol RESULTANTE, así que confirma que lo que sobrevive está
+/// bien formado, pero es ciego a lo que debería haberse liberado y no lo
+/// fue — precisamente el hueco por el que sobrevivieron los dos hallazgos a
+/// la autorrevisión original de esta tarea (hallazgo 6 del informe de
+/// revisión). Este módulo añade la comprobación que sí las habría visto:
+/// contar las páginas alcanzables desde la raíz (árbol MÁS cadenas de
+/// overflow) y compararlas contra `WriteTxn::pages_in_use` — un desajuste
+/// por debajo es una fuga, por encima un doble-free.
+#[cfg(all(test, feature = "std"))]
+mod range_accounting_tests {
+    use super::invariant_tests::{check_invariants, Rng};
+    use super::*;
+    use crate::storage::MemStorage;
+    use crate::tx::{Db, Options};
+    use alloc::collections::BTreeSet;
+
+    fn db() -> Db {
+        Db::create(Box::new(MemStorage::new()), Options::default()).unwrap()
+    }
+
+    /// Recorre el árbol entero desde `root` y devuelve el conjunto de
+    /// páginas alcanzables: las del propio árbol (hojas e internos) MÁS las
+    /// de cada cadena de overflow que cuelgue de una hoja — a diferencia de
+    /// `check_invariants`, que solo mira la estructura del árbol y nunca
+    /// abre una cadena de overflow.
+    fn reachable_pages(tx: &impl PageSource, root: PageNo) -> BTreeSet<PageNo> {
+        let mut seen = BTreeSet::new();
+        if root != 0 {
+            walk_reachable(tx, root, &mut seen);
+        }
+        seen
+    }
+
+    fn walk_reachable(tx: &impl PageSource, page_no: PageNo, seen: &mut BTreeSet<PageNo>) {
+        // `insert` devuelve `false` si ya estaba: evita un bucle infinito
+        // si la propia prueba, por error, construyera algo cíclico — no es
+        // la cota de profundidad del árbol real (esta función es solo para
+        // pruebas, sobre árboles que las propias pruebas construyen).
+        if !seen.insert(page_no) {
+            return;
+        }
+        let bytes = tx.read_page(page_no).unwrap();
+        let page = PageRef::parse(&bytes, page_no).unwrap();
+        match page.page_type() {
+            PageType::Leaf => {
+                for i in 0..page.n_slots() {
+                    if let LeafValue::Overflow { first, .. } = page.leaf_value(i) {
+                        let mut current = first;
+                        while current != 0 && seen.insert(current) {
+                            let b = tx.read_page(current).unwrap();
+                            let p = PageRef::parse(&b, current).unwrap();
+                            current = p.extra();
+                        }
+                    }
+                }
+            }
+            PageType::Internal => {
+                for i in 0..page.n_slots() {
+                    walk_reachable(tx, page.child(i), seen);
+                }
+                walk_reachable(tx, page.extra(), seen);
+            }
+            _ => panic!("tipo de página inesperado en el árbol: {:?}", page.page_type()),
+        }
+    }
+
+    /// Las páginas que el asignador cuenta como "en uso" deben ser
+    /// EXACTAMENTE las alcanzables desde `root`, salvo el `baseline` fijo de
+    /// páginas de arranque (cabecera y las dos ranuras de meta —
+    /// `meta_b_page + 1` en `tx.rs`, 9 con el `page_size` por defecto) que
+    /// `pages_in_use()` cuenta pero que NUNCA forman parte del árbol, así
+    /// que `reachable_pages` nunca las ve. `baseline` debe capturarse con
+    /// `tx.pages_in_use()` justo tras `begin_write()`, antes de tocar el
+    /// árbol — así la resta aísla exactamente lo que este árbol añadió. Ni
+    /// una fuga ni un doble-free: es la comprobación de contabilidad de la
+    /// ronda 1 de revisión, como test helper permanente (hallazgo 6 de su
+    /// informe).
+    fn assert_accounting_matches(tx: &mut WriteTxn, root: PageNo, baseline: u32, ctx: &str) {
+        let reachable = reachable_pages(tx, root).len() as u32;
+        let in_use = tx.pages_in_use() - baseline;
+        assert_eq!(
+            reachable, in_use,
+            "{ctx}: páginas alcanzables ({reachable}) no coincide con páginas en uso según \
+             el asignador, descontando el arranque ({in_use}) — {} páginas {}",
+            in_use.abs_diff(reachable),
+            if in_use > reachable { "perdidas (fuga)" } else { "liberadas por duplicado" }
+        );
+    }
+
+    /// Hallazgo 1 del informe de revisión, CRÍTICO: reproduce exactamente
+    /// los números del informe (3000 claves, 15 valores de 2000 bytes,
+    /// `delete_range` sobre un tercio → 15 páginas huérfanas antes de la
+    /// corrección) pero usando la comprobación de contabilidad en vez de
+    /// `before - after > 25` (la prueba original, que el propio informe
+    /// señala que no podía distinguir "se liberaron ~150 hojas" de "se
+    /// liberaron ~150 hojas Y SE PERDIERON 15 páginas de overflow" — pasaba
+    /// igual en los dos casos).
+    #[test]
+    fn overflow_inside_a_bulk_freed_subtree_leaves_no_orphan_pages() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let baseline = tx.pages_in_use();
+        for i in 0..3000u32 {
+            tx.put(0x01, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
+        }
+        for i in 1000..1015u32 {
+            tx.put(0x01, alloc::format!("{i:06}").as_bytes(), &alloc::vec![7u8; 2000]).unwrap();
+        }
+        tx.delete_range(0x01, b"000500", b"002500").unwrap();
+        let root = tx.root();
+        assert_accounting_matches(
+            &mut tx,
+            root,
+            baseline,
+            "tras delete_range con overflow en bloque",
+        );
+        tx.commit().unwrap();
+    }
+
+    /// Hallazgo 2 del informe de revisión, CRÍTICO: `put`/`delete` sobre un
+    /// árbol de fanout bajo (claves de 127 bytes, cerca del límite de
+    /// `page_size / 4` — el mismo truco que usa
+    /// `churn_grows_depth_but_stays_within_the_measured_ceiling`, tarea 12,
+    /// para forzar poca ramificación con el `page_size` mínimo) produce, al
+    /// cabo de suficiente churn de borrado/reinserción, nodos internos con
+    /// hijos de tipo mixto (una hoja en una posición, un nodo interno en
+    /// otra) — el colapso de un solo hijo que documenta `MAX_DEPTH` más
+    /// arriba. Antes de la corrección del hallazgo 2, un `delete_range` que
+    /// alcanzara uno de esos nodos mixtos liberaba sus hermanos internos
+    /// como si fueran hojas, perdiendo sus subárboles enteros para
+    /// siempre. La comprobación de contabilidad tras CADA `delete_range`
+    /// intercalado con el churn es lo que lo delataría.
+    #[test]
+    fn churn_then_range_delete_on_a_low_fanout_tree_leaves_no_orphan_pages() {
+        let key_for = |i: u32| -> Vec<u8> {
+            let mut k = alloc::format!("{i:07}").into_bytes();
+            k.resize(127, b'k');
+            k
+        };
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let baseline = tx.pages_in_use();
+        let mut root = 0;
+        let n = 300u32;
+        for i in 0..n {
+            root = put(&mut tx, root, &key_for(i), b"v").unwrap();
+        }
+        tx.set_root(root);
+
+        // Semilla elegida a propósito, no la primera que se probó:
+        // verificada a mano (revirtiendo temporalmente la corrección del
+        // hallazgo 2 y confirmando que ESTA prueba falla con la versión
+        // rota, con un desajuste de 11 páginas en el paso 149) para que
+        // sea de verdad un guardián de regresión, no una prueba que por
+        // casualidad nunca llega a tocar un nodo mixto con esta semilla
+        // concreta — varias semillas candidatas (por ejemplo
+        // `0x5EED_1234`) SÍ pasaban incluso con el defecto presente.
+        let mut rng = Rng(0xC0FFEE);
+        let mut live: Vec<u32> = (0..n).collect();
+        for step in 0..2000u32 {
+            let idx = (rng.next() as usize) % live.len();
+            let victim = live.swap_remove(idx);
+            let cur_root = tx.root();
+            let (r, existed) = delete(&mut tx, cur_root, &key_for(victim)).unwrap();
+            assert!(existed, "clave {victim}");
+            tx.set_root(r);
+            let newest = n + step;
+            let cur_root = tx.root();
+            let r = put(&mut tx, cur_root, &key_for(newest), b"v").unwrap();
+            tx.set_root(r);
+            live.push(newest);
+
+            // Cada pocos pasos, un borrado de rango sobre un tramo
+            // aleatorio de las claves VIVAS — bastante para alcanzar
+            // nodos mixtos según van apareciendo por el churn, pero sin
+            // convertir la prueba en desproporcionadamente lenta.
+            if step % 50 == 49 {
+                live.sort_unstable();
+                let a = (rng.next() as usize) % live.len();
+                let b = (rng.next() as usize) % live.len();
+                let (lo, hi) = (a.min(b), a.max(b));
+                if lo < hi {
+                    let from = key_for(live[lo]);
+                    let to = key_for(live[hi]);
+                    // `delete_range` de `tree.rs` (sin espacio de claves),
+                    // no `tx.delete_range`: el árbol de esta prueba se
+                    // construye con `put`/`delete` crudos (sin el prefijo
+                    // de `scoped`), así que mezclar `tx.delete_range` (que
+                    // SÍ antepone `ns = 0x01`) buscaría un prefijo que
+                    // ninguna clave real tiene.
+                    let cur_root = tx.root();
+                    let new_root = delete_range(&mut tx, cur_root, &from, &to).unwrap();
+                    tx.set_root(new_root);
+                    let cur_root = tx.root();
+                    assert_accounting_matches(
+                        &mut tx,
+                        cur_root,
+                        baseline,
+                        &alloc::format!("paso {step}, borrado de rango {lo}..{hi}"),
+                    );
+                    live.retain(|&k| {
+                        let key = key_for(k);
+                        key.as_slice() < from.as_slice() || key.as_slice() >= to.as_slice()
+                    });
+                }
+            }
+        }
+
+        let mut visited = BTreeSet::new();
+        let final_root = tx.root();
+        check_invariants(&tx, final_root, None, None, &mut visited);
+        assert_accounting_matches(&mut tx, final_root, baseline, "final");
+    }
+
+    /// Construye a mano un nodo interno con dos hijos de tipo DISTINTO — una
+    /// hoja y un nodo interno con sus propias hojas — y `children_plain`
+    /// puesto deliberadamente a `false` (el valor correcto para esta
+    /// estructura, y también el que pone `PageBuilder` por defecto si nadie
+    /// lo toca). Comprueba directamente que `free_subtree` no confía en un
+    /// único hijo para todos: recorre cada uno según su tipo real y libera
+    /// el subárbol entero sin perder ninguna página, aunque el "hijo 0" (el
+    /// que la versión original de la tarea usaba como única muestra) sea
+    /// del tipo que NO delataría al hermano mixto.
+    #[test]
+    fn free_subtree_handles_a_hand_built_node_with_mixed_child_types() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let baseline = tx.pages_in_use();
+
+        // Hijo 0: una hoja normal, sin overflow.
+        let leaf0 = tx.alloc().unwrap();
+        let leaf0_bytes = PageBuilder::new(512, PageType::Leaf)
+            .build(&[(b"aa".as_slice(), CellPayload::Value(b"1"))])
+            .unwrap();
+        tx.write_page(leaf0, &leaf0_bytes).unwrap();
+
+        // Hijo 1 (extra): un nodo INTERNO de verdad, con dos hojas propias.
+        let grandleaf_a = tx.alloc().unwrap();
+        let ga_bytes = PageBuilder::new(512, PageType::Leaf)
+            .build(&[(b"ma".as_slice(), CellPayload::Value(b"2"))])
+            .unwrap();
+        tx.write_page(grandleaf_a, &ga_bytes).unwrap();
+        let grandleaf_b = tx.alloc().unwrap();
+        let gb_bytes = PageBuilder::new(512, PageType::Leaf)
+            .build(&[(b"za".as_slice(), CellPayload::Value(b"3"))])
+            .unwrap();
+        tx.write_page(grandleaf_b, &gb_bytes).unwrap();
+
+        let internal_child = tx.alloc().unwrap();
+        let mut icb = PageBuilder::new(512, PageType::Internal);
+        icb.set_extra(grandleaf_b);
+        icb.set_children_plain(true); // ESTE sí es homogéneo: sus dos hijos son hojas planas.
+        let ic_bytes = icb.build(&[(b"za".as_slice(), CellPayload::Child(grandleaf_a))]).unwrap();
+        tx.write_page(internal_child, &ic_bytes).unwrap();
+
+        // La raíz: hijo 0 = hoja, extra = interno. Mixta de verdad, y
+        // `children_plain` puesto a `false` a propósito.
+        let root = tx.alloc().unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(internal_child);
+        rb.set_children_plain(false);
+        let root_bytes = rb.build(&[(b"ma".as_slice(), CellPayload::Child(leaf0))]).unwrap();
+        tx.write_page(root, &root_bytes).unwrap();
+        tx.set_root(root);
+
+        let mut budget = RangeBudget::new(tx.n_pages());
+        free_subtree(&mut tx, root, 1, &mut budget).unwrap();
+
+        // Las cinco páginas construidas a mano (raíz, hoja0, interno-hijo,
+        // sus dos hojas) deben haber vuelto todas a la lista de libres —
+        // de vuelta exactamente al `baseline` de antes de construir nada.
+        assert_eq!(
+            tx.pages_in_use(),
+            baseline,
+            "algo del subárbol mixto no se liberó: quedan {} páginas de más en uso",
+            tx.pages_in_use() - baseline
+        );
+    }
+
+    /// Hallazgo 3 del informe de revisión, CRÍTICO: un nodo interno
+    /// corrupto con `extra == 0` no debe hacer que `free_subtree` empuje la
+    /// página 0 (la cabecera del fichero) a la lista de libres. Antes de
+    /// `validate_child`, esto pasaba en silencio (`Ok(())`) y la siguiente
+    /// escritura destruía la cabecera.
+    #[test]
+    fn free_subtree_rejects_a_corrupt_node_with_a_zero_child_instead_of_freeing_page_zero() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let leaf = tx.alloc().unwrap();
+        let leaf_bytes = PageBuilder::new(512, PageType::Leaf).build(&[]).unwrap();
+        tx.write_page(leaf, &leaf_bytes).unwrap();
+
+        let root = tx.alloc().unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        // `extra == 0`: corrupción — ningún `alloc()` legítimo reparte la
+        // página 0. `children_plain` a `true` para forzar el camino que
+        // vuelca hijos sin abrirlos, el que el hallazgo 3 encontró sin
+        // validar nada.
+        rb.set_extra(0);
+        rb.set_children_plain(true);
+        let root_bytes = rb.build(&[(b"m".as_slice(), CellPayload::Child(leaf))]).unwrap();
+        tx.write_page(root, &root_bytes).unwrap();
+
+        let mut budget = RangeBudget::new(tx.n_pages());
+        let err = free_subtree(&mut tx, root, 1, &mut budget).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::CellBounds, .. }),
+            "se esperaba CellBounds, se obtuvo {err:?}"
+        );
+    }
+
+    /// Mismo hallazgo 3, pero con un hijo que apunta MÁS ALLÁ del final del
+    /// fichero (`>= n_pages`) en vez de a la página reservada `0`.
+    #[test]
+    fn free_subtree_rejects_a_child_pointing_past_the_end_of_the_file() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let n_pages = tx.n_pages();
+
+        let root = tx.alloc().unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(n_pages + 1000); // ninguna página así existe todavía
+        rb.set_children_plain(true);
+        let root_bytes = rb.build(&[]).unwrap();
+        tx.write_page(root, &root_bytes).unwrap();
+
+        let mut budget = RangeBudget::new(tx.n_pages());
+        let err = free_subtree(&mut tx, root, 1, &mut budget).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::CellBounds, .. }),
+            "se esperaba CellBounds, se obtuvo {err:?}"
         );
     }
 }
