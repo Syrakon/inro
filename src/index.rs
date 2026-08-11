@@ -778,12 +778,20 @@ mod tests {
     /// con `Error::KeyTooLarge` en un `put` perfectamente legítimo.
     ///
     /// Extraído de `proptest` (`tests/props.rs`,
-    /// `the_secondary_index_matches_a_recomputed_index_after_every_op`),
-    /// que lo encuentra de forma fiable con un puñado de casos aleatorios —
-    /// reproducido aquí con `PROPTEST_CASES=300
-    /// PROPTEST_MAX_SHRINK_ITERS=200000 cargo test --test props
+    /// `the_secondary_index_matches_a_recomputed_index_after_every_op`).
+    /// **No "de forma fiable" al número de casos por defecto** (corrección
+    /// de la ronda de revisión de la tarea 19 que encontró esta frase
+    /// demasiado optimista): medido con `PROPTEST_CASES=20` explícito
+    /// (el valor por defecto de este fichero, ver `tests/props.rs`), diez
+    /// ejecuciones independientes solo fallan en 3 — de ahí el fichero
+    /// `tests/props.proptest-regressions`, comiteado con esta misma
+    /// corrección: registra la semilla exacta que sí lo encuentra, para que
+    /// `cargo test` la repita SIEMPRE, sin depender de acertar con el nº de
+    /// casos aleatorios de turno. Reproducido aquí a mano con
+    /// `PROPTEST_CASES=1000 PROPTEST_MAX_SHRINK_ITERS=500000 cargo test
+    /// --test props
     /// the_secondary_index_matches_a_recomputed_index_after_every_op` y
-    /// reducido a mano desde ahí hasta estos nueve `put`. **El nombre del
+    /// reducido desde ahí hasta estos nueve `put`. **El nombre del
     /// índice importa tanto como las claves y valores**: forma parte del
     /// registro de catálogo (`ns` 0x00) que comparte hoja con los demás, así
     /// que cambiar su longitud en un solo byte desplaza el presupuesto justo

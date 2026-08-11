@@ -326,6 +326,7 @@ impl Freelist {
         pager: &Pager,
         alloc: &mut dyn FnMut() -> Result<PageNo>,
         txn: TxnId,
+        oldest_reader: Option<TxnId>,
         next_nonce: &mut dyn FnMut() -> Result<u64>,
     ) -> Result<(PageNo, PageNo)> {
         // Antes de serializar hay que absorber TODO lo que `load` dejó sin
@@ -395,6 +396,75 @@ impl Freelist {
         let page_size = pager.logical_page_size() as usize;
         let capacity = (page_size - FREELIST_HEADER) / 4;
 
+        // Fuente los contenedores que va a hacer falta escribir a partir de
+        // páginas YA libres (de transacciones ANTERIORES a esta) en vez de
+        // extender el fichero por cada una — tarea 19, segunda ronda de
+        // revisión tras el hallazgo de crecimiento cuadrático: sin esto,
+        // cada contenedor que un `commit` necesita es una página física
+        // NUEVA para siempre, y el reciclado de `written_head` (arriba)
+        // convierte el contenedor de HOY en una entrada libre más para el
+        // `commit` de MAÑANA, que a su vez necesita otro contenedor para
+        // describirla — 300 páginas físicas tras 30 `commit` de un solo
+        // `put`, 374 418 tras 500, medido sin este bloque (ver el informe
+        // de la tarea 19 y el test `freelist_growth_stays_bounded_over_
+        // many_commits` en `tx.rs`).
+        //
+        // Tiene que vivir AQUÍ, dentro de `flush`, y no en la persona que
+        // llama (`WriteTxn::commit`, `tx.rs`): solo aquí, tras
+        // `fill_from_disk` y el reciclado de `written_head` justo arriba,
+        // se conoce el contenido FINAL de `self.groups` que hace falta
+        // serializar — calcularlo fuera trabajaría sobre una fotografía
+        // que este mismo `flush` todavía va a cambiar.
+        //
+        // `self.pop(oldest_reader)` — la misma función que sirve
+        // `WriteTxn::alloc`, con la misma cota de lector — es sobre `self`,
+        // así que sacar una página de `self.groups` para usarla de
+        // contenedor no es la recursión con la que se descartaba
+        // reutilizar (comentario antiguo, ya no vigente): no hay ningún
+        // cierre externo reentrando en `self.groups` mientras algo más lo
+        // recorre, es una secuencia de pasos sobre el mismo `&mut self`,
+        // uno detrás de otro.
+        //
+        // `needed` (páginas que hacen falta) es MONÓTONA NO CRECIENTE
+        // mientras se saca de aquí mismo: cada página que se saca quita
+        // exactamente una entrada de un grupo, así que `needed` baja como
+        // mucho en 1 por cada una (nunca sube) — de ahí que el bucle
+        // termine: la diferencia `needed - reused.len()` no puede crecer.
+        // Puede haber UN sobrante como mucho (si sacar la última página que
+        // parecía hacer falta baja `needed` justo en ese paso) — el
+        // segundo bucle, más abajo, lo devuelve antes de escribir nada, así
+        // que nunca queda una página fuera de la foto que este mismo
+        // `flush` va a dejar en disco (a diferencia de devolverla DESPUÉS
+        // de llamar, que es como una versión anterior de este cambio
+        // perdía páginas de verdad — confirmado con
+        // `pages_are_never_lost_or_double_allocated`, tarea 19).
+        let needed = |groups: &VecDeque<Group>| -> usize {
+            groups
+                .iter()
+                .filter(|g| !g.pages.is_empty())
+                .map(|g| g.pages.len().div_ceil(capacity))
+                .sum()
+        };
+        let mut reused: alloc::vec::Vec<PageNo> = alloc::vec::Vec::new();
+        while reused.len() < needed(&self.groups) {
+            match self.pop(oldest_reader) {
+                Some(p) => reused.push(p),
+                None => break,
+            }
+        }
+        while reused.len() > needed(&self.groups) {
+            // Sobrante de la convergencia de arriba (ver su comentario):
+            // se devuelve etiquetado con ESTA transacción — tan seguro
+            // como cualquier otra página que libera por cualquier otro
+            // motivo — y, al pasar por `push`, vuelve a contar para
+            // `needed` en la siguiente vuelta del bucle de escritura, más
+            // abajo, sin ningún hueco temporal sin cubrir.
+            if let Some(p) = reused.pop() {
+                self.push(p, txn);
+            }
+        }
+        let mut reused = reused.into_iter();
+
         // Se escribe de la cola hacia la cabeza para poder enlazar cada página
         // con la siguiente, que ya tiene número asignado. Dentro de un mismo
         // grupo, los trozos también se escriben en ese orden (el trozo más
@@ -409,7 +479,10 @@ impl Freelist {
         for group in self.groups.iter().rev() {
             let flat: alloc::vec::Vec<PageNo> = group.pages.iter().copied().collect();
             for chunk in flat.chunks(capacity).rev() {
-                let page_no = alloc()?;
+                let page_no = match reused.next() {
+                    Some(p) => p,
+                    None => alloc()?,
+                };
                 let mut b = vec![0u8; page_size];
                 b[0] = PageType::Freelist as u8;
                 b[12..16].copy_from_slice(&next.to_le_bytes());
@@ -482,10 +555,12 @@ impl Freelist {
     /// una sentada: `pop_refill` trae solo lo que hace falta, y `flush` ya
     /// absorbe el tramo intermedio con `fill_from_disk` en bucle.
     ///
-    /// Puramente de lectura — a diferencia del intento de reciclado que se
-    /// descartó en `flush` (ver su comentario), esto no cambia qué páginas
-    /// se ofrecen a `alloc`, así que no hereda ninguno de los problemas de
-    /// durabilidad de aquel: es sólo para el diagnóstico de `audit_pages`.
+    /// Puramente de lectura — a diferencia de la reutilización de `flush`
+    /// (ver su comentario), esto no cambia qué páginas se ofrecen a
+    /// `alloc`, así que no hereda ninguno de sus problemas de durabilidad
+    /// (el mismo guardián de lector más antiguo que usa `flush` internamente
+    /// ya los cierra, en cualquier caso): es sólo para el diagnóstico de
+    /// `audit_pages`.
     ///
     /// Mismo guardián de ciclos que `fill_from_disk` (comentario ahí):
     /// una cadena bien formada visita cada página física del fichero como
@@ -628,6 +703,17 @@ mod tests {
                     Ok(next)
                 },
                 5,
+                // `Some(0)`, no `None`: TODO lo que hay aquí lleva `max_txn
+                // = 5` (el mismo `txn` de este `flush`), así que con
+                // `None` (sin ningún lector, cualquier página es "segura")
+                // la reutilización nueva de `flush` (ver su comentario)
+                // consumiría del propio contenido bajo prueba como si
+                // fueran contenedores — exactamente lo que este test NO
+                // quiere: que el orden 100..400 sobreviva intacto al viaje
+                // a disco. `0` deja fuera a todo (`0 < 5`), como
+                // `WriteTxn::commit` deja fuera siempre las páginas que
+                // libera esta misma transacción.
+                Some(0),
                 &mut || {
                     counter += 1;
                     Ok(counter)
@@ -651,7 +737,7 @@ mod tests {
         let p = pager();
         let mut f = Freelist::empty();
         let (head, tail) = f
-            .flush(&p, &mut || panic!("no debe asignar"), 5, &mut || panic!("no debe pedir contador"))
+            .flush(&p, &mut || panic!("no debe asignar"), 5, None, &mut || panic!("no debe pedir contador"))
             .unwrap();
         assert_eq!((head, tail), (0, 0));
     }
@@ -673,6 +759,7 @@ mod tests {
                     Ok(next)
                 },
                 5,
+                Some(0), // ver el comentario en `survives_a_flush_and_load_roundtrip`
                 &mut || {
                     counter += 1;
                     Ok(counter)
