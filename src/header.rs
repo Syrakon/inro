@@ -29,6 +29,13 @@ pub struct Geometry {
 
 impl Geometry {
     pub fn encode(&self) -> [u8; HEADER_SIZE] {
+        // encode derives log2 from trailing_zeros, which is only meaningful for a power of two.
+        // This asserts that page_size is a power of two with log2 in range 9..=16.
+        debug_assert!(
+            (9..=16).contains(&self.page_size.trailing_zeros()),
+            "page_size must be a power of two with log2 in range 9..=16, got {}",
+            self.page_size
+        );
         let mut b = [0u8; HEADER_SIZE];
         b[0..8].copy_from_slice(MAGIC);
         b[8..10].copy_from_slice(&self.format_major.to_le_bytes());
@@ -107,6 +114,13 @@ mod tests {
     #[test]
     fn roundtrip_preserves_every_field() {
         let g = sample();
+        assert_eq!(Geometry::decode(&g.encode()).unwrap(), g);
+    }
+
+    #[test]
+    fn roundtrip_at_max_page_size() {
+        let mut g = sample();
+        g.page_size = MAX_PAGE_SIZE; // 65_536 (log2 = 16)
         assert_eq!(Geometry::decode(&g.encode()).unwrap(), g);
     }
 
