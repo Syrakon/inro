@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use crate::freelist::Freelist;
 use crate::header::{Geometry, FORMAT_MAJOR, MAX_PAGE_SIZE, MIN_PAGE_SIZE};
+use crate::index::{index_key, primary_of, IndexDef, CATALOG_NS};
 use crate::meta::{Meta, MetaSlot};
 use crate::pager::Pager;
 use crate::{Error, PageNo, Result, Storage, TxnId};
@@ -46,6 +47,11 @@ pub struct Db {
     readers: Mutex<BTreeMap<TxnId, u32>>,
     sync: Sync,
     last_sync: Mutex<Instant>,
+    /// Índices registrados en este proceso (tarea 16). Vacío hasta que el
+    /// llamante invoca `define_index`; nunca se relee solo de disco — cada
+    /// apertura debe volver a registrar sus índices, porque el extractor es
+    /// código del llamante y no vive en el fichero.
+    indexes: Mutex<Vec<IndexDef>>,
 }
 
 /// Estado que sobrevive entre transacciones de escritura: la lista de libres
@@ -141,6 +147,7 @@ impl Db {
             readers: Mutex::new(BTreeMap::new()),
             sync: opts.sync,
             last_sync: Mutex::new(Instant::now()),
+            indexes: Mutex::new(Vec::new()),
         }
     }
 }
@@ -241,6 +248,31 @@ impl<'db> ReadTxn<'db> {
     /// coincidir.
     pub fn scan(&self, ns: u8, from: &[u8], to: &[u8]) -> Result<crate::tree::Cursor<'_, Self>> {
         crate::tree::Cursor::new(self, self.meta.root, ns, from, to)
+    }
+
+    /// Claves primarias cuyas entradas de índice caen en `[from, to)`
+    /// (tarea 16). `from`/`to` se comparan contra el valor indexado: en un
+    /// índice no único eso es solo el prefijo de la entrada, nunca la clave
+    /// primaria ni la longitud que le siguen, así que el orden que ve quien
+    /// llama es el del valor indexado, aunque la clave real en el árbol
+    /// lleve más bytes detrás.
+    pub fn scan_index(&self, id: u8, from: &[u8], to: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let def = self
+            .db
+            .indexes
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|d| d.id == id)
+            .ok_or(Error::BadFormat)?;
+
+        let mut out = Vec::new();
+        let mut cursor = self.scan(def.index_ns(), from, to)?;
+        while let Some((k, v)) = cursor.next()? {
+            out.push(if def.unique { v } else { primary_of(&k)?.to_vec() });
+        }
+        Ok(out)
     }
 }
 
@@ -528,18 +560,122 @@ impl<'db> WriteTxn<'db> {
         Ok(())
     }
 
-    pub fn put(&mut self, ns: u8, key: &[u8], value: &[u8]) -> Result<()> {
+    /// Escritura sin mantenimiento de índices. `put` (más abajo) la envuelve
+    /// para actualizar también los índices secundarios dentro de la misma
+    /// transacción; `define_index` también la usa directamente para escribir
+    /// el catálogo, que nunca está indexado.
+    fn put_raw(&mut self, ns: u8, key: &[u8], value: &[u8]) -> Result<()> {
         let full = scoped(ns, key);
         let root = crate::tree::put(self, self.meta.root, &full, value)?;
         self.meta.root = root;
         Ok(())
     }
 
-    pub fn delete(&mut self, ns: u8, key: &[u8]) -> Result<bool> {
+    /// Borrado sin mantenimiento de índices. Ver `put_raw`.
+    fn delete_raw(&mut self, ns: u8, key: &[u8]) -> Result<bool> {
         let full = scoped(ns, key);
         let (root, existed) = crate::tree::delete(self, self.meta.root, &full)?;
         self.meta.root = root;
         Ok(existed)
+    }
+
+    /// Escribe `key`/`value` en `ns` y mantiene, dentro de la MISMA
+    /// transacción, cualquier índice secundario definido sobre `ns` (tarea
+    /// 16) — esa atomicidad es lo único que un índice mantenido a mano con
+    /// prefijos de clave no puede dar.
+    ///
+    /// **Contrato de error, igual que `tree::put` (ver su comentario): si
+    /// esta función devuelve `Err`, abandona la transacción — déjala caer
+    /// sin `commit` — en vez de reintentar sobre el mismo `tx`.** No hace
+    /// falta para el caso más peligroso, el que motivó este comentario: una
+    /// clave de índice no único es `indexado + primaria + 2`, y ambas
+    /// mitades pueden ser individualmente legales (`page_size / 4` cada una,
+    /// tarea 11) y aun así superar el límite juntas. Ese caso, y una
+    /// violación de unicidad, se comprueban ENTEROS antes de mutar ninguna
+    /// página (ver el bucle de más abajo): si van a fallar, fallan limpio,
+    /// sin haber tocado el dato ni ningún índice, exactamente como ya hace
+    /// `tree::put` con una clave primaria de sobra. El contrato de abandonar
+    /// la transacción cubre lo que queda: un error real de motor (`Corrupt`,
+    /// `Full`) a mitad de aplicar las mutaciones ya planeadas, el mismo tipo
+    /// de fallo catastrófico que ya obliga a abandonar cualquier `put`/
+    /// `delete` de este motor.
+    pub fn put(&mut self, ns: u8, key: &[u8], value: &[u8]) -> Result<()> {
+        let defs = self.db.indexes_for(ns);
+        if defs.is_empty() {
+            return self.put_raw(ns, key, value);
+        }
+
+        let max_key = self.page_size() / 4;
+        let previous = self.get(ns, key)?;
+
+        // Fase de planificación: solo lecturas, ninguna página se toca
+        // todavía. Recoge qué entradas de índice hay que borrar (las viejas,
+        // derivadas del valor anterior — su tamaño ya se validó cuando se
+        // insertaron, así que borrarlas nunca puede fallar por tamaño) y
+        // cuáles insertar (las nuevas, derivadas de `value`), validando de
+        // paso el tamaño de cada una nueva y, en un índice único, que no
+        // colisione con la de OTRA fila.
+        //
+        // La comprobación de unicidad compara la clave primaria ALMACENADA,
+        // no solo si la entrada existe: así una fila que se reescribe con el
+        // mismo valor indexado que ya tenía (p. ej. solo cambió una parte no
+        // indexada del valor) no se confunde consigo misma. Comparar solo
+        // existencia obligaría a borrar la entrada vieja ANTES de comprobar
+        // duplicados para que este caso no fallara — y borrar antes de
+        // validar es exactamente la mutación prematura que este bloque
+        // entero existe para evitar.
+        let mut deletions: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut insertions: Vec<(u8, Vec<u8>, Vec<u8>)> = Vec::new();
+
+        for def in &defs {
+            if let Some(old) = &previous {
+                for ik in (def.extract)(key, old) {
+                    deletions.push((def.index_ns(), index_key(def, &ik, key)));
+                }
+            }
+            for ik in (def.extract)(key, value) {
+                let entry = index_key(def, &ik, key);
+                if entry.len() as u32 > max_key {
+                    return Err(Error::KeyTooLarge { len: entry.len() as u32, max: max_key });
+                }
+                if def.unique
+                    && let Some(existing_pk) = self.get(def.index_ns(), &ik)?
+                    && existing_pk != key
+                {
+                    return Err(Error::DuplicateKey { id: def.id });
+                }
+                let payload = if def.unique { key.to_vec() } else { Vec::new() };
+                insertions.push((def.index_ns(), entry, payload));
+            }
+        }
+
+        // Fase de aplicación: todo lo de arriba ya validó limpio, así que de
+        // aquí en adelante solo puede fallar por un error real de motor —
+        // el caso que el contrato de "abandona la transacción" ya cubre.
+        for (idx_ns, k) in &deletions {
+            self.delete_raw(*idx_ns, k)?;
+        }
+        for (idx_ns, k, v) in &insertions {
+            self.put_raw(*idx_ns, k, v)?;
+        }
+        self.put_raw(ns, key, value)
+    }
+
+    /// Borra `key` de `ns` y sus entradas de índice asociadas (tarea 16),
+    /// dentro de la misma transacción. Mismo contrato de error que `put`:
+    /// abandona la transacción si devuelve `Err`.
+    pub fn delete(&mut self, ns: u8, key: &[u8]) -> Result<bool> {
+        let defs = self.db.indexes_for(ns);
+        if !defs.is_empty()
+            && let Some(old) = self.get(ns, key)?
+        {
+            for def in &defs {
+                for ik in (def.extract)(key, &old) {
+                    self.delete_raw(def.index_ns(), &index_key(def, &ik, key))?;
+                }
+            }
+        }
+        self.delete_raw(ns, key)
     }
 
     /// Borra todas las claves de `[from, to)` dentro del espacio `ns`.
@@ -631,6 +767,56 @@ impl Db {
                 Ok(())
             }
         }
+    }
+}
+
+impl Db {
+    /// Registra un índice (tarea 16). Si el catálogo ya tiene ese `id` con
+    /// otra versión, falla: el llamante decide si reconstruirlo o corregir
+    /// el extractor — `version` es la única defensa posible, porque la
+    /// lógica de indexado vive en código del llamante y el motor no puede
+    /// comprobar por sí mismo si `extract` cambió.
+    ///
+    /// Registrar el mismo `id` dos veces en el mismo proceso (misma versión)
+    /// es idempotente: sustituye la entrada en memoria en vez de duplicarla.
+    /// Sin esto, una segunda llamada dejaría dos copias del mismo `IndexDef`
+    /// en `indexes`, y `indexes_for` se lo entregaría dos veces a
+    /// `WriteTxn::put`/`delete` — no corrompe nada (borrar y volver a poner
+    /// la misma entrada es idempotente), pero duplica trabajo en cada
+    /// escritura para siempre, en silencio.
+    pub fn define_index(&self, def: IndexDef) -> Result<()> {
+        if def.id >= 0x80 {
+            return Err(Error::BadFormat);
+        }
+        let mut tx = self.begin_write()?;
+        match tx.get(CATALOG_NS, &[def.id])? {
+            Some(record) => {
+                let stored = IndexDef::stored_version(&record).ok_or(Error::BadFormat)?;
+                if stored != def.version {
+                    return Err(Error::IndexVersionMismatch {
+                        id: def.id,
+                        stored,
+                        provided: def.version,
+                    });
+                }
+            }
+            None => {
+                tx.put_raw(CATALOG_NS, &[def.id], &def.encode())?;
+                tx.commit()?;
+            }
+        }
+        let mut indexes = self.indexes.lock().unwrap();
+        match indexes.iter_mut().find(|d| d.id == def.id) {
+            Some(slot) => *slot = def,
+            None => indexes.push(def),
+        }
+        Ok(())
+    }
+
+    /// Índices registrados sobre el espacio de claves `ns`, en el orden en
+    /// que se definieron.
+    fn indexes_for(&self, ns: u8) -> Vec<IndexDef> {
+        self.indexes.lock().unwrap().iter().copied().filter(|d| d.ns == ns).collect()
     }
 }
 

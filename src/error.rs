@@ -17,6 +17,8 @@ pub enum Error {
     WriterBusy,
     /// El extractor registrado no coincide con el que construyó el índice.
     IndexVersionMismatch { id: u8, stored: u32, provided: u32 },
+    /// Un índice único ya contiene ese valor indexado.
+    DuplicateKey { id: u8 },
     KeyTooLarge { len: u32, max: u32 },
     /// No queda espacio direccionable: el fichero alcanzó 2^32 páginas.
     Full,
