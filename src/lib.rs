@@ -16,6 +16,7 @@ pub(crate) mod varint;
 pub mod storage;
 pub mod header;
 pub mod meta;
+pub mod page;
 
 pub use error::{CorruptKind, Error, IoError, Result};
 pub use storage::Storage;
