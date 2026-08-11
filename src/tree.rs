@@ -1071,6 +1071,20 @@ mod invariant_tests {
                 }
             }
             PageType::Internal => {
+                // Un nodo interno con cero separadores tiene un único hijo:
+                // no ramifica, añade profundidad sin ningún beneficio, y es
+                // exactamente el nodo degenerado del que depende el
+                // argumento de `MAX_DEPTH`. `put` nunca lo produce (una
+                // división interna necesita al menos tres entradas, ver el
+                // `debug_assert` de `emit`) y `delete_rec` lo colapsa en vez
+                // de dejarlo persistir (la rama `entries.is_empty()`). Sin
+                // esta comprobación, `check_invariants` recorrería ese nodo
+                // igual que cualquier otro y nunca vería el propio caso que
+                // debería delatar.
+                assert!(
+                    page.n_slots() >= 1,
+                    "nodo interno {page_no} sin separadores: un solo hijo, degenerado"
+                );
                 let mut prev_sep: Option<Vec<u8>> = None;
                 for i in 0..page.n_slots() {
                     let sep = page.key(i);
