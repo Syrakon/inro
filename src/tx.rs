@@ -207,15 +207,43 @@ impl<'db> ReadTxn<'db> {
         self.meta.txn_id
     }
 
-    pub fn root(&self) -> PageNo {
+    /// Raíz cruda del árbol de datos. Plomería de página (ronda 3 de
+    /// revisión de la tarea 16, mismo motivo que `WriteTxn::root`/
+    /// `set_root`/`read_page`/`alloc`/`free` más abajo): fuera del crate no
+    /// hay nada legítimo que hacer con un número de página suelto, y
+    /// tenerlo público era justo lo que le permitía a un llamante externo
+    /// reconstruir un `Cursor` sobre esta raíz saltándose `scan`, o
+    /// simplemente leer estructura interna que no forma parte del
+    /// contrato — el contrato es `get`/`scan`/`scan_index`. Su único
+    /// llamador hoy son las pruebas de bajo nivel de `tree.rs` que montan
+    /// árboles a mano; de ahí el `#[cfg(test)]`, igual que `pages_read` más
+    /// arriba en este mismo `impl Db`.
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> PageNo {
         self.meta.root
     }
 
-    pub fn catalog_root(&self) -> PageNo {
+    /// Sin llamador, ni siquiera en pruebas: el catálogo de índices vive en
+    /// el árbol normal bajo `CATALOG_NS` (tarea 16), no en un árbol aparte
+    /// enraizado aquí. El campo `meta.catalog_root` en sí sigue siendo parte
+    /// del formato en disco (lo pedía el brief de la tarea 9, ver
+    /// `Meta::encode`/`decode`) y se queda reservado — este accesor, sin
+    /// nada que lo use, se marca explícitamente en vez de dejar el aviso de
+    /// código muerto sin explicar.
+    #[allow(dead_code)]
+    pub(crate) fn catalog_root(&self) -> PageNo {
         self.meta.catalog_root
     }
 
-    pub fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
+    /// Bytes crudos de una página por número. Plomería de página: ver el
+    /// comentario de `root`, arriba. `ReadTxn` también implementa
+    /// `PageSource` (también `pub(crate)`, mismo motivo) para que `tree.rs`
+    /// pueda leer páginas sin saber si viene de un lector o un escritor —
+    /// esa es la vía que usa el código de producción; este método inherente
+    /// solo lo llaman pruebas que ya tienen un `&ReadTxn` concreto en la
+    /// mano.
+    #[cfg(test)]
+    pub(crate) fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
         self.db.pager.read(page)
     }
 
@@ -306,7 +334,15 @@ pub(crate) fn scoped(ns: u8, key: &[u8]) -> Vec<u8> {
 
 /// Acceso a páginas común a lectores y escritores, para que el árbol se
 /// escriba una sola vez y sirva a ambos.
-pub trait PageSource {
+///
+/// `pub(crate)` (ronda 3 de revisión de la tarea 16): si este trait fuera
+/// público, un llamante externo podría invocar `read_page` a través de él
+/// (`PageSource::read_page(&tx, pagina)`) igual que a través del método
+/// inherente, sin que importara que ESE método inherente pasara a
+/// `pub(crate)` — la visibilidad de un método de trait la fija el trait
+/// entero, no cada implementación por separado, así que dejar el trait
+/// público habría dejado la misma puerta abierta con otro nombre.
+pub(crate) trait PageSource {
     fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>>;
 }
 
@@ -435,19 +471,44 @@ impl<'db> WriteTxn<'db> {
         self.meta.txn_id
     }
 
-    pub fn root(&self) -> PageNo {
+    /// Plomería de página cruda (ronda 3 de revisión de la tarea 16, junto
+    /// con `set_root`/`catalog_root`/`set_catalog_root`/`read_page`/
+    /// `write_page`/`alloc`/`free` más abajo). Antes de esta ronda, esto era
+    /// `pub`, y la revisión demostró exactamente el problema: con `set_root`
+    /// y `write_page` públicos, cualquiera puede construir una página a
+    /// mano, escribirla, y apuntar la raíz del árbol a ella sin pasar por
+    /// `put`/`delete` — es decir, sin que ningún índice se entere. Esa es
+    /// justo la garantía que la tarea 16 existe para dar, así que dejarla
+    /// bypasseable por una vía pública la volvía condicional a que quien
+    /// llama no usara una API que el propio crate anunciaba. `pub(crate)`
+    /// cierra el camino sin tocar ni una sola prueba interna.
+    ///
+    /// El código de producción no llama ni siquiera a la versión
+    /// `pub(crate)`: `put_raw`/`delete_raw` leen y escriben `self.meta.root`
+    /// directamente (acceso de campo, mismo módulo), y las funciones de
+    /// `tree.rs` reciben `root: PageNo` como parámetro explícito en vez de
+    /// pedírselo a un `WriteTxn`. El único llamador real son las pruebas de
+    /// bajo nivel de `tree.rs`, que montan árboles a mano página a página —
+    /// de ahí el `#[cfg(test)]`.
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> PageNo {
         self.meta.root
     }
 
-    pub fn set_root(&mut self, root: PageNo) {
+    #[cfg(test)]
+    pub(crate) fn set_root(&mut self, root: PageNo) {
         self.meta.root = root;
     }
 
-    pub fn catalog_root(&self) -> PageNo {
+    /// Sin llamador, ni siquiera en pruebas — ver el comentario gemelo en
+    /// `ReadTxn::catalog_root`.
+    #[allow(dead_code)]
+    pub(crate) fn catalog_root(&self) -> PageNo {
         self.meta.catalog_root
     }
 
-    pub fn set_catalog_root(&mut self, root: PageNo) {
+    #[allow(dead_code)]
+    pub(crate) fn set_catalog_root(&mut self, root: PageNo) {
         self.meta.catalog_root = root;
     }
 
@@ -543,7 +604,7 @@ impl<'db> WriteTxn<'db> {
     /// liberarla de nuevo (dentro de la misma transacción) es siempre
     /// seguro y debe ir a `own_free`, no a la lista persistente — ver
     /// `free`.
-    pub fn alloc(&mut self) -> Result<PageNo> {
+    pub(crate) fn alloc(&mut self) -> Result<PageNo> {
         if let Some(p) = self.own_free.pop() {
             return Ok(p);
         }
@@ -573,7 +634,7 @@ impl<'db> WriteTxn<'db> {
     /// de antes de esta transacción — del árbol confirmado — va a la lista
     /// de libres persistente etiquetada con esta transacción y no se
     /// reutiliza hasta que el commit la haga durable (ver `alloc`).
-    pub fn free(&mut self, page: PageNo) {
+    pub(crate) fn free(&mut self, page: PageNo) {
         if self.self_allocated.contains(&page) {
             self.own_free.push(page);
         } else {
@@ -582,11 +643,11 @@ impl<'db> WriteTxn<'db> {
         }
     }
 
-    pub fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
+    pub(crate) fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
         self.db.pager.read(page)
     }
 
-    pub fn write_page(&mut self, page: PageNo, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn write_page(&mut self, page: PageNo, bytes: &[u8]) -> Result<()> {
         self.db.pager.write(page, bytes)?;
         self.written.push(page);
         Ok(())

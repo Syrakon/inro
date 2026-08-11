@@ -1579,6 +1579,19 @@ const MAX_NEXT_WORK: u32 = 8 * MAX_DEPTH;
 /// Recorrido ordenado. Mantiene la pila de descenso porque las hojas no están
 /// encadenadas: encadenarlas obligaría, en copy-on-write, a reescribir la hoja
 /// anterior cada vez que su sucesora cambia de página.
+///
+/// `pub`, aunque vive en un módulo `pub(crate)` (ronda 3 de revisión de la
+/// tarea 16): `ReadTxn::scan` lo devuelve, así que tiene que poder nombrarse
+/// desde fuera del crate aunque `tree` no sea navegable — se reexporta suelto
+/// como `inro::Cursor` en `lib.rs`. `#[allow(private_bounds)]`: el aviso del
+/// compilador es real (`PageSource` es `pub(crate)`, más privado que este
+/// `struct` `pub`) pero inofensivo aquí — la única forma de conseguir un
+/// `Cursor` es `ReadTxn::scan`, que fija `S = ReadTxn<'_>` en concreto, así
+/// que nadie fuera del crate necesita nombrar `PageSource` ni puede
+/// implementarlo para su propio tipo; lo que sí gana con `Cursor` público es
+/// poder tipar una variable o un campo con él, que es justo lo que pide
+/// nombrarlo.
+#[allow(private_bounds)]
 pub struct Cursor<'a, S: PageSource> {
     src: &'a S,
     /// Raíz con la que se construyó el cursor. Se recuerda para que `seek`
@@ -1631,13 +1644,24 @@ pub struct Cursor<'a, S: PageSource> {
     poison: Option<Error>,
 }
 
+#[allow(private_bounds)] // ver el comentario de la definición del struct, arriba.
 impl<'a, S: PageSource> Cursor<'a, S> {
     /// Recorrido de `[from, to)` dentro del espacio de claves `ns`. `from` y
     /// `to` son claves SIN el byte de espacio, igual que en
     /// `get`/`put`/`delete` — el cursor antepone `ns` internamente con
     /// `scoped` (la misma transformación que usa el resto de la API) y lo
     /// recorta de cada clave que devuelve `next`.
-    pub fn new(src: &'a S, root: PageNo, ns: u8, from: &[u8], to: &[u8]) -> Result<Self> {
+    ///
+    /// `pub(crate)` (ronda 3 de revisión de la tarea 16, más allá del cierre
+    /// de la fuga de `ns` de la ronda 1 — ver el comentario de `ns` en la
+    /// definición del struct): un constructor público habría dejado
+    /// reconstruir un `Cursor` con cualquier `root: PageNo`, sin pasar por
+    /// `ReadTxn::scan` ni por la raíz de la transacción — otro camino para
+    /// leer el árbol saltándose `Db`, la misma familia de fuga que
+    /// `WriteTxn::write_page`/`set_root` (ver su comentario en `tx.rs`), solo
+    /// que de lectura en vez de escritura. La única vía sancionada para
+    /// conseguir un `Cursor` es `ReadTxn::scan`.
+    pub(crate) fn new(src: &'a S, root: PageNo, ns: u8, from: &[u8], to: &[u8]) -> Result<Self> {
         let scoped_from = crate::tx::scoped(ns, from);
         let scoped_to = crate::tx::scoped(ns, to);
         let mut c = Self::new_raw(src, root, &scoped_from, &scoped_to)?;

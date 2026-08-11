@@ -125,6 +125,14 @@ impl Pager {
         self.storage.sync()
     }
 
+    /// Sin llamador todavía (era parte del API público que pedía el brief
+    /// de la tarea 7; queda invisible al análisis de código muerto desde
+    /// que `pager` pasó a `pub(crate)` en la ronda 3 de revisión de la
+    /// tarea 16). Se conserva para cuando haga falta invalidar un lote de
+    /// páginas sin pasar por `write` una a una — p. ej. tras una
+    /// recuperación que descubre varias páginas huérfanas a la vez (ver
+    /// `Db::open`).
+    #[allow(dead_code)]
     pub fn invalidate(&self, pages: &[PageNo]) {
         let mut c = self.cache.lock().unwrap();
         for &p in pages {

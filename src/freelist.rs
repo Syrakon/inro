@@ -313,16 +313,33 @@ impl Freelist {
         Ok((head, tail))
     }
 
+    /// Sin llamador todavía (era parte del API público que pedía el brief
+    /// de la tarea 8; queda invisible al análisis de código muerto desde
+    /// que `freelist` pasó a `pub(crate)` en la ronda 3 de revisión de la
+    /// tarea 16). Se conserva para cuando `commit` quiera saltarse la
+    /// escritura de la lista de libres si esta transacción no la tocó.
+    #[allow(dead_code)]
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
     /// Páginas libres materializadas en memoria ahora mismo (no cuenta lo
     /// que sigue sin cargar en disco, referenciado por `next_on_disk`).
+    /// Solo tiene llamador en pruebas (`WriteTxn::pages_in_use`, también
+    /// `#[cfg(test)]`), así que se gatea igual para no quedar en el binario
+    /// de producción.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.groups.iter().map(|g| g.pages.len()).sum()
     }
 
+    /// Sin llamador, ni siquiera en pruebas — a diferencia de `len`, que sí
+    /// usa `WriteTxn::pages_in_use`. Se conserva por la pareja natural
+    /// `len`/`is_empty` (era parte del API público que pedía el brief de la
+    /// tarea 8) y porque clippy la pediría en cuanto alguien llamara a
+    /// `len() == 0` en vez de a esta.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
