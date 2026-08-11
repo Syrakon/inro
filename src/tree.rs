@@ -388,6 +388,128 @@ pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<
     }
 }
 
+/// Resultado de borrar en un subárbol.
+enum Removal {
+    /// Sin cambios: la clave no estaba. La página original sigue siendo válida.
+    Unchanged,
+    /// El subárbol sigue existiendo en esta página nueva.
+    Updated(PageNo),
+    /// El subárbol quedó vacío y su página ya está liberada.
+    Gone,
+}
+
+/// Como `descend` e `insert_rec`, sigue punteros a hijos leídos del disco, así
+/// que necesita la misma cota de profundidad: sin ella, un ciclo de páginas
+/// corruptas haría que la recursión desbordara la pila en vez de devolver
+/// `TreeLoop`. `depth` cuenta la página actual, igual que en las otras dos (la
+/// raíz entra con `depth == 1`).
+fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Result<Removal> {
+    if depth > MAX_DEPTH {
+        return Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::TreeLoop });
+    }
+    let bytes = tx.read_page(page_no)?;
+    let page = PageRef::parse(&bytes, page_no)?;
+
+    match page.page_type() {
+        PageType::Leaf => {
+            let Ok(hit) = search_key(&page, key) else {
+                return Ok(Removal::Unchanged);
+            };
+            if page.n_slots() == 1 {
+                tx.free(page_no);
+                return Ok(Removal::Gone);
+            }
+            let mut keys = Vec::with_capacity(page.n_slots() - 1);
+            let mut values = Vec::with_capacity(page.n_slots() - 1);
+            for j in 0..page.n_slots() {
+                if j != hit {
+                    keys.push(page.key(j));
+                    values.push(page.value(j).to_vec());
+                }
+            }
+            let entries: Vec<(Vec<u8>, CellPayload)> = keys
+                .iter()
+                .zip(values.iter())
+                .map(|(k, v)| (k.clone(), CellPayload::Value(v.as_slice())))
+                .collect();
+            match emit(tx, Some(page_no), PageType::Leaf, 0, &entries)? {
+                Insertion::Updated(p) => Ok(Removal::Updated(p)),
+                // Quitar una entrada nunca puede hacer que las restantes dejen
+                // de caber donde ya cabían.
+                Insertion::Split { .. } => unreachable!("borrar no divide"),
+            }
+        }
+
+        PageType::Internal => {
+            let idx = child_index(&page, key);
+            let child = child_at(&page, idx);
+            let result = delete_rec(tx, child, key, depth + 1)?;
+            if matches!(result, Removal::Unchanged) {
+                return Ok(Removal::Unchanged);
+            }
+
+            let mut entries: Vec<(Vec<u8>, CellPayload)> = Vec::with_capacity(page.n_slots());
+            for j in 0..page.n_slots() {
+                entries.push((page.key(j), CellPayload::Child(page.child(j))));
+            }
+            let mut extra = page.extra();
+
+            match result {
+                Removal::Updated(new_child) => {
+                    if idx < page.n_slots() {
+                        entries[idx].1 = CellPayload::Child(new_child);
+                    } else {
+                        extra = new_child;
+                    }
+                }
+                Removal::Gone => {
+                    if idx < page.n_slots() {
+                        entries.remove(idx);
+                    } else {
+                        // Desaparece el hijo `extra`: el de la última celda
+                        // pasa a ocupar su lugar y pierde su separador.
+                        match entries.pop() {
+                            Some((_, CellPayload::Child(c))) => extra = c,
+                            _ => {
+                                tx.free(page_no);
+                                return Ok(Removal::Gone);
+                            }
+                        }
+                    }
+                }
+                Removal::Unchanged => unreachable!("ya se descartó arriba"),
+            }
+
+            // Un nodo interno sin separadores tiene un único hijo: sobra como
+            // nivel. Se descarta y el padre apunta directamente al nieto. Así
+            // el árbol encoge por arriba sin código específico de raíz.
+            if entries.is_empty() {
+                tx.free(page_no);
+                return Ok(if extra == 0 { Removal::Gone } else { Removal::Updated(extra) });
+            }
+
+            match emit(tx, Some(page_no), PageType::Internal, extra, &entries)? {
+                Insertion::Updated(p) => Ok(Removal::Updated(p)),
+                Insertion::Split { .. } => unreachable!("borrar no divide"),
+            }
+        }
+
+        _ => Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::PageType }),
+    }
+}
+
+/// Borra `key`. Devuelve la raíz nueva y si la clave existía.
+pub fn delete(tx: &mut WriteTxn, root: PageNo, key: &[u8]) -> Result<(PageNo, bool)> {
+    if root == 0 {
+        return Ok((0, false));
+    }
+    match delete_rec(tx, root, key, 1)? {
+        Removal::Unchanged => Ok((root, false)),
+        Removal::Updated(p) => Ok((p, true)),
+        Removal::Gone => Ok((0, true)),
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
@@ -860,9 +982,12 @@ mod invariant_tests {
 
     /// xorshift32, sin dependencias: solo hace falta un orden pseudoaleatorio
     /// reproducible, no calidad criptográfica.
-    struct Rng(u32);
+    ///
+    /// `pub(crate)`: la reutiliza también `delete_invariant_tests` para sus
+    /// propios casos adversariales de borrado.
+    pub(crate) struct Rng(pub(crate) u32);
     impl Rng {
-        fn next(&mut self) -> u32 {
+        pub(crate) fn next(&mut self) -> u32 {
             let mut x = self.0;
             x ^= x << 13;
             x ^= x >> 17;
@@ -877,7 +1002,10 @@ mod invariant_tests {
     /// c_i solo tiene claves < s_i, c_n (extra) solo tiene claves >= s_{n-1}.
     /// También acumula las páginas visitadas para detectar aliasing (una
     /// misma página referenciada dos veces en el árbol).
-    fn check_invariants(
+    ///
+    /// `pub(crate)`: la reutiliza también `delete_invariant_tests` (tarea
+    /// 12), que ejerce el mismo contrato tras secuencias de borrados.
+    pub(crate) fn check_invariants(
         tx: &impl PageSource,
         page_no: PageNo,
         lo: Option<&[u8]>,
@@ -1087,6 +1215,442 @@ mod invariant_tests {
             size_after_2000_updates <= size_after_first_commit + 4096,
             "el fichero creció de {size_after_first_commit} a {size_after_2000_updates} bytes \
              tras 2000 actualizaciones de la misma clave: páginas filtradas en vez de recicladas"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod delete_tests {
+    use super::*;
+    use crate::storage::MemStorage;
+    use crate::tx::{Db, Options};
+
+    fn db() -> Db {
+        Db::create(Box::new(MemStorage::new()), Options::default()).unwrap()
+    }
+
+    #[test]
+    fn deleting_a_present_key_removes_it() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let root = put(&mut tx, 0, b"a", b"1").unwrap();
+        let root = put(&mut tx, root, b"b", b"2").unwrap();
+        let (root, existed) = delete(&mut tx, root, b"a").unwrap();
+        assert!(existed);
+        assert_eq!(get(&tx, root, b"a").unwrap(), None);
+        assert_eq!(get(&tx, root, b"b").unwrap().as_deref(), Some(b"2".as_slice()));
+    }
+
+    #[test]
+    fn deleting_an_absent_key_reports_false_and_does_not_rewrite() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let root = put(&mut tx, 0, b"a", b"1").unwrap();
+        let (new_root, existed) = delete(&mut tx, root, b"z").unwrap();
+        assert!(!existed);
+        assert_eq!(new_root, root, "sin cambios no hay copy-on-write");
+    }
+
+    #[test]
+    fn emptying_the_tree_returns_a_null_root() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let root = put(&mut tx, 0, b"solo", b"1").unwrap();
+        let (root, existed) = delete(&mut tx, root, b"solo").unwrap();
+        assert!(existed);
+        assert_eq!(root, 0);
+    }
+
+    #[test]
+    fn deleting_everything_from_a_deep_tree_collapses_it() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let mut root = 0;
+        for i in 0..800u32 {
+            root = put(&mut tx, root, alloc::format!("k/{i:06}").as_bytes(), b"v").unwrap();
+        }
+        for i in 0..800u32 {
+            let (r, existed) = delete(&mut tx, root, alloc::format!("k/{i:06}").as_bytes()).unwrap();
+            assert!(existed, "clave {i}");
+            root = r;
+        }
+        assert_eq!(root, 0, "el árbol vacío no deja raíz");
+    }
+
+    #[test]
+    fn the_remaining_keys_survive_interleaved_deletes() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let mut root = 0;
+        for i in 0..600u32 {
+            root = put(&mut tx, root, alloc::format!("k/{i:06}").as_bytes(), b"v").unwrap();
+        }
+        for i in (0..600u32).step_by(2) {
+            let (r, _) = delete(&mut tx, root, alloc::format!("k/{i:06}").as_bytes()).unwrap();
+            root = r;
+        }
+        for i in 0..600u32 {
+            let present = get(&tx, root, alloc::format!("k/{i:06}").as_bytes()).unwrap().is_some();
+            assert_eq!(present, i % 2 == 1, "clave {i}");
+        }
+    }
+}
+
+/// Casos adversariales de autorrevisión de la tarea 12, más allá de los del
+/// propio informe: el primero y el último elemento de una hoja, una clave
+/// igual a un separador interno, el colapso de un nodo interno de dos hijos,
+/// el vaciado específico del hijo `extra` sin colapso completo, e
+/// intercalado aleatorio a una escala que fuerza varios niveles. Reutiliza
+/// `check_invariants` de `invariant_tests`, el mismo contrato que delató los
+/// dos defectos reales de la tarea 11.
+#[cfg(all(test, feature = "std"))]
+mod delete_invariant_tests {
+    use super::invariant_tests::{check_invariants, Rng};
+    use super::*;
+    use crate::storage::MemStorage;
+    use crate::tx::{Db, Options};
+    use alloc::collections::BTreeSet;
+
+    fn db() -> Db {
+        Db::create(Box::new(MemStorage::new()), Options::default()).unwrap()
+    }
+
+    #[test]
+    fn deleting_the_first_key_of_a_leaf_keeps_the_rest_readable() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let mut root = 0;
+        for k in [b"aa".as_slice(), b"bb", b"cc", b"dd", b"ee"] {
+            root = put(&mut tx, root, k, b"v").unwrap();
+        }
+        let (root, existed) = delete(&mut tx, root, b"aa").unwrap();
+        assert!(existed);
+        assert_eq!(get(&tx, root, b"aa").unwrap(), None);
+        for k in [b"bb".as_slice(), b"cc", b"dd", b"ee"] {
+            assert!(get(&tx, root, k).unwrap().is_some(), "clave {k:?}");
+        }
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    #[test]
+    fn deleting_the_last_key_of_a_leaf_keeps_the_rest_readable() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let mut root = 0;
+        for k in [b"aa".as_slice(), b"bb", b"cc", b"dd", b"ee"] {
+            root = put(&mut tx, root, k, b"v").unwrap();
+        }
+        let (root, existed) = delete(&mut tx, root, b"ee").unwrap();
+        assert!(existed);
+        assert_eq!(get(&tx, root, b"ee").unwrap(), None);
+        for k in [b"aa".as_slice(), b"bb", b"cc", b"dd"] {
+            assert!(get(&tx, root, k).unwrap().is_some(), "clave {k:?}");
+        }
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    /// Encuentra un separador real de un nodo interno: `root.key(0)`. Por
+    /// cómo `emit` promueve separadores (siempre una clave que ya existía en
+    /// una hoja, nunca un valor sintético), esta clave sigue siendo
+    /// recuperable con `get` mientras nadie la haya borrado — condición que
+    /// esta prueba comprueba antes de borrarla, para no dar por hecho el
+    /// propio mecanismo que quiere ejercitar.
+    fn first_root_separator(tx: &WriteTxn, root: PageNo) -> Vec<u8> {
+        let bytes = tx.read_page(root).unwrap();
+        let page = PageRef::parse(&bytes, root).unwrap();
+        assert_eq!(page.page_type(), PageType::Internal, "se esperaba una raíz interna");
+        page.key(0)
+    }
+
+    #[test]
+    fn deleting_a_key_equal_to_an_internal_separator_keeps_routing_correct() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let mut rng = Rng(0x5EED_5EED);
+        let n = 2000u32;
+        let mut order: Vec<u32> = (0..n).collect();
+        for i in (1..order.len()).rev() {
+            let j = (rng.next() as usize) % (i + 1);
+            order.swap(i, j);
+        }
+        let mut root = 0;
+        for &i in &order {
+            root = put(&mut tx, root, alloc::format!("clave/{i:06}").as_bytes(), b"v").unwrap();
+        }
+
+        let sep = first_root_separator(&tx, root);
+        assert!(
+            get(&tx, root, &sep).unwrap().is_some(),
+            "el separador debe ser una clave viva antes de borrarla"
+        );
+
+        let (root, existed) = delete(&mut tx, root, &sep).unwrap();
+        assert!(existed, "el separador debía existir como clave");
+        assert_eq!(get(&tx, root, &sep).unwrap(), None);
+
+        for i in 0..n {
+            let key = alloc::format!("clave/{i:06}");
+            let expected_present = key.as_bytes() != sep.as_slice();
+            let present = get(&tx, root, key.as_bytes()).unwrap().is_some();
+            assert_eq!(present, expected_present, "clave {key}");
+        }
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    /// Construye a mano un nodo interno con exactamente dos hijos hoja:
+    /// `left` en la celda 0 (separador `mm`) y `right` en `extra`. Da control
+    /// total sobre la forma del árbol, en vez de depender de que `put`
+    /// produzca por casualidad justo dos hijos.
+    fn two_leaf_tree(tx: &mut WriteTxn) -> (PageNo, PageNo, PageNo) {
+        let left = tx.alloc().unwrap();
+        let right = tx.alloc().unwrap();
+        let root = tx.alloc().unwrap();
+
+        let l = PageBuilder::new(512, PageType::Leaf)
+            .build(&[
+                (b"aa".as_slice(), CellPayload::Value(b"1")),
+                (b"bb".as_slice(), CellPayload::Value(b"2")),
+            ])
+            .unwrap();
+        let r = PageBuilder::new(512, PageType::Leaf)
+            .build(&[
+                (b"mm".as_slice(), CellPayload::Value(b"3")),
+                (b"zz".as_slice(), CellPayload::Value(b"4")),
+            ])
+            .unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(right);
+        let rt = rb.build(&[(b"mm".as_slice(), CellPayload::Child(left))]).unwrap();
+
+        tx.write_page(left, &l).unwrap();
+        tx.write_page(right, &r).unwrap();
+        tx.write_page(root, &rt).unwrap();
+        (root, left, right)
+    }
+
+    /// Vaciar la hoja izquierda de un nodo interno de dos hijos debe hacer
+    /// que la raíz colapse: `entries` queda vacío tras el `remove(idx)` de la
+    /// única celda, así que el nodo interno se libera y la raíz pasa a ser
+    /// exactamente la hoja superviviente (`right`), sin nivel intermedio.
+    #[test]
+    fn emptying_a_leaf_collapses_its_two_child_parent() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let (root, _left, right) = two_leaf_tree(&mut tx);
+
+        let (root, existed) = delete(&mut tx, root, b"aa").unwrap();
+        assert!(existed);
+        assert_ne!(root, 0, "queda una clave, el árbol no debe vaciarse todavía");
+
+        let (root, existed) = delete(&mut tx, root, b"bb").unwrap();
+        assert!(existed);
+        assert_eq!(
+            root, right,
+            "la raíz colapsada debe ser exactamente la hoja superviviente, sin nivel intermedio"
+        );
+
+        let bytes = tx.read_page(root).unwrap();
+        let page = PageRef::parse(&bytes, root).unwrap();
+        assert_eq!(page.page_type(), PageType::Leaf, "el nodo interno de un solo hijo debe desaparecer");
+
+        assert_eq!(get(&tx, root, b"aa").unwrap(), None);
+        assert_eq!(get(&tx, root, b"bb").unwrap(), None);
+        assert_eq!(get(&tx, root, b"mm").unwrap().as_deref(), Some(b"3".as_slice()));
+        assert_eq!(get(&tx, root, b"zz").unwrap().as_deref(), Some(b"4".as_slice()));
+
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    /// Construye a mano un nodo interno con tres hijos hoja: `left` (celda 0,
+    /// separador `gg`), `middle` (celda 1, separador `mm`) y `right` en
+    /// `extra`. Con dos separadores de partida, vaciar `right` no puede
+    /// colapsar el nodo entero (le queda un separador de sobra): ejercita el
+    /// camino de `Removal::Gone` sobre `extra` (`entries.pop()`, pierde su
+    /// separador) de forma aislada del colapso completo.
+    fn three_leaf_tree(tx: &mut WriteTxn) -> (PageNo, PageNo, PageNo, PageNo) {
+        let left = tx.alloc().unwrap();
+        let middle = tx.alloc().unwrap();
+        let right = tx.alloc().unwrap();
+        let root = tx.alloc().unwrap();
+
+        let l = PageBuilder::new(512, PageType::Leaf)
+            .build(&[
+                (b"aa".as_slice(), CellPayload::Value(b"1")),
+                (b"bb".as_slice(), CellPayload::Value(b"2")),
+            ])
+            .unwrap();
+        let m = PageBuilder::new(512, PageType::Leaf)
+            .build(&[
+                (b"gg".as_slice(), CellPayload::Value(b"3")),
+                (b"hh".as_slice(), CellPayload::Value(b"4")),
+            ])
+            .unwrap();
+        let r = PageBuilder::new(512, PageType::Leaf)
+            .build(&[
+                (b"mm".as_slice(), CellPayload::Value(b"5")),
+                (b"zz".as_slice(), CellPayload::Value(b"6")),
+            ])
+            .unwrap();
+        let mut rb = PageBuilder::new(512, PageType::Internal);
+        rb.set_extra(right);
+        let rt = rb
+            .build(&[
+                (b"gg".as_slice(), CellPayload::Child(left)),
+                (b"mm".as_slice(), CellPayload::Child(middle)),
+            ])
+            .unwrap();
+
+        tx.write_page(left, &l).unwrap();
+        tx.write_page(middle, &m).unwrap();
+        tx.write_page(right, &r).unwrap();
+        tx.write_page(root, &rt).unwrap();
+        (root, left, middle, right)
+    }
+
+    #[test]
+    fn emptying_the_extra_child_drops_its_separator_without_collapsing() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let (root, left, middle, _right) = three_leaf_tree(&mut tx);
+
+        let (root, existed) = delete(&mut tx, root, b"mm").unwrap();
+        assert!(existed);
+        let (root, existed) = delete(&mut tx, root, b"zz").unwrap();
+        assert!(existed, "la segunda clave de la hoja `extra` también existía");
+
+        let bytes = tx.read_page(root).unwrap();
+        let page = PageRef::parse(&bytes, root).unwrap();
+        assert_eq!(page.page_type(), PageType::Internal, "queda un separador: no debe colapsar");
+        assert_eq!(page.n_slots(), 1, "el separador `mm` de la celda de `middle` debe perderse");
+        assert_eq!(page.key(0), b"gg");
+        assert_eq!(page.child(0), left, "la hoja `left` no se toca");
+        assert_eq!(
+            page.extra(),
+            middle,
+            "`middle` pasa a ocupar el hueco de `extra` y pierde su separador propio"
+        );
+
+        assert_eq!(get(&tx, root, b"mm").unwrap(), None);
+        assert_eq!(get(&tx, root, b"zz").unwrap(), None);
+        assert_eq!(get(&tx, root, b"aa").unwrap().as_deref(), Some(b"1".as_slice()));
+        assert_eq!(get(&tx, root, b"bb").unwrap().as_deref(), Some(b"2".as_slice()));
+        assert_eq!(get(&tx, root, b"gg").unwrap().as_deref(), Some(b"3".as_slice()));
+        assert_eq!(get(&tx, root, b"hh").unwrap().as_deref(), Some(b"4".as_slice()));
+
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    /// Intercalado aleatorio de inserciones y borrados sobre un universo fijo
+    /// de claves, a una escala (6000 operaciones, 500 claves posibles) que
+    /// fuerza divisiones y colapsos repetidos en varios niveles. El modelo de
+    /// referencia es un `BTreeSet`; tras cada operación de borrado se
+    /// comprueba también que `existed` coincide con la pertenencia al
+    /// conjunto esperado, no solo el estado final.
+    #[test]
+    fn random_interleaved_puts_and_deletes_match_the_expected_set() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let mut rng = Rng(0x1EAF_5EED);
+        let universe = 500u32;
+        let mut expected: BTreeSet<u32> = BTreeSet::new();
+        let mut root = 0;
+
+        for _ in 0..6000 {
+            let i = rng.next() % universe;
+            let key = alloc::format!("k/{i:05}");
+            if rng.next().is_multiple_of(2) {
+                root = put(&mut tx, root, key.as_bytes(), b"v").unwrap();
+                expected.insert(i);
+            } else {
+                let (r, existed) = delete(&mut tx, root, key.as_bytes()).unwrap();
+                assert_eq!(existed, expected.contains(&i), "borrado de la clave {i}");
+                root = r;
+                expected.remove(&i);
+            }
+        }
+
+        for i in 0..universe {
+            let key = alloc::format!("k/{i:05}");
+            let present = get(&tx, root, key.as_bytes()).unwrap().is_some();
+            assert_eq!(present, expected.contains(&i), "clave {i}");
+        }
+
+        if expected.is_empty() {
+            assert_eq!(root, 0, "sin claves no debe quedar raíz");
+        } else {
+            assert_ne!(root, 0);
+            let mut visited = BTreeSet::new();
+            check_invariants(&tx, root, None, None, &mut visited);
+        }
+    }
+
+    /// Asa a `MemStorage` que sobrevive a la `Box<dyn Storage>` entregada a
+    /// `Db::create`, para poder medir el tamaño del fichero después. Calcado
+    /// del mismo patrón que usa `invariant_tests`.
+    struct ArcStorage(alloc::sync::Arc<MemStorage>);
+    impl crate::Storage for ArcStorage {
+        fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> {
+            self.0.read_at(o, b)
+        }
+        fn write_at(&self, o: u64, b: &[u8]) -> Result<()> {
+            self.0.write_at(o, b)
+        }
+        fn sync(&self) -> Result<()> {
+            self.0.sync()
+        }
+        fn len(&self) -> Result<u64> {
+            self.0.len()
+        }
+    }
+
+    /// Borrar TODAS las claves de un árbol y reinsertarlas, varias veces
+    /// seguidas, no debe hacer crecer el fichero sin límite: cada página que
+    /// `delete_rec` libera (hojas vacías y nodos internos colapsados) debe
+    /// quedar disponible para que `put` la recicle en el ciclo siguiente.
+    #[test]
+    fn deleting_everything_then_reinserting_does_not_leak_pages() {
+        let storage = alloc::sync::Arc::new(MemStorage::new());
+        let db =
+            Db::create(alloc::boxed::Box::new(ArcStorage(storage.clone())), Options::default())
+                .unwrap();
+
+        let mut tx = db.begin_write().unwrap();
+        let mut root = 0;
+        let n = 400u32;
+        for i in 0..n {
+            root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v").unwrap();
+        }
+        tx.set_root(root);
+        tx.commit().unwrap();
+        let size_after_build = storage.snapshot().len();
+
+        for _cycle in 0..3 {
+            let mut tx = db.begin_write().unwrap();
+            let mut root = tx.root();
+            for i in 0..n {
+                let (r, existed) =
+                    delete(&mut tx, root, alloc::format!("k/{i:05}").as_bytes()).unwrap();
+                assert!(existed, "clave {i}");
+                root = r;
+            }
+            assert_eq!(root, 0, "el árbol vacío no deja raíz");
+            for i in 0..n {
+                root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v").unwrap();
+            }
+            tx.set_root(root);
+            tx.commit().unwrap();
+        }
+        let size_after_cycles = storage.snapshot().len();
+
+        assert!(
+            size_after_cycles <= size_after_build + 4096,
+            "el fichero creció de {size_after_build} a {size_after_cycles} bytes tras ciclos \
+             completos de borrado + reinserción: páginas filtradas en vez de recicladas"
         );
     }
 }
