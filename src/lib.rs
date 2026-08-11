@@ -23,6 +23,8 @@ pub mod pager;
 pub mod freelist;
 #[cfg(feature = "std")]
 pub mod tx;
+#[cfg(feature = "std")]
+pub mod tree;
 
 pub use error::{CorruptKind, Error, IoError, Result};
 pub use storage::Storage;

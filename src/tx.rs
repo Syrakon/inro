@@ -203,6 +203,24 @@ impl<'db> ReadTxn<'db> {
     }
 }
 
+/// Acceso a páginas común a lectores y escritores, para que el árbol se
+/// escriba una sola vez y sirva a ambos.
+pub trait PageSource {
+    fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>>;
+}
+
+impl PageSource for ReadTxn<'_> {
+    fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
+        self.db.pager.read(page)
+    }
+}
+
+impl PageSource for WriteTxn<'_> {
+    fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
+        self.db.pager.read(page)
+    }
+}
+
 impl Drop for ReadTxn<'_> {
     fn drop(&mut self) {
         let mut readers = self.db.readers.lock().unwrap();
