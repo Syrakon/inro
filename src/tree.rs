@@ -54,6 +54,14 @@ fn child_at(page: &PageRef<'_>, i: usize) -> PageNo {
 /// números de página de 32 bits un árbol legítimo no puede tener más de
 /// `2^32` hojas, así que no puede pasar de profundidad 32. 64 duplica ese
 /// margen sin dejar de cortar un ciclo en tiempo acotado.
+///
+/// Esta premisa — todo nodo interno rama en al menos dos — depende de que
+/// `put` rechace claves mayores que `page_size / 4` antes de tocar ninguna
+/// página (ver el chequeo al principio de `put`). Sin ese límite, dividir un
+/// nodo interno con solo dos entradas deja una mitad sin separador propio: un
+/// nodo de un solo hijo que no ramifica y falsearía esta cuenta. Si algún día
+/// se toca ese límite, hay que revisar este comentario, no solo confiar en el
+/// número.
 const MAX_DEPTH: u32 = 64;
 
 /// Localiza la hoja donde vive o viviría `key`, y el camino de nodos internos
@@ -150,14 +158,22 @@ fn emit(
     let mid = entries.len() / 2;
     // `mid == 0` solo puede pasar con una única entrada, y solo se llega aquí
     // porque `build` ya falló para ella: no hay nada que partir, la entrada
-    // sola no cabe en una página. Con una sola entrada su clave se convierte
-    // en el prefijo entero de la página (ver `PageBuilder::build`), así que
-    // el límite lo marca la clave. Esto es alcanzable hoy con una clave lo
-    // bastante grande; las páginas de overflow (tarea 13) lo evitarán para
-    // valores grandes con clave pequeña, pero mientras tanto una entrada así
-    // debe devolver `Error`, nunca entrar en pánico.
+    // sola no cabe en una página. `put` ya rechaza claves mayores que
+    // `page_size / 4` antes de llegar aquí, así que en la práctica esto solo
+    // es alcanzable hoy por una hoja de una sola entrada cuyo VALOR es
+    // demasiado grande (clave pequeña, valor grande) — las páginas de
+    // overflow (tarea 13) lo resolverán moviendo el valor fuera de la celda.
+    // El informe debe reflejar qué es lo que no cabe: para una hoja es la
+    // celda completa (clave + valor), no solo la clave; para un nodo interno
+    // (celda separador + hijo de 4 bytes) sigue siendo la clave, ya cubierta
+    // por el límite de `put`, así que esta rama es inalcanzable para
+    // internos, pero se deja completa por si ese límite cambiara algún día.
     if mid == 0 {
-        return Err(Error::KeyTooLarge { len: entries[0].0.len() as u32, max: page_size });
+        let len = match entries[0].1 {
+            CellPayload::Value(v) => entries[0].0.len() + v.len(),
+            CellPayload::Child(_) => entries[0].0.len(),
+        };
+        return Err(Error::KeyTooLarge { len: len as u32, max: page_size });
     }
 
     let (l, r) = borrowed.split_at(mid);
@@ -181,7 +197,23 @@ fn emit(
                     CellPayload::Child(c) => c,
                     CellPayload::Value(_) => unreachable!("nodo interno con valor"),
                 };
-                (l, promoted_child, &r[1..])
+                let right = &r[1..];
+                // `right` se queda sin separador propio (un nodo de un solo
+                // hijo, que añade profundidad sin ramificar) exactamente
+                // cuando la página se divide con solo dos entradas. Con el
+                // límite de tamaño de clave que impone `put`
+                // (`page_size / 4`), ninguna combinación de separador +
+                // hijo llega a ocupar suficiente página como para que dos
+                // entradas por sí solas fuercen una división — hacen falta
+                // al menos tres para que ambas mitades conserven un
+                // separador. Si esto salta, el límite de `put` tiene un
+                // agujero: no ensanchar esta comprobación, hay que cerrar
+                // ese agujero.
+                debug_assert!(
+                    !right.is_empty(),
+                    "división de nodo interno con la mitad derecha sin separador propio"
+                );
+                (l, promoted_child, right)
             }
             _ => (l, 0, r),
         };
@@ -304,15 +336,42 @@ fn insert_rec(
 }
 
 /// Inserta o reemplaza `key`. Devuelve la raíz nueva.
+///
+/// Si devuelve `Err`, el llamante debe abandonar la transacción (dejar caer
+/// el `WriteTxn` sin llamar a `commit`) en vez de reintentar sobre el mismo
+/// `tx`. Un fallo a mitad de `insert_rec` puede ocurrir después de que algún
+/// nivel más profundo ya haya liberado su página vieja (`emit` libera antes
+/// de que el nivel de arriba termine de reconstruirse); hoy eso es seguro
+/// solo porque `WriteTxn::drop` restaura la lista de libres al estado previo
+/// a la transacción entera cuando esta nunca hizo `commit`. Si esa restauración
+/// se optimizara para no deshacer siempre, un `put` fallido dejaría páginas
+/// liberadas de más sin que la raíz llegara a apuntar a la reconstrucción
+/// parcial — dos dueños o una fuga, según el caso.
 pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<PageNo> {
+    let page_size = tx.page_size();
+    // Una división de nodo interno promueve un separador y reparte el resto
+    // entre dos mitades; para que ambas conserven al menos un separador
+    // propio hacen falta al menos tres entradas en total (ver el
+    // `debug_assert` en `emit`). Limitar aquí, antes de tocar ninguna
+    // página, a `page_size / 4` garantiza ese mínimo: ni siquiera el peor
+    // caso (separador + hijo de 4 bytes, sin prefijo compartido) llena una
+    // página con menos de cuatro entradas de ese tamaño. Sin este límite,
+    // claves grandes degeneran casi toda división interna en un nodo de un
+    // solo hijo — profundidad sin ramificar, hasta reventar `MAX_DEPTH` en
+    // un árbol perfectamente válido y dejar sus claves ilegibles.
+    let max_key = page_size / 4;
+    if key.len() as u32 > max_key {
+        return Err(Error::KeyTooLarge { len: key.len() as u32, max: max_key });
+    }
+
     if root == 0 {
         let entries = alloc::vec![(key.to_vec(), CellPayload::Value(value))];
         return match emit(tx, None, PageType::Leaf, 0, &entries)? {
             Insertion::Updated(p) => Ok(p),
-            Insertion::Split { .. } => Err(Error::KeyTooLarge {
-                len: (key.len() + value.len()) as u32,
-                max: tx.page_size(),
-            }),
+            Insertion::Split { .. } => unreachable!(
+                "emit con una sola entrada nunca divide: cabe (Updated) o falla dentro de \
+                 emit (Err), nunca Split"
+            ),
         };
     }
 
@@ -621,11 +680,15 @@ mod put_tests {
         tx.commit().unwrap();
     }
 
-    /// Defecto descrito en la tarea 11: con `root == 0` una única clave
-    /// (root == 0) tan grande que ni siquiera cabe sola en una página nueva
-    /// hace que `emit` calcule `mid = entries.len() / 2 == 0`. El `assert!`
-    /// original entraba en pánico ahí; el motor nunca debe entrar en pánico
-    /// con datos de entrada, por grandes que sean — debe devolver `Error`.
+    /// Defecto original descrito en la tarea 11: con `root == 0` una única
+    /// clave tan grande que ni siquiera cabe sola en una página nueva hacía
+    /// que `emit` calculara `mid = entries.len() / 2 == 0`, y el `assert!`
+    /// original entraba en pánico ahí. Tras la revisión de la tarea 11 (punto
+    /// "claves grandes degeneran la ramificación"), `put` rechaza esta clave
+    /// mucho antes, en su propio chequeo de entrada (`key.len() >
+    /// page_size / 4`) — así que esta prueba ya no ejercita el `mid == 0` de
+    /// `emit` en concreto, pero sigue siendo la prueba de que una clave
+    /// enorme nunca produce pánico, solo `Error`.
     #[test]
     fn a_key_alone_too_big_for_a_page_returns_an_error_instead_of_panicking() {
         let db = db();
@@ -638,15 +701,15 @@ mod put_tests {
         );
     }
 
-    /// Mismo defecto, buscado también por el otro camino que puede producir
-    /// `entries.len() == 1` en `emit`: el ascenso de un separador huérfano al
-    /// hacer crecer la raíz (`put`, rama `Insertion::Split` tras
-    /// `insert_rec`). Una hoja con claves que comparten un prefijo larguísimo
-    /// se llena, se divide, y el separador promovido puede terminar siendo
-    /// una clave tan larga que, sola y sin nada con quien compartir prefijo,
-    /// no cabe como raíz interna de una sola entrada. Ninguna combinación
-    /// aquí debe entrar en pánico; si no cabe, el único error aceptable es
-    /// `KeyTooLarge`.
+    /// Mismo espíritu que la prueba anterior, pero por el otro camino que
+    /// podía producir `entries.len() == 1` en `emit`: el ascenso de un
+    /// separador huérfano al hacer crecer la raíz (`put`, rama
+    /// `Insertion::Split` tras `insert_rec`). Con el límite de `page_size / 4`
+    /// ya en vigor, cada clave de este bucle (490 bytes con `page_size` 512)
+    /// se rechaza en el chequeo de entrada de `put` desde la primera
+    /// iteración — la ruta original ya no es alcanzable, y así debe ser. Se
+    /// deja la prueba porque sigue demostrando la propiedad que le da nombre:
+    /// ninguna combinación de claves grandes debe entrar en pánico.
     #[test]
     fn growing_the_root_with_a_lone_oversized_separator_does_not_panic() {
         let db = db();
@@ -662,6 +725,90 @@ mod put_tests {
                 Err(e) => panic!("error inesperado: {e:?}"),
             }
         }
+    }
+
+    /// Regresión de la revisión de la tarea 11: `put` debe rechazar de
+    /// entrada, sin tocar ninguna página, cualquier clave mayor que
+    /// `page_size / 4` — a 512 bytes de página, 128. Los valores exactos del
+    /// error son parte del contrato (`Error` es `PartialEq`), no solo su
+    /// variante.
+    #[test]
+    fn put_rejects_a_key_larger_than_a_quarter_page() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let key = alloc::vec![b'k'; 129];
+        let err = put(&mut tx, 0, &key, b"v").unwrap_err();
+        assert_eq!(err, crate::Error::KeyTooLarge { len: 129, max: 128 });
+    }
+
+    /// El límite es `> page_size / 4`, no `>=`: una clave que ocupa
+    /// exactamente el límite se acepta.
+    #[test]
+    fn put_accepts_a_key_exactly_at_a_quarter_page() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let key = alloc::vec![b'k'; 128];
+        let root = put(&mut tx, 0, &key, b"v").unwrap();
+        assert_eq!(get(&tx, root, &key).unwrap().as_deref(), Some(b"v".as_slice()));
+    }
+
+    /// Regresión del hallazgo 3 de la revisión: cuando `emit` no puede
+    /// construir una hoja de una sola entrada porque el VALOR es demasiado
+    /// grande (no la clave, que aquí es diminuta y pasa de sobra el chequeo
+    /// de `put`), el error debe reportar la longitud de la celda completa
+    /// (clave + valor), no solo la de la clave — si no, quien reciba el error
+    /// no puede saber qué recortar.
+    #[test]
+    fn key_too_large_from_an_oversized_value_reports_the_combined_length() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let huge_value = alloc::vec![0u8; 2000];
+        let err = put(&mut tx, 0, b"k", &huge_value).unwrap_err();
+        match err {
+            crate::Error::KeyTooLarge { len, max } => {
+                assert_eq!(len, 1 + 2000, "debe reportar clave + valor, no solo la clave");
+                assert_eq!(max, 512);
+            }
+            other => panic!("se esperaba KeyTooLarge, se obtuvo {other:?}"),
+        }
+    }
+
+    /// Regresión del hallazgo 1 de la revisión: con claves cerca del límite
+    /// de `page_size / 4` (128 bytes a 512 de página) y sin prefijo
+    /// compartido entre ellas — el peor caso para la ramificación, porque no
+    /// hay compresión de prefijo que ayude — el árbol debe seguir siendo
+    /// poco profundo. Antes del arreglo, este mismo escenario (con claves de
+    /// 250 bytes) daba profundidad 34 a 3.000 claves y profundidad 65 — por
+    /// encima de `MAX_DEPTH` — a 95.512, dejando el árbol entero ilegible.
+    /// Aquí se afirma una cota real de profundidad, no solo que las
+    /// inserciones no fallen.
+    #[test]
+    fn keys_near_the_limit_keep_the_tree_shallow() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let mut root = 0;
+        let n = 3000u32;
+        // 127 bytes: justo por debajo del límite de 128, y sin prefijo común
+        // entre claves (el sufijo numérico va al principio, no al final), así
+        // que la compresión de prefijo de la página no puede disimular un mal
+        // factor de ramificación.
+        for i in 0..n {
+            let mut key = alloc::format!("{i:07}").into_bytes();
+            key.resize(127, b'k');
+            root = put(&mut tx, root, &key, b"v").unwrap();
+        }
+        let mut max_depth = 0usize;
+        for i in (0..n).step_by(37) {
+            let mut key = alloc::format!("{i:07}").into_bytes();
+            key.resize(127, b'k');
+            let (_, path) = descend(&tx, root, &key).unwrap().unwrap();
+            max_depth = max_depth.max(path.len() + 1); // +1: la propia hoja
+        }
+        assert!(
+            max_depth <= 12,
+            "profundidad {max_depth} con {n} claves de 127 bytes: la ramificación \
+             sigue degenerando"
+        );
     }
 
     /// Cota de profundidad: como `descend`, `insert_rec` sigue punteros a
@@ -804,6 +951,48 @@ mod invariant_tests {
                 get(&tx, root, key.as_bytes()).unwrap().as_deref(),
                 Some(&i.to_le_bytes()[..]),
                 "clave {key}"
+            );
+        }
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    /// Igual que la prueba anterior, pero con claves justo por debajo del
+    /// límite nuevo de `page_size / 4` (127 de 128, a 512 de página) en vez
+    /// de las claves cortas de log. Es el caso que motivó la revisión: con
+    /// claves grandes, el árbol tenía un factor de ramificación degenerado
+    /// (~1,3) por una división de nodo interno que dejaba una mitad sin
+    /// separador propio. `check_invariants` verifica de nuevo la partición
+    /// completa (no solo que las 2500 claves se lean), así que cualquier
+    /// nodo de un solo hijo que sobreviviera al límite de `put` lo
+    /// delataría igual que delató el defecto original.
+    #[test]
+    fn random_order_insertion_with_near_limit_keys_stays_well_formed() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let mut rng = Rng(0xA5A5_5A5A);
+        let n = 2500u32;
+        let mut order: Vec<u32> = (0..n).collect();
+        for i in (1..order.len()).rev() {
+            let j = (rng.next() as usize) % (i + 1);
+            order.swap(i, j);
+        }
+        let key_for = |i: u32| -> Vec<u8> {
+            let mut k = alloc::format!("{i:07}").into_bytes();
+            k.resize(127, b'k');
+            k
+        };
+        let mut root = 0;
+        for &i in &order {
+            let key = key_for(i);
+            root = put(&mut tx, root, &key, &i.to_le_bytes()).unwrap();
+        }
+        for i in 0..n {
+            let key = key_for(i);
+            assert_eq!(
+                get(&tx, root, &key).unwrap().as_deref(),
+                Some(&i.to_le_bytes()[..]),
+                "clave {i}"
             );
         }
         let mut visited = BTreeSet::new();
