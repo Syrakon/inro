@@ -422,6 +422,49 @@ enum Insertion {
     Split { left: PageNo, left_plain: bool, sep: Vec<u8>, right: PageNo, right_plain: bool },
 }
 
+/// Por dónde EMPIEZA `emit` a buscar el punto de corte cuando `entries` no
+/// cabe en una sola página. No es una orden: sea cual sea el sesgo, `emit`
+/// sigue recorriendo los demás candidatos si el primero no sirve (ver el
+/// bucle de búsqueda), así que un sesgo equivocado cuesta como mucho llenado,
+/// nunca corrección.
+///
+/// **`Append` es la corrección de la patología de inserción ascendente.** Un
+/// B+tree que parte siempre por el punto medio deja la mitad izquierda
+/// congelada al 50% para siempre cuando las claves llegan en orden creciente:
+/// ningún `put` futuro cae ya en ese rango, así que ese hueco no se rellena
+/// nunca. Medido sobre la carga real de `request_logs` (`tests/size.rs`, un
+/// millón de registros con marca de tiempo creciente): llenado medio de hoja
+/// 49,6%, mediana 49,6%, p95 51,6% — la mitad del fichero era hueco libre
+/// (34,17 de 68,81 bytes por entrada). LMDB y SQLite tratan este caso aparte
+/// por el mismo motivo.
+///
+/// El sesgo solo se pide cuando la entrada nueva es la MAYOR DEL ÁRBOL
+/// ENTERO: la página está en el camino más a la derecha desde la raíz (todos
+/// los descensos tomaron el hijo `extra`) Y el punto de inserción es la
+/// última posición de esa página. Con esas dos condiciones, todo lo que ya
+/// estaba se queda en la izquierda y la derecha nace con la entrada nueva
+/// sola, que es exactamente la que sí va a seguir creciendo. Es deliberado
+/// que NO baste con "se inserta al final de esta hoja": en inserción
+/// aleatoria eso ocurre en una hoja de cada `n` por puro azar, y sesgar ahí
+/// llenaría la izquierda al 100% para que se parta otra vez a la siguiente
+/// inserción — más divisiones, no menos hueco. La condición de camino
+/// derecho la hace inalcanzable salvo para un anexado real
+/// (`bytes_per_entry_reacts_to_shuffled_insertion_order` existe justo para
+/// vigilar esa diferencia).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitBias {
+    /// Punto medio por cuenta de entradas: reparte a partes iguales, deja
+    /// sitio a los dos lados. Es lo correcto cuando no se sabe por dónde va
+    /// a crecer la página, y es lo que usan todos los caminos salvo el
+    /// anexado (borrado, poda, y cualquier inserción que no sea la mayor
+    /// clave del árbol).
+    Middle,
+    /// La entrada nueva es la mayor del árbol y esta página es la última:
+    /// empezar por el corte que deja la izquierda entera y la derecha con
+    /// una sola entrada.
+    Append,
+}
+
 /// `true` si `entries` (los que va a recibir una página de tipo `page_type`)
 /// no contienen ninguna entrada de overflow — solo puede ser cierto para
 /// hojas, nunca para nodos internos (cuyas celdas son punteros a hijos, no
@@ -443,6 +486,9 @@ fn entries_are_plain(page_type: PageType, entries: &BorrowedEntries) -> bool {
 /// tiene forma de calcularlo por sí mismo, porque `entries` para un nodo
 /// interno solo trae `CellPayload::Child(PageNo)`, sin el tipo del hijo. Se
 /// ignora sin efecto para cualquier otro `page_type`.
+///
+/// `bias` solo se mira si `entries` NO cabe: es por dónde empezar a buscar el
+/// punto de corte, no una imposición (ver `SplitBias`).
 fn emit(
     tx: &mut WriteTxn,
     old: Option<PageNo>,
@@ -450,6 +496,7 @@ fn emit(
     extra: u32,
     entries: &[(Vec<u8>, CellPayload)],
     children_plain: bool,
+    bias: SplitBias,
 ) -> Result<Insertion> {
     let page_size = tx.logical_page_size();
     let borrowed: Vec<(&[u8], CellPayload)> =
@@ -469,11 +516,16 @@ fn emit(
         return Ok(Insertion::Updated(page_no, entries_are_plain(page_type, &borrowed)));
     }
 
-    // No cabe: partir en dos páginas. Con inserción ordenada, el punto medio
-    // POR CUENTA de entradas (`entries.len() / 2`) es casi siempre la
-    // división correcta — deja la mitad izquierda llena y la derecha con
-    // sitio para lo que viene, el caso dominante en cargas de log — así
-    // que se prueba primero.
+    // No cabe: partir en dos páginas. El primer candidato lo elige `bias`
+    // (ver `SplitBias`): el punto medio por cuenta de entradas
+    // (`entries.len() / 2`) cuando no se sabe por dónde va a crecer la
+    // página, y el último hueco (`entries.len() - 1`, izquierda entera y
+    // derecha con una sola entrada) cuando la entrada nueva es la mayor del
+    // árbol y esta es la última página — el caso dominante en cargas de log,
+    // donde el punto medio congela la mitad izquierda al 50% para siempre.
+    //
+    // Las dos elecciones colapsan al mismo valor, 0, con una sola entrada, y
+    // ese caso se atiende igual abajo.
     //
     // `mid == 0` solo puede pasar con una única entrada, y solo se llega
     // aquí porque `build` ya falló para ella: no hay nada que partir, la
@@ -488,7 +540,10 @@ fn emit(
     // cubierta por el límite de `put`, así que esta rama es inalcanzable
     // para internos, pero se deja completa por si ese límite cambiara algún
     // día.
-    let mid = entries.len() / 2;
+    let mid = match bias {
+        SplitBias::Middle => entries.len() / 2,
+        SplitBias::Append => entries.len().saturating_sub(1),
+    };
     if mid == 0 {
         let len = match entries[0].1 {
             CellPayload::Value(v) => entries[0].0.len() + v.len(),
@@ -578,10 +633,18 @@ fn emit(
         ))
     };
 
-    // El punto medio por cuenta se prueba primero, sin ningún coste extra
-    // sobre el diseño anterior a esta corrección: si basta (el caso común,
-    // con mucha diferencia), termina aquí en dos llamadas a `build`, igual
-    // que antes.
+    // El candidato que eligió `bias` se prueba primero, sin ningún coste
+    // extra sobre el diseño anterior a esta corrección: si basta (el caso
+    // común, con mucha diferencia), termina aquí en dos llamadas a `build`,
+    // igual que antes.
+    //
+    // Con `SplitBias::Append` el primer candidato es `entries.len() - 1`, y
+    // en un nodo INTERNO ese candidato se descarta siempre por construcción
+    // (la mitad derecha se quedaría sin separador propio, ver `attempt`): el
+    // bucle de abajo baja entonces a `entries.len() - 2`, que deja la
+    // derecha con exactamente un separador y dos hijos. Es un descarte
+    // previsto, no un fallo — el mismo mecanismo que ya cubría el caso de la
+    // compresión perdida.
     //
     // Si NO basta — tarea 19, hallazgo de las pruebas basadas en
     // propiedades contra un oráculo `BTreeMap` — el punto medio por cuenta
@@ -663,12 +726,21 @@ fn emit(
 /// haría que la recursión desbordara la pila en vez de devolver `TreeLoop`.
 /// `depth` cuenta la página actual, igual que en `descend` (la raíz entra con
 /// `depth == 1`).
+///
+/// `rightmost` dice si esta página está en el camino MÁS A LA DERECHA desde la
+/// raíz: la raíz entra con `true`, y cada descenso lo conserva solo si tomó el
+/// hijo `extra` (el mayor). Es la mitad de la condición de anexado que
+/// `SplitBias::Append` necesita — la otra mitad, "y además la clave nueva va
+/// al final de esta página", se comprueba abajo con el punto de inserción. Se
+/// calcula durante el descenso, que ya se estaba haciendo de todos modos, así
+/// que no cuesta ni una lectura de página.
 fn insert_rec(
     tx: &mut WriteTxn,
     page_no: PageNo,
     key: &[u8],
     value: &[u8],
     depth: u32,
+    rightmost: bool,
 ) -> Result<Insertion> {
     if depth > MAX_DEPTH {
         return Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::TreeLoop });
@@ -693,7 +765,17 @@ fn insert_rec(
 
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page.n_slots() + 1);
             let mut payloads: Vec<LeafPayload> = Vec::with_capacity(page.n_slots() + 1);
-            match search_key(&page, key) {
+            let found = search_key(&page, key);
+            // Anexado real: hoja del extremo derecho del árbol Y la clave
+            // nueva va detrás de todas las de esta hoja. `Ok(_)` es un
+            // REEMPLAZO — no añade ninguna entrada, y si aun así hace crecer
+            // la página lo hace por el medio, no por el borde, así que no
+            // cuenta como anexado. Ver `SplitBias`.
+            let bias = match found {
+                Err(i) if rightmost && i == page.n_slots() => SplitBias::Append,
+                _ => SplitBias::Middle,
+            };
+            match found {
                 Ok(i) => {
                     for j in 0..page.n_slots() {
                         keys.push(page.key(j));
@@ -730,13 +812,17 @@ fn insert_rec(
                 .collect();
             // `children_plain` no significa nada en una hoja: `emit` lo
             // ignora salvo para `PageType::Internal` (ver su comentario).
-            emit(tx, Some(page_no), PageType::Leaf, 0, &entries, false)
+            emit(tx, Some(page_no), PageType::Leaf, 0, &entries, false, bias)
         }
 
         PageType::Internal => {
             let idx = child_index(&page, key);
             let child = child_at(&page, idx);
-            let result = insert_rec(tx, child, key, value, depth + 1)?;
+            // El hijo sigue en el camino más a la derecha solo si esta página
+            // lo estaba Y el descenso tomó `extra`, que es lo que significa
+            // `idx == page.n_slots()` (ver `child_at`).
+            let child_rightmost = rightmost && idx == page.n_slots();
+            let result = insert_rec(tx, child, key, value, depth + 1, child_rightmost)?;
 
             let mut entries: Vec<(Vec<u8>, CellPayload)> = Vec::with_capacity(page.n_slots() + 2);
             let mut extra = page.extra();
@@ -780,7 +866,23 @@ fn insert_rec(
                 }
             }
 
-            emit(tx, Some(page_no), PageType::Internal, extra, &entries, children_plain)
+            // `SplitBias::Middle` a propósito, aunque esta página también
+            // crezca por el borde derecho en una carga de anexado: los nodos
+            // internos son ~0,45 bytes por entrada del fichero medido (once
+            // páginas de 1642 en el banco de 100.000 registros), así que
+            // densificarlos no mueve la métrica, y el candidato de anexado en
+            // un interno deja la mitad derecha con un solo separador — más
+            // reconstrucciones del padre por la misma cantidad de datos. No
+            // se toca lo que no hace falta tocar.
+            emit(
+                tx,
+                Some(page_no),
+                PageType::Internal,
+                extra,
+                &entries,
+                children_plain,
+                SplitBias::Middle,
+            )
         }
 
         _ => Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::PageType }),
@@ -830,7 +932,7 @@ pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<
             CellPayload::Value(value)
         };
         let entries = alloc::vec![(key.to_vec(), payload)];
-        return match emit(tx, None, PageType::Leaf, 0, &entries, false)? {
+        return match emit(tx, None, PageType::Leaf, 0, &entries, false, SplitBias::Middle)? {
             Insertion::Updated(p, _) => Ok(p),
             Insertion::Split { .. } => unreachable!(
                 "emit con una sola entrada nunca divide: cabe (Updated) o falla dentro de \
@@ -839,7 +941,7 @@ pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<
         };
     }
 
-    match insert_rec(tx, root, key, value, 1)? {
+    match insert_rec(tx, root, key, value, 1, true)? {
         Insertion::Updated(p, _) => Ok(p),
         Insertion::Split { left, left_plain, sep, right, right_plain } => {
             // El árbol crece por arriba: raíz nueva con un solo separador.
@@ -850,7 +952,16 @@ pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<
             // son ambos hojas planas.
             let entries = alloc::vec![(sep, CellPayload::Child(left))];
             let children_plain = left_plain && right_plain;
-            match emit(tx, None, PageType::Internal, right, &entries, children_plain)? {
+            let emitted = emit(
+                tx,
+                None,
+                PageType::Internal,
+                right,
+                &entries,
+                children_plain,
+                SplitBias::Middle,
+            )?;
+            match emitted {
                 Insertion::Updated(p, _) => Ok(p),
                 Insertion::Split { .. } => unreachable!("una raíz de una entrada siempre cabe"),
             }
@@ -914,7 +1025,7 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
                 .zip(payloads.iter())
                 .map(|(k, p)| (k.clone(), p.as_cell_payload()))
                 .collect();
-            match emit(tx, Some(page_no), PageType::Leaf, 0, &entries, false)? {
+            match emit(tx, Some(page_no), PageType::Leaf, 0, &entries, false, SplitBias::Middle)? {
                 Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
                 // Quitar una entrada nunca puede hacer que las restantes dejen
                 // de caber donde ya cabían.
@@ -1031,7 +1142,16 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
             // interno nunca es él mismo una hoja plana, ver
             // `entries_are_plain`): se reenvía tal cual, no hace falta
             // recalcularlo.
-            match emit(tx, Some(page_no), PageType::Internal, extra, &entries, children_plain)? {
+            let emitted = emit(
+                tx,
+                Some(page_no),
+                PageType::Internal,
+                extra,
+                &entries,
+                children_plain,
+                SplitBias::Middle,
+            )?;
+            match emitted {
                 Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
                 Insertion::Split { .. } => unreachable!("borrar no divide"),
             }
@@ -1502,7 +1622,7 @@ fn delete_range_rec(
                 return Ok(Removal::Gone);
             }
             let entries: Vec<(Vec<u8>, CellPayload)> = keys.into_iter().zip(values).collect();
-            match emit(tx, Some(page_no), PageType::Leaf, 0, &entries, false)? {
+            match emit(tx, Some(page_no), PageType::Leaf, 0, &entries, false, SplitBias::Middle)? {
                 Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
                 Insertion::Split { .. } => unreachable!("borrar no divide"),
             }
@@ -1637,6 +1757,7 @@ fn delete_range_rec(
                 extra,
                 &plain_entries,
                 children_plain,
+                SplitBias::Middle,
             )? {
                 Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
                 Insertion::Split { .. } => unreachable!("borrar no divide"),
@@ -2662,6 +2783,172 @@ mod invariant_tests {
             }
             _ => panic!("tipo de página inesperado en el árbol: {:?}", page.page_type()),
         }
+    }
+
+    /// Recorre el árbol y acumula cuántas entradas guarda CADA hoja. Es la
+    /// materia prima de las dos pruebas de política de división de abajo.
+    fn leaf_slot_counts(tx: &impl PageSource, page_no: PageNo, out: &mut Vec<usize>) {
+        let bytes = tx.read_page(page_no).unwrap();
+        let page = PageRef::parse(&bytes, page_no).unwrap();
+        match page.page_type() {
+            PageType::Leaf => out.push(page.n_slots()),
+            PageType::Internal => {
+                for i in 0..page.n_slots() {
+                    leaf_slot_counts(tx, page.child(i), out);
+                }
+                leaf_slot_counts(tx, page.extra(), out);
+            }
+            _ => panic!("tipo de página inesperado en el árbol: {:?}", page.page_type()),
+        }
+    }
+
+    /// Claves con la forma exacta de un log: marca de tiempo big-endian de 8
+    /// bytes que avanza 520 ms por registro, más 2 bytes de contador. La
+    /// marca domina, así que la sucesión es ESTRICTAMENTE ASCENDENTE — la
+    /// misma forma que `synthetic_log` en `tests/size.rs`, para que lo que
+    /// aquí se fija sea lo mismo que allí se mide.
+    fn log_key(i: u32) -> Vec<u8> {
+        let mut k = Vec::with_capacity(10);
+        k.extend_from_slice(&(1_760_000_000_000u64 + i as u64 * 520).to_be_bytes());
+        k.extend_from_slice(&((i % 8) as u16).to_be_bytes());
+        k
+    }
+
+    /// Cuántas entradas de `log_key` + valor de 4 bytes caben DE VERDAD en
+    /// una hoja de `page_size`, medido preguntándoselo a `PageBuilder` hasta
+    /// que deja de caber.
+    ///
+    /// Hace falta medirlo aparte, y no basta con el máximo observado en el
+    /// árbol: **con la política de punto medio ninguna hoja llega jamás a
+    /// llenarse**, así que el árbol no contiene su propia capacidad y usar
+    /// su máximo como referencia da un llenado aparente muy por encima del
+    /// real (medido: 82 % aparente contra 49 % real). El umbral se compara
+    /// contra esta capacidad, que no depende de la política de división.
+    fn log_leaf_capacity(page_size: u32) -> usize {
+        let mut best = 0;
+        for k in 1..2048u32 {
+            let keys: Vec<Vec<u8>> = (0..k).map(log_key).collect();
+            let values: Vec<[u8; 4]> = (0..k).map(|i| i.to_le_bytes()).collect();
+            let entries: Vec<(&[u8], CellPayload)> = keys
+                .iter()
+                .zip(values.iter())
+                .map(|(k, v)| (k.as_slice(), CellPayload::Value(v.as_slice())))
+                .collect();
+            if PageBuilder::new(page_size, PageType::Leaf).build(&entries).is_none() {
+                break;
+            }
+            best = k as usize;
+        }
+        best
+    }
+
+    /// **Regresión de `SplitBias::Append`.** Con inserción estrictamente
+    /// ascendente, partir por el punto medio deja cada mitad izquierda
+    /// congelada al 50 % para siempre: ningún `put` posterior vuelve a caer
+    /// en ese rango. Medido sobre el banco de un millón de registros
+    /// (`tests/size.rs`) antes de la corrección: llenado medio de hoja
+    /// 49,5 %, p95 51,6 %, y la mitad del fichero —34,15 de 68 B/entrada—
+    /// era hueco libre.
+    ///
+    /// Esta prueba fija el arreglo donde se puede comprobar barato: el
+    /// llenado medio de las hojas debe quedar cerca de la capacidad real de
+    /// una hoja, no cerca de su mitad. Medido con este mismo caso (4000
+    /// claves, página de 512 B, capacidad 40 entradas): con la política
+    /// anterior salen 203 hojas con una media de 19,7 entradas (**49 %**);
+    /// con el sesgo de anexado, 103 hojas con una media de 38,8 (**97 %**).
+    /// El umbral de 0,85 deja sitio de sobra a la última hoja, que por
+    /// construcción está a medio llenar y siempre baja algo la media.
+    #[test]
+    fn ascending_insertion_fills_leaves_instead_of_freezing_them_half_empty() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let capacity = log_leaf_capacity(tx.logical_page_size());
+        let n = 4000u32;
+        let mut root = 0;
+        for i in 0..n {
+            root = put(&mut tx, root, &log_key(i), &i.to_le_bytes()).unwrap();
+        }
+
+        let mut counts = Vec::new();
+        leaf_slot_counts(&tx, root, &mut counts);
+        let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
+        assert!(
+            mean >= 0.85 * capacity as f64,
+            "llenado medio de hoja {mean:.1} entradas sobre una capacidad real de {capacity} \
+             ({:.0} %) en {} hojas: la inserción ascendente vuelve a congelar las mitades \
+             izquierdas",
+            mean / capacity as f64 * 100.0,
+            counts.len()
+        );
+
+        for i in 0..n {
+            assert_eq!(
+                get(&tx, root, &log_key(i)).unwrap().as_deref(),
+                Some(&i.to_le_bytes()[..]),
+                "clave {i}"
+            );
+        }
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    /// La otra mitad del contrato de `SplitBias::Append`: una página que se
+    /// llena por inserción **interior** —no por anexado— debe seguir
+    /// partiéndose por el medio. Si el caso especial de anexado se disparara
+    /// también aquí, cada división dejaría una mitad derecha con UNA sola
+    /// entrada y el árbol degeneraría en muchas hojas casi vacías; este
+    /// proyecto ya tuvo una pérdida silenciosa de datos por un defecto de
+    /// división interna, así que el caso se fija explícitamente en vez de
+    /// darse por bueno.
+    ///
+    /// La siembra deja huecos (solo los índices pares) y las hojas llenas
+    /// hasta arriba por el camino de anexado; después se insertan los
+    /// impares, que caen SIEMPRE entre dos claves existentes y nunca son la
+    /// mayor del árbol —el mayor par, `n-2`, se insertó primero—, así que
+    /// ninguna de esas inserciones puede pedir `Append` legítimamente.
+    /// Todas ellas caen sobre páginas ya llenas: cada una provoca una
+    /// división interior.
+    #[test]
+    fn a_page_that_fills_by_interior_insertion_still_splits_near_the_middle() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let capacity = log_leaf_capacity(tx.logical_page_size());
+        let n = 4000u32;
+        let mut root = 0;
+        for i in (0..n).step_by(2) {
+            root = put(&mut tx, root, &log_key(i), &i.to_le_bytes()).unwrap();
+        }
+        for i in (1..n).step_by(2) {
+            root = put(&mut tx, root, &log_key(i), &i.to_le_bytes()).unwrap();
+        }
+
+        let mut counts = Vec::new();
+        leaf_slot_counts(&tx, root, &mut counts);
+        let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
+        // El suelo clásico de un B+tree que parte por el medio. Un anexado
+        // mal disparado aquí produciría una mitad derecha de una sola entrada
+        // en cada división y hundiría esta media muy por debajo.
+        assert!(
+            mean >= 0.45 * capacity as f64,
+            "llenado medio de hoja {mean:.1} entradas sobre una capacidad real de {capacity} \
+             ({:.0} %) en {} hojas: la división interior está degenerando",
+            mean / capacity as f64 * 100.0,
+            counts.len()
+        );
+        assert!(
+            counts.iter().all(|&c| c >= 2),
+            "alguna hoja quedó con menos de dos entradas tras divisiones interiores: {counts:?}"
+        );
+
+        for i in 0..n {
+            assert_eq!(
+                get(&tx, root, &log_key(i)).unwrap().as_deref(),
+                Some(&i.to_le_bytes()[..]),
+                "clave {i}"
+            );
+        }
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
     }
 
     #[test]
