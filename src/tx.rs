@@ -3,6 +3,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock};
 use std::time::Instant;
 
@@ -24,16 +25,73 @@ use crate::{Error, PageNo, Result, Storage, TxnId};
 pub use crate::crypto::Encryption;
 
 /// Política de sincronización a disco.
+///
+/// # Lo que cada modo promete de verdad
+///
+/// Los tres modos comparten una garantía, y es la que el motor SÍ puede
+/// dar: **ninguna página que la meta superviviente referencie ha sido
+/// reescrita por una transacción posterior.** El reciclado de páginas
+/// libres está anclado a la última meta DEMOSTRADA en disco, no a la
+/// última escrita (ver el campo `Db::durable`), así que el árbol que monta
+/// tras un corte es el de un commit real y completo, nunca uno con
+/// agujeros.
+///
+/// Lo que cambia entre modos es CUÁNTO se pierde y CUÁNTOS `fsync` se
+/// pagan:
+///
+/// - `Commit`: dos `fsync` por commit. Pérdida máxima: el commit en vuelo.
+/// - `Interval(d)`: `fsync` como mucho cada `d`. Pérdida máxima: los
+///   commits de la última ventana.
+/// - `Never`: ningún `fsync` por commit. Pérdida máxima: todo lo
+///   confirmado desde el último `fsync` que el motor haya emitido por su
+///   cuenta.
+///
+/// # Los dos `fsync` que el motor emite pase lo que pase
+///
+/// Ni `Interval` ni `Never` significan "cero `fsync`":
+///
+/// - **Para recuperar espacio.** Una página liberada no se puede volver a
+///   repartir mientras la meta durable siga referenciándola, así que un
+///   punto durable muy retrasado obliga a retener páginas libres — y bajo
+///   `Never`, sin ningún `fsync`, a retenerlas para siempre: el fichero
+///   crecería sin cota justo en el entorno donde el disco es más escaso.
+///   El motor no deja que el punto durable se retrase más de
+///   `MAX_DURABLE_LAG` transacciones: pasado ese punto paga UN `fsync` y
+///   recupera de golpe todo lo liberado hasta ahí. Coste medido (2 000
+///   commits sobre 200 claves, páginas de 512 B): 84 páginas frente a las
+///   24 de `Sync::Commit` —un margen constante, no proporcional al
+///   trabajo—, un 23 % más de escrituras físicas y 31 veces menos `fsync`.
+///   Ver `relaxed_sync_costs_bounded_space_and_far_fewer_fsyncs` en
+///   `tests/faults.rs`.
+/// - **Para no reutilizar un contador de nonce** en una base cifrada, ver
+///   `Db::extend_counter_ceiling`.
+///
+/// # El límite que ningún modo relajado puede superar
+///
+/// Con `Interval`/`Never`, entre las páginas de un commit y su meta puede
+/// no haber ningún `fsync`, así que nada impide que el sistema operativo
+/// escriba la meta ANTES que las páginas que esa meta referencia. Si el
+/// corte cae justo ahí, la base monta por una meta cuyas páginas nunca
+/// llegaron al medio, y eso el motor no lo puede evitar: ordenar las dos
+/// cosas es exactamente lo que hace el primer `fsync` de `Sync::Commit`.
+/// Dicho al derecho: **el modo relajado no promete que el último commit
+/// sobreviva entero; promete que lo que sobreviva no lo habrá estropeado
+/// una transacción posterior.**
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sync {
     /// Un `fsync` de páginas y otro de meta por commit. Pérdida máxima en un
-    /// corte: el commit en vuelo.
+    /// corte: el commit en vuelo. Único modo que ordena las páginas de un
+    /// commit por delante de su meta — ver el comentario del enum.
     Commit,
     /// Agrupa sincronizaciones. Pérdida máxima: los commits de la última
     /// ventana. Pensado para IoT, donde sincronizar cada escritura desgasta la
-    /// memoria flash. Nunca corrompe: el dato vivo no se sobrescribe.
+    /// memoria flash. Emite además el `fsync` de recuperación de espacio
+    /// descrito en el comentario del enum si el ritmo de commits deja el
+    /// punto durable más de `MAX_DURABLE_LAG` transacciones por detrás.
     Interval(Duration),
-    /// Sin `fsync`. Solo para pruebas y bancos.
+    /// Sin `fsync` por commit: solo los que el motor necesita para
+    /// recuperar espacio (y, con cifrado, para no reutilizar contadores)
+    /// — ver el comentario del enum. Pensado para pruebas y bancos.
     Never,
 }
 
@@ -59,6 +117,11 @@ impl Default for Options {
     }
 }
 
+/// Transacciones que el punto durable (`Db::durable`) puede quedarse por
+/// detrás de la meta confirmada antes de que el motor pague UN `fsync`
+/// para ponerlo al día. Ver `Db::reclaim_needs_a_sync`.
+const MAX_DURABLE_LAG: TxnId = 16;
+
 pub struct Db {
     pager: Pager,
     /// La meta CONFIRMADA y la ranura donde vive, siempre fieles byte a
@@ -83,6 +146,42 @@ pub struct Db {
     /// pertenece: es el punto de partida de la PRÓXIMA transacción, no algo
     /// que ya esté confirmado.
     committed: RwLock<(Meta, MetaSlot)>,
+    /// Punto DURABLE: el último `txn_id` cuya meta se ha demostrado en
+    /// disco, con la extensión que tenía el fichero en ese instante.
+    ///
+    /// **No es `committed`, y confundirlos era el defecto que esta
+    /// corrección cierra.** `committed` es la última meta ESCRITA; bajo
+    /// `Sync::Interval`/`Never` una escritura de meta puede llevar mucho
+    /// tiempo sin sincronizarse, así que la meta que un corte de corriente
+    /// deja como superviviente puede ir varias transacciones por detrás.
+    /// La regla de reutilización de la lista de libres — una página
+    /// liberada en la transacción N sigue viva para cualquier lector cuyo
+    /// snapshot sea anterior a N — cuenta la meta confirmada como lector
+    /// implícito, y ese lector implícito es el que MONTARÍA tras un corte:
+    /// el durable, no el escrito. Con el escrito como suelo, `alloc`
+    /// repartía páginas que el árbol durable seguía referenciando y el
+    /// escritor las sobrescribía; tras el corte, la meta superviviente
+    /// describía un árbol con agujeros — claves confirmadas y reconocidas
+    /// decenas de commits antes devueltas como `None`, y claves de commits
+    /// muy posteriores devueltas como si fueran suyas. Ver
+    /// `a_power_cut_that_keeps_data_pages_but_loses_the_last_metas_leaves_a_whole_snapshot`
+    /// (`tests/faults.rs`).
+    ///
+    /// **Es exactamente el mismo razonamiento que `counter_ceiling`**
+    /// (`WriterState`, más abajo), un módulo más allá y por el mismo
+    /// motivo: aquel campo se negó a avanzar con la escritura de meta de un
+    /// commit normal porque «bajo `Sync::Interval`/`Never` puede no haberse
+    /// hecho durable todavía», y solo acepta avances ya demostrados en
+    /// disco. Este campo es esa misma regla aplicada a la reutilización de
+    /// páginas: solo avanza tras un `sync()` que devolvió `Ok` (ver
+    /// `Db::sync_upto`, el ÚNICO sitio que lo mueve).
+    ///
+    /// `n_pages` es la extensión del fichero en el momento de ese avance:
+    /// es la base contra la que `reclaim_needs_a_sync` mide cuánto ha
+    /// crecido el fichero por no poder reciclar todavía. Ver ahí el
+    /// porqué de que exista un presupuesto en vez de sincronizar en cuanto
+    /// haga falta una página.
+    durable: AtomicU64,
     write_lock: Mutex<Option<WriterState>>,
     readers: Mutex<BTreeMap<TxnId, u32>>,
     sync: Sync,
@@ -355,46 +454,42 @@ impl Db {
         let pager = Pager::new(storage, geometry, opts.cache_pages).with_encryption(encryption);
         // Degrada con gracia si la cadena heredada no decodifica, en vez de
         // propagar el error con `?` (tarea 19, autorrevisión tras el hallazgo
-        // de las pruebas basadas en propiedades). `Freelist::flush` recicla,
-        // dentro de la misma sesión, el contenedor físico que su propio
-        // `flush` anterior escribió (ver `written_head` en `freelist.rs`) —
-        // más rápido de lo que una meta antigua todavía "vigente" puede
-        // tolerar: bajo `Sync::Never` o un `Sync::Interval` largo, la meta
-        // que sobrevive a un corte de corriente puede quedarse varias
-        // transacciones atrás de la última escrita, y esa meta vieja puede
-        // seguir señalando como `freelist_head`/`freelist_tail` una página
-        // cuyo contenedor físico una transacción posterior — nunca
-        // sincronizada, así que invisible para esta apertura — ya reasignó
-        // como página de datos.
+        // de las pruebas basadas en propiedades).
         //
-        // **La pérdida NO es pequeña.** Esa cadena concreta es irrecuperable
-        // — sus páginas quedan perdidas en vez de reincorporarse a la lista
-        // de libres — y "esa cadena" puede ser una fracción grande del
-        // fichero, no un puñado de páginas: la ronda de revisión que
-        // encontró esta corrección midió un caso real con 27 de 56 páginas
-        // (48 %) huérfanas para siempre tras degradar. La reutilización de
-        // contenedores de esta misma tarea (ver el comentario de
-        // `Freelist::flush`) empeora esto, no lo mejora: al consumir
-        // contenedores con avidez en vez de dejarlos extender el fichero,
-        // hace MÁS probable —no menos— que la meta que sobrevive a un corte
-        // bajo `Sync::Never`/`Interval` largo describa una cadena ya
-        // reasignada. El resto del fichero —árbol, meta, cabecera— sigue
-        // intacto y perfectamente legible; solo la lista de libres concreta
-        // que esa meta vieja describía se pierde. Cerrarlo de verdad
-        // necesita coordinar la reutilización con la política de `Sync`, no
-        // solo con el número de `flush` transcurridos — ver la reforma de
-        // la lista de libres ya pendiente en la deuda técnica de la fase 2;
-        // esta corrección solo evita que el motor se niegue a abrir, no
-        // evita la pérdida en sí.
+        // **El escenario que motivó esto ya está cerrado en origen.** Se
+        // escribió porque `Freelist::flush` reciclaba, dentro de la misma
+        // sesión, el contenedor físico que su propio `flush` anterior había
+        // escrito (ver `written_head` en `freelist.rs`) más rápido de lo que
+        // una meta antigua todavía "vigente" podía tolerar: bajo
+        // `Sync::Never` o un `Sync::Interval` largo, la meta que sobrevive a
+        // un corte puede quedarse varias transacciones atrás de la última
+        // escrita, y esa meta vieja seguía señalando como
+        // `freelist_head`/`freelist_tail` una página cuyo contenedor físico
+        // una transacción posterior —nunca sincronizada, así que invisible
+        // para esta apertura— ya había reasignado como página de datos. La
+        // pérdida no era pequeña: un caso real medido dejó 27 de 56 páginas
+        // (48 %) huérfanas para siempre tras degradar. Eso ya no puede
+        // ocurrir: el suelo de reutilización es la meta DURABLE, no la
+        // última escrita (ver el campo `Db::durable`), así que nada de lo
+        // que la meta que montaría tras un corte referencia —cadena de
+        // libres incluida— se reparte.
         //
-        // Negarse a abrir por esto, aun así, sería peor: el mismo error que
-        // la reparación de cabecera de más arriba existe para evitar — un
+        // Se conserva como defensa en profundidad, no como red de un
+        // reciclado que se sabía imprudente: una cadena puede dejar de
+        // decodificar por un medio que devuelve basura o un fichero
+        // manipulado, y negarse a abrir por eso sería el mismo error que la
+        // reparación de cabecera de más arriba existe para evitar — un
         // fichero por lo demás legible al que el motor le niega la entrada
-        // porque una pieza de contabilidad no cuadra. Solo `Corrupt` se
-        // trata así — un `IoError` del medio subyacente (lectura fallida de
-        // verdad, no una página con el tipo cambiado) sigue siendo fatal,
-        // porque ahí no hay ninguna base razonable para asumir "esto es
-        // solo el reciclado de la tarea 19" en vez de un fallo real del
+        // porque una pieza de contabilidad no cuadra. Cubierto por su
+        // prueba directa,
+        // `an_unreadable_freelist_chain_does_not_keep_the_database_from_opening`
+        // (abajo), que ataca la cadena a propósito: las pruebas de corte de
+        // corriente que antes llegaban aquí de rebote ya no lo hacen, y
+        // dejar la rama sin cobertura confiando en que sí lo hacen sería el
+        // patrón de siempre. Solo `Corrupt` se trata así — un `IoError` del
+        // medio subyacente (lectura fallida de verdad, no una página con el
+        // tipo cambiado) sigue siendo fatal, porque ahí no hay ninguna base
+        // razonable para asumir contabilidad en vez de un fallo real del
         // almacenamiento.
         let mut freelist = match Freelist::load(&pager, meta.freelist_head, meta.freelist_tail) {
             Ok(f) => f,
@@ -511,6 +606,15 @@ impl Db {
         Self {
             pager: Pager::new(storage, geometry, opts.cache_pages).with_encryption(encryption),
             committed: RwLock::new((meta, slot)),
+            // La meta con la que se monta ESTÁ en disco por definición —
+            // `Db::create` la sincroniza antes de llegar aquí y `Db::open`
+            // acaba de leerla del fichero — así que el punto durable
+            // arranca exactamente ahí, sin necesitar ninguna
+            // sincronización de más. (En `open`, `meta` puede llevar
+            // `freelist_head`/`tail` puestos a cero por la degradación con
+            // gracia; lo que este campo mira, `txn_id` y `n_pages`, sigue
+            // siendo byte a byte lo que hay en el fichero.)
+            durable: AtomicU64::new(meta.txn_id),
             write_lock: Mutex::new(Some(writer_state)),
             readers: Mutex::new(BTreeMap::new()),
             sync: opts.sync,
@@ -1117,13 +1221,19 @@ impl Db {
         // Primero la INACTIVA: mientras se escribe, la activa sigue siendo
         // el registro válido del último commit.
         extension.store_via(&self.pager, &geometry, committed_slot.other())?;
-        self.pager.sync()?;
+        // `sync_upto`, no `pager.sync()` a secas: estas dos escrituras
+        // llevan el estado confirmado —el mismo `txn_id`— así que una
+        // sincronización que devuelve `Ok` aquí demuestra en disco esa
+        // meta confirmada tanto como lo haría la de un commit bajo
+        // `Sync::Commit`. Avanzar el punto durable con ella es gratis y le
+        // ahorra a `WriteTxn::recycle` un `fsync` propio más adelante.
+        self.sync_upto(committed_meta.txn_id)?;
         // Y solo entonces la ACTIVA: ahora la inactiva ya lleva, de forma
         // duradera, ese mismo estado confirmado con el techo nuevo, así que
         // desgarrar esta segunda escritura no puede dejar el fichero sin
         // ninguna meta válida. Ver el razonamiento completo arriba.
         extension.store_via(&self.pager, &geometry, committed_slot)?;
-        self.pager.sync()?;
+        self.sync_upto(committed_meta.txn_id)?;
 
         // `self.committed` debe seguir describiendo, byte a byte, lo que hay
         // en la ranura confirmada — es la invariante de la que depende que
@@ -1402,7 +1512,7 @@ impl<'db> WriteTxn<'db> {
     /// motor cuyo objetivo es justo el mínimo consumo de disco.
     ///
     /// Si `own_free` está vacío, la lista de libres persistente, con la
-    /// meta confirmada contando como lector — el más importante: si esta
+    /// meta DURABLE contando como lector — el más importante: si esta
     /// transacción no llega a confirmar, la recuperación monta por ella,
     /// así que hay un lector implícito en el último commit hasta que esta
     /// acabe. Sin ese suelo, una página liberada por esta transacción pero
@@ -1413,7 +1523,13 @@ impl<'db> WriteTxn<'db> {
     /// memoria, no lo que ya se escribió en disco — y un corte de
     /// corriente nunca llega a ejecutar `Drop`. `min` con el lector real
     /// más antiguo (si lo hay) conserva ese límite tal cual: la meta
-    /// confirmada nunca es más reciente que cualquier lector real vivo.
+    /// durable nunca es más reciente que cualquier lector real vivo.
+    ///
+    /// **DURABLE, no confirmada** (ver el campo `Db::durable`): la meta que
+    /// monta tras un corte no es la última escrita sino la última
+    /// sincronizada, y bajo `Sync::Interval`/`Never` no son la misma. Con
+    /// la confirmada como suelo, este método repartía páginas que el árbol
+    /// durable seguía referenciando.
     ///
     /// Cualquier página que salga de aquí, sea cual sea la fuente, se
     /// registra en `self_allocated`: en cuanto esta transacción la posee,
@@ -1425,13 +1541,7 @@ impl<'db> WriteTxn<'db> {
             return Ok(p);
         }
 
-        let committed_txn = self.db.committed.read().unwrap().0.txn_id;
-        let oldest = Some(match self.db.oldest_reader() {
-            Some(r) => core::cmp::min(r, committed_txn),
-            None => committed_txn,
-        });
-        let pager = &self.db.pager;
-        let p = if let Some(p) = self.state().freelist.pop_refill(pager, oldest)? {
+        let p = if let Some(p) = self.recycle()? {
             p
         } else {
             // Salta la página destino final de la meta B (tarea 18): ver el
@@ -1446,6 +1556,50 @@ impl<'db> WriteTxn<'db> {
         };
         self.self_allocated.insert(p);
         Ok(p)
+    }
+
+    /// Sirve una página de la lista de libres persistente, o `None` si no
+    /// hay ninguna reutilizable y el fichero tiene que crecer.
+    ///
+    /// Dos intentos, no uno. El primero usa el suelo de reutilización tal
+    /// como está (`Db::reuse_floor`, con la meta DURABLE como lector
+    /// implícito). Si no sirve nada y lo que retiene al suelo es el retraso
+    /// del punto durable —no un lector real, ni una lista de libres
+    /// vacía— entonces un `fsync` AQUÍ pone el punto durable al día y
+    /// desbloquea de golpe todo lo liberado hasta la última meta escrita;
+    /// `reclaim_needs_a_sync` decide si ya toca pagarlo o si todavía sale
+    /// más barato dejar crecer el fichero (ver su comentario para el
+    /// presupuesto y su porqué).
+    ///
+    /// **Es la respuesta a la única objeción seria contra usar el punto
+    /// durable como suelo**: bajo `Sync::Never` nada se sincroniza jamás,
+    /// así que un suelo durable «puro» no avanzaría nunca y ninguna página
+    /// se reciclaría — el fichero crecería sin cota en el entorno donde el
+    /// disco es más escaso. Con esto, `Sync::Never` deja de significar
+    /// «sin `fsync` pase lo que pase» y pasa a significar «sin `fsync` por
+    /// commit; solo los que hagan falta para recuperar espacio» — que es
+    /// justo el trato que un proceso IoT de larga duración querría. No es
+    /// una excepción nueva en el motor: `Db::extend_counter_ceiling` ya
+    /// sincroniza sin condiciones bajo cualquier política cuando la
+    /// corrección lo exige.
+    ///
+    /// Sincronizar a mitad de una transacción no publica nada: lo único
+    /// que hay escrito y sin confirmar son páginas que ninguna meta
+    /// referencia todavía, y la meta de esta transacción aún no se ha
+    /// escrito. Mismo razonamiento que `extend_counter_ceiling`.
+    fn recycle(&mut self) -> Result<Option<PageNo>> {
+        let pager = &self.db.pager;
+        let floor = self.db.reuse_floor();
+        if let Some(p) = self.state().freelist.pop_refill(pager, Some(floor))? {
+            return Ok(Some(p));
+        }
+        if !self.db.reclaim_needs_a_sync() {
+            return Ok(None);
+        }
+        let upto = self.db.committed.read().unwrap().0.txn_id;
+        self.db.sync_upto(upto)?;
+        let floor = self.db.reuse_floor();
+        self.state().freelist.pop_refill(pager, Some(floor))
     }
 
     /// Marca `page` como libre a partir de esta transacción.
@@ -1968,14 +2122,22 @@ impl<'db> WriteTxn<'db> {
         // la posición nueva sin ningún contenido legible justo cuando la
         // cabecera, dos líneas más abajo, empieza a apuntar ahí. Con
         // `new_geometry`, `MetaSlot::B.page(&new_geometry)` ya es `target`.
+        // Las tres sincronizaciones pasan por `sync_upto` (ver su
+        // comentario) por el mismo motivo que las de
+        // `extend_counter_ceiling`: lo que se está escribiendo es el
+        // estado CONFIRMADO (`current.0`), así que cada una de ellas
+        // demuestra en disco esa meta y el punto durable puede avanzar
+        // hasta ella sin pagar ningún `fsync` que no se fuera a pagar de
+        // todos modos.
+        let durable_txn = current.0.txn_id;
         current.0.store_via(&self.db.pager, &new_geometry, MetaSlot::B)?;
-        self.db.pager.sync()?;
+        self.db.sync_upto(durable_txn)?;
 
         new_geometry.write_mirror(self.db.pager.storage())?;
-        self.db.pager.sync()?;
+        self.db.sync_upto(durable_txn)?;
 
         new_geometry.write(self.db.pager.storage())?;
-        self.db.pager.sync()?;
+        self.db.sync_upto(durable_txn)?;
         self.db.pager.set_geometry(new_geometry);
 
         // **`set_geometry` corre DESPUÉS de un `sync` que puede fallar
@@ -2079,6 +2241,28 @@ impl<'db> WriteTxn<'db> {
                 state.freelist.push(page, txn_id);
             }
         }
+        // Pone al día el punto durable ANTES de serializar la lista de
+        // libres, si se ha quedado demasiado atrás (ver
+        // `Db::reclaim_needs_a_sync`).
+        //
+        // **Aquí, y no solo en `WriteTxn::recycle`.** `Freelist::flush`
+        // reserva un contenedor por cada grupo que tenga que escribir, y
+        // los pide con un `alloc` PROPIO —el cierre de aquí abajo— que
+        // extiende el fichero sin pasar por `WriteTxn::alloc` ni por
+        // ninguna comprobación de presupuesto. Con el punto durable
+        // retrasado, `flush` no puede reciclar nada como contenedor y
+        // extiende tantas páginas como grupos tenga; cada commit deja un
+        // grupo más, así que el coste por commit crece con el retraso y
+        // las páginas que extiende engordan la propia lista: medido, un
+        // banco de 2 000 commits sobre 200 claves pasaba de 24 a 2 088
+        // páginas y de 8 000 a 65 000 escrituras físicas cuando el
+        // presupuesto solo se comprobaba en `alloc`. Sincronizando aquí,
+        // `flush` recicla contenedores como siempre y las tres cosas
+        // —espacio, escrituras y `fsync`— quedan acotadas a la vez.
+        if self.db.reclaim_needs_a_sync() {
+            let previous = self.db.committed.read().unwrap().0.txn_id;
+            self.db.sync_upto(previous)?;
+        }
         {
             let pager = &self.db.pager;
             let page_size = self.page_size();
@@ -2094,17 +2278,25 @@ impl<'db> WriteTxn<'db> {
             // cuando `flush` la necesita.
             //
             // Mismo guardián de lector más antiguo que usa `WriteTxn::alloc`
-            // (ver su comentario): páginas liberadas por ESTA misma
-            // transacción (el volcado de `own_free` justo arriba, ya
-            // etiquetado con `txn_id`) quedan descartadas sin más — no son
-            // "de antes de esta transacción" — porque `committed_txn` sigue
-            // siendo la del commit ANTERIOR mientras este todavía no ha
-            // confirmado.
-            let committed_txn = self.db.committed.read().unwrap().0.txn_id;
-            let oldest = Some(match self.db.oldest_reader() {
-                Some(r) => core::cmp::min(r, committed_txn),
-                None => committed_txn,
-            });
+            // (ver su comentario y el del campo `Db::durable`): páginas
+            // liberadas por ESTA misma transacción (el volcado de
+            // `own_free` justo arriba, ya etiquetado con `txn_id`) quedan
+            // descartadas sin más — no son "de antes de esta transacción" —
+            // porque el suelo no puede pasar de la meta confirmada, que
+            // sigue siendo la del commit ANTERIOR mientras este todavía no
+            // ha confirmado.
+            //
+            // Que el suelo sea el DURABLE importa aquí tanto como en
+            // `alloc`, y cierra además un agujero que estaba documentado
+            // como conocido: `Freelist::flush` recicla como contenedor
+            // tanto páginas libres cualesquiera como la cadena física que
+            // el `flush` anterior escribió, y con la meta ESCRITA como
+            // suelo podía reasignar la cadena que la meta DURABLE todavía
+            // declaraba como suya — dejando a `Db::open` releyendo una
+            // cadena de lista de libres ya reasignada (ver el comentario
+            // de `Freelist::flush` en `freelist.rs` y el de la degradación
+            // con gracia en `Db::open`, más arriba).
+            let oldest = Some(self.db.reuse_floor());
             // Salta la página destino final de la meta B igual que `alloc`
             // (tarea 18, ver el comentario de `skip_meta_b_target`): una
             // página de lista de libres es tan "dato en vivo" como cualquier
@@ -2157,12 +2349,20 @@ impl<'db> WriteTxn<'db> {
             self.meta.write_counter = live_counter.checked_add(COUNTER_RESERVE).ok_or(Error::Full)?;
         }
 
-        self.db.maybe_sync()?;
+        // La meta de ESTA transacción todavía no está escrita, así que si
+        // esta sincronización ocurre, lo que se demuestra duradero es el
+        // commit ANTERIOR (con las páginas de este ya en el medio, que es
+        // justo el orden que hace atómico el commit). Ver `Db::sync_upto`.
+        let previous = self.db.committed.read().unwrap().0.txn_id;
+        self.db.maybe_sync(previous)?;
 
         let target = self.slot.other();
         let geometry = self.db.pager.geometry();
         self.meta.store_via(&self.db.pager, &geometry, target)?;
-        self.db.maybe_sync()?;
+        // Y aquí sí: la meta de esta transacción ya está escrita, así que
+        // una sincronización que ocurra ahora la hace duradera y el punto
+        // durable puede avanzar hasta ella.
+        self.db.maybe_sync(self.meta.txn_id)?;
 
         *self.db.committed.write().unwrap() = (self.meta, target);
         self.committed = true;
@@ -2171,19 +2371,98 @@ impl<'db> WriteTxn<'db> {
 }
 
 impl Db {
-    fn maybe_sync(&self) -> Result<()> {
+    /// Sincroniza según la política configurada. `upto` es el `txn_id`
+    /// cuya meta YA está escrita en el medio en el momento de la llamada
+    /// —no la que se escribirá después— y `extent` la extensión del
+    /// fichero ahora mismo: si la sincronización llega a ocurrir, ese par
+    /// pasa a ser el punto durable. Ver `sync_upto`.
+    fn maybe_sync(&self, upto: TxnId) -> Result<()> {
         match self.sync {
-            Sync::Commit => self.pager.sync(),
+            Sync::Commit => self.sync_upto(upto),
             Sync::Never => Ok(()),
             Sync::Interval(d) => {
                 let mut last = self.last_sync.lock().unwrap();
                 if last.elapsed() >= d {
-                    self.pager.sync()?;
+                    self.sync_upto(upto)?;
                     *last = Instant::now();
                 }
                 Ok(())
             }
         }
+    }
+
+    /// Sincroniza y, solo si el `sync()` devolvió `Ok`, avanza el punto
+    /// durable hasta `upto`.
+    ///
+    /// **Es el único sitio del motor que mueve `Db::durable`**, y el orden
+    /// —primero el medio, después el campo— es toda la garantía: un
+    /// `sync()` correcto significa que todo lo escrito ANTES de él está en
+    /// el medio, incluida la meta de `upto`, así que a partir de aquí
+    /// reutilizar páginas que `upto` ya no referencia no puede dañar a
+    /// ningún estado que un corte de corriente pueda hacer montar. Si
+    /// `sync()` falla, el punto durable se queda donde estaba y el motor
+    /// sigue protegiendo el estado anterior: exactamente la misma
+    /// disciplina que `WriterState::counter_ceiling`, que tampoco avanza
+    /// con una escritura que quizá no se hizo durable.
+    fn sync_upto(&self, upto: TxnId) -> Result<()> {
+        self.pager.sync()?;
+        self.durable.fetch_max(upto, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Suelo de reutilización: la transacción más antigua que todavía
+    /// puede necesitar ver una página liberada, contando la meta DURABLE
+    /// como lector implícito (ver el campo `durable`) además de los
+    /// lectores reales.
+    ///
+    /// `min` con `committed`: el punto durable nunca debería superar a la
+    /// meta confirmada, pero durante el commit hay un instante en que la
+    /// meta nueva ya se sincronizó y `Db::committed` todavía no se ha
+    /// publicado; tomar el mínimo hace que ese instante no pueda adelantar
+    /// el suelo por delante de lo que cualquier otro hilo ve como
+    /// confirmado, sin costar nada.
+    ///
+    /// Cada candado se toma y se suelta por separado, dentro de su propia
+    /// sentencia: así no hay ningún orden de adquisición que mantener
+    /// entre `committed`, `durable` y `readers`.
+    fn reuse_floor(&self) -> TxnId {
+        let committed = self.committed.read().unwrap().0.txn_id;
+        let durable = self.durable.load(Ordering::SeqCst);
+        let implicit = core::cmp::min(committed, durable);
+        match self.oldest_reader() {
+            Some(r) => core::cmp::min(r, implicit),
+            None => implicit,
+        }
+    }
+
+    /// ¿Toca pagar un `fsync` para poder reciclar?
+    ///
+    /// Solo tiene sentido preguntarlo cuando la lista de libres no ha
+    /// podido servir nada: si el punto durable va por detrás de la meta
+    /// confirmada, sincronizar AHORA lo pone al día y con ello desbloquea
+    /// todas las páginas liberadas hasta esa meta. La alternativa es
+    /// extender el fichero.
+    ///
+    /// **Por qué hay un presupuesto y no se sincroniza a la primera.** Una
+    /// carga en régimen permanente libera en cada transacción más o menos
+    /// tantas páginas como asigna, y todas quedan etiquetadas con esa
+    /// misma transacción: sincronizar en cuanto la lista de libres no
+    /// sirve significaría un `fsync` por transacción, que es tanto como no
+    /// tener sincronización relajada. Dejando crecer el fichero un poco
+    /// primero, cada `fsync` desbloquea de golpe toda la basura acumulada
+    /// desde el anterior, y el coste queda amortizado: como mucho un
+    /// `fsync` por cada `n_pages/16` páginas de crecimiento (con un suelo
+    /// de 16 páginas para bases diminutas), y el fichero nunca se pasa de
+    /// ese mismo margen sobre lo que ocuparía sincronizando siempre. Ver
+    /// las medidas en el informe de esta tarea.
+    ///
+    /// Bajo `Sync::Commit` esto devuelve `false` SIEMPRE —el punto durable
+    /// va al día por construcción— así que ni se llega a evaluar el
+    /// presupuesto ni se emite ningún `fsync` de más.
+    fn reclaim_needs_a_sync(&self) -> bool {
+        let committed = self.committed.read().unwrap().0.txn_id;
+        let durable = self.durable.load(Ordering::SeqCst);
+        committed.saturating_sub(durable) >= MAX_DURABLE_LAG
     }
 }
 
@@ -2327,6 +2606,33 @@ impl Db {
     /// fuera de cualquier `WriteTxn`, con el candado de escritor libre —
     /// coherente con la firma que pide el brief, `db.audit_pages()` sobre
     /// `&Db`, no sobre `&mut WriteTxn`.
+    ///
+    /// # Por qué `Db::open` NO la llama
+    ///
+    /// Decisión explícita, no un olvido. Una revisión encontró un fichero
+    /// que `open` aceptaba en silencio y sobre el que esta función
+    /// devolvía `Ok(false)`, y preguntó si abrir debería enterarse. No:
+    ///
+    /// 1. **`Ok(false)` es fuga o doble dueño, no ilegibilidad.** Una fuga
+    ///    —páginas que nadie reclama— no impide leer ni escribir nada; es
+    ///    espacio desperdiciado. Negar la apertura por eso convertiría un
+    ///    problema de contabilidad en una base inaccesible, justo el
+    ///    criterio contrario al que ya siguen la reparación de cabecera y
+    ///    la degradación de la lista de libres.
+    /// 2. **Costaría lo que el motor promete que abrir no cuesta.** Esto
+    ///    recorre el árbol entero y la cadena de libres entera: O(n_pages).
+    ///    Abrir cuesta hoy tres lecturas —cabecera y dos metas— sin
+    ///    importar el tamaño del fichero, y hay criterio de salida y
+    ///    pruebas que lo fijan (`open_costs_the_same_on_a_small_and_a_large_file`
+    ///    aquí, `opening_costs_the_same_at_thirty_kilobytes_..` en
+    ///    `tests/size.rs`). Un motor pensado para arrancar en un
+    ///    dispositivo pequeño no puede pagar un `fsck` en cada apertura.
+    /// 3. **El defecto concreto que producía aquel `Ok(false)` está
+    ///    cerrado en origen** (ver el campo `durable`), que es donde había
+    ///    que cerrarlo: detectarlo al abrir habría sido tratar el síntoma.
+    ///
+    /// Quien quiera la comprobación la tiene aquí, explícita y bajo su
+    /// propia feature, para ejecutarla cuando le convenga.
     pub fn audit_pages(&self) -> Result<bool> {
         let (meta, _slot) = *self.committed.read().unwrap();
         let n_pages = meta.n_pages;
@@ -2474,6 +2780,7 @@ mod tests {
         fn sync(&self) -> Result<()> { self.0.sync() }
         fn len(&self) -> Result<u64> { self.0.len() }
     }
+
 
     #[test]
     fn a_fresh_database_is_under_five_kilobytes() {
@@ -2812,21 +3119,83 @@ mod tests {
         }
     }
 
+    /// Una cadena de lista de libres que no decodifica no puede impedir
+    /// abrir un fichero por lo demás legible: `Db::open` la da por perdida
+    /// (poniendo a cero `freelist_head`/`tail` también en la meta EN
+    /// MEMORIA) y sigue adelante. Ver su comentario.
+    ///
+    /// **Esta prueba ataca la cadena DIRECTAMENTE, y esa es toda su
+    /// razón de ser.** Hasta la corrección del suelo de reutilización
+    /// (ver el campo `Db::durable`), la única cobertura de esta rama eran
+    /// dos pruebas de corte de corriente —la de aquí abajo y la gemela de
+    /// `crypto.rs`— que llegaban a ella de rebote: bajo `Sync::Never`, el
+    /// reciclado podía reasignar el contenedor físico que la meta
+    /// superviviente seguía declarando como su cadena. Ese escenario ya no
+    /// existe —el suelo durable impide reciclar nada que la meta durable
+    /// referencie, cadena de libres incluida— así que aquellas dos pruebas
+    /// dejaron de ejercitar esta rama (comprobado poniendo un `panic!` en
+    /// ella: ninguna prueba del crate lo dispara ya). Sin una prueba
+    /// directa, la degradación se quedaría sin cobertura ninguna mientras
+    /// dos nombres de prueba seguirían sugiriendo lo contrario — que es
+    /// exactamente el patrón que este proyecto lleva media docena de
+    /// rondas persiguiendo.
+    ///
+    /// Sigue siendo código necesario: la cadena puede no decodificar por
+    /// motivos que nada tienen que ver con el reciclado — un medio que
+    /// devuelve basura, un fichero manipulado, un formato futuro — y
+    /// negarle la entrada a la base entera por eso sería el mismo error
+    /// que la reparación de cabecera existe para evitar.
+    #[test]
+    fn an_unreadable_freelist_chain_does_not_keep_the_database_from_opening() {
+        let s = Arc::new(MemStorage::new());
+        let head = {
+            let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), Options::default()).unwrap();
+            for i in 0..40u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), &alloc::vec![7u8; 60]).unwrap();
+                tx.commit().unwrap();
+            }
+            let head = db.committed.read().unwrap().0.freelist_head;
+            assert_ne!(head, 0, "el fixture tiene que dejar una cadena de libres de verdad");
+            head
+        };
+        // Basura en la cabeza de la cadena: ni tipo de página válido ni CRC.
+        s.write_at(head as u64 * 512, &alloc::vec![0xEE; 512]).unwrap();
+
+        let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), Options::default())
+            .expect("una cadena de libres ilegible no debe impedir abrir");
+        assert!(
+            db.audit_pages().is_ok(),
+            "audit_pages no debe fallar con Err tras una apertura que ya tuvo éxito"
+        );
+        let r = db.begin_read();
+        for i in 0..40u32 {
+            assert_eq!(
+                r.get(0x01, &i.to_be_bytes()).unwrap().as_deref(),
+                Some(alloc::vec![7u8; 60].as_slice()),
+                "el árbol sigue entero: lo perdido es la contabilidad de libres, no el dato"
+            );
+        }
+        drop(r);
+        let mut tx = db.begin_write().unwrap();
+        tx.put(0x01, b"tras-degradar", b"v").unwrap();
+        tx.commit().unwrap();
+    }
+
     /// Camino PLANO (sin cifrado) del hallazgo HIGH de la tarea 19, segunda
-    /// ronda de revisión. `Sync::Never`: los `commit` normales no
-    /// sincronizan, salvo la sincronización incondicional de
-    /// `relocate_meta_b` — que sí llega en algún punto de las 300 escrituras
-    /// de más abajo, en cuanto el fichero cruza los 4 KB — capturando en
-    /// `last_synced_meta` un `freelist_head` YA no vacío. El resto de las
-    /// 300, sin sincronizar, tienen de sobra ocasión de reciclar el
-    /// contenedor que esa foto todavía señala (con la reutilización de la
-    /// tarea 19, ver `Freelist::flush`) — al simular el corte, la meta que
-    /// sobrevive sigue señalando esa cadena, pero su contenedor físico
-    /// puede llevar tiempo siendo otra cosa. Sin la degradación con gracia,
-    /// reabrir fallaría con `Err(Corrupt)`; confirmado desactivándola
-    /// temporalmente durante el desarrollo de este test — sin ella,
-    /// falla de forma determinista con `Corrupt { page: 9, kind: PageType
-    /// }`, el mismo síntoma exacto que reproducía el camino cifrado.
+    /// ronda de revisión: un corte de corriente que deja viva una meta
+    /// vieja no debe impedir reabrir.
+    ///
+    /// **Lo que este escenario ejercitaba ya no ocurre, y la prueba se
+    /// queda para fijar que no vuelva a ocurrir.** Cuando se escribió, el
+    /// reciclado podía reasignar bajo `Sync::Never` el contenedor físico
+    /// que la meta superviviente seguía señalando como su cadena de
+    /// libres, y reabrir solo funcionaba gracias a la degradación con
+    /// gracia de `Db::open`. Con el suelo de reutilización anclado a la
+    /// meta DURABLE (ver el campo `Db::durable`) eso es imposible: nada de
+    /// lo que la meta durable referencia se reparte. Así que hoy esta
+    /// prueba reabre por el camino normal, sin degradar nada — la
+    /// degradación tiene ahora su prueba propia y directa, justo arriba.
     #[test]
     fn a_stale_meta_after_simulated_power_loss_still_opens_without_audit_erroring() {
         let s = Arc::new(PowerLossStorage::new());

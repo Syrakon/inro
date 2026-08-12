@@ -812,16 +812,468 @@ fn relaxed_sync_loses_commits_but_never_corrupts() {
         );
     }
 
+    // La ventana tolerada es la transacción que reubica ENTERA, no sus dos
+    // últimas escrituras.
+    //
+    // **Las "dos últimas" eran otra constante cocinada a mano.** El hueco
+    // conocido es este: `relocate_meta_b` reescribe la cabecera y la
+    // sincroniza SIN CONDICIONES —así que esa parte queda duradera pase lo
+    // que pase— pero quien devuelve la página vieja de la meta B a la
+    // lista de libres es el `self.free(...)` del final de esa misma
+    // función, y eso solo llega a disco si la transacción CONFIRMA. Un
+    // corte en cualquier punto entre la reescritura de cabecera y el final
+    // del commit deja la cabecera nueva (meta B ya en su sitio definitivo)
+    // y a la página vieja sin dueño: `audit_pages` la ve como fuga.
+    // Comprobado en caja blanca durante esta corrección: la única página
+    // sin marcar en los tres puntos de corte que fallaban era la 2, la
+    // posición inicial de la meta B.
+    //
+    // Cuántas escrituras hay entre la reescritura de cabecera y el final
+    // del commit depende de cuántos contenedores necesite `Freelist::flush`
+    // en esa transacción concreta — un número que cambia con cualquier
+    // ajuste de la lista de libres o de la política de reciclado. Anclarlo
+    // a "las dos últimas" era, por tanto, una foto de una versión concreta
+    // del motor: al pasar el suelo de reutilización a la meta durable, esa
+    // misma transacción pasó a tener una escritura más y la ventana dejó
+    // de encajar. Lo que sí es estable es el hecho estructural — la fuga
+    // solo puede aparecer dentro de la transacción que reubica — y eso es
+    // lo que se comprueba ahora, con los límites MEDIDOS por
+    // `measure_relaxed_reference`, no supuestos.
     for &n in &audit_failures {
         let write_ord = n + 1;
         let tolerated = relocating_window
-            .map(|(_, end)| write_ord == end || write_ord + 1 == end)
+            .map(|(start, end)| write_ord > start && write_ord <= end)
             .unwrap_or(false);
         assert!(
             tolerated,
             "auditoria de paginas fallo en la escritura {n} (ordinal {write_ord}) de {total}, \
-             fuera de la ventana de relocate_meta_b ({relocating_window:?}): defecto nuevo, no \
-             el conocido"
+             fuera de la transaccion que reubica la meta B ({relocating_window:?}): defecto \
+             nuevo, no el conocido"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// Prueba 6: corte de corriente CON escrituras sin sincronizar (el único
+// escenario en el que vive la sincronización relajada).
+// ---------------------------------------------------------------------
+
+/// Una escritura emitida contra el medio, con su ordinal global.
+struct PendingWrite {
+    ordinal: u64,
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
+/// Medio que modela un corte de corriente DE VERDAD: `sync()` marca un
+/// punto de durabilidad y `cut` descarta un subconjunto ARBITRARIO de las
+/// escrituras emitidas desde ese punto.
+///
+/// **Por qué hace falta un tercer arné, habiendo ya dos.** Ninguno de los
+/// dos que ya existían puede expresar la única condición en la que vive la
+/// sincronización relajada — "escrito pero todavía no sincronizado":
+///
+/// - `FaultStorage` (`src/storage.rs`, usado por todo el resto de este
+///   fichero) tiene un `sync()` que es un no-op y un `Fault::AbortAt` que
+///   deja DURADERA toda escritura anterior al punto de corte. Su modelo es
+///   "el proceso murió": las escrituras se pierden en sufijo, nunca de
+///   forma desordenada. Bajo él, `Sync::Never` y `Sync::Commit` se
+///   comportan exactamente igual — de hecho
+///   `relaxed_sync_loses_commits_but_never_corrupts` (arriba) PASA sin
+///   tocar nada si se le cambia `Sync::Never` por `Sync::Commit`, que es
+///   la señal de que la política de sincronización no entra en lo que esa
+///   prueba mide.
+/// - `tx::tests::PowerLossStorage` sí modela la pérdida de lo no
+///   sincronizado, pero solo para las ranuras de meta y de cabecera, cuyos
+///   offsets lleva CODIFICADOS A MANO — y su prueba nunca vuelve a leer
+///   ninguna clave después de reabrir, así que no puede detectar que el
+///   árbol que la meta superviviente describe se haya quedado sin páginas.
+///
+/// Este combina las dos mitades y no codifica ningún offset: no sabe —ni
+/// necesita saber— qué escritura es una meta, cuál una página de árbol y
+/// cuál una de lista de libres. Solo sabe lo que el contrato de `Storage`
+/// promete de verdad (ver el trait): tras un `sync()` correcto, lo escrito
+/// hasta ese momento está en el medio; de lo escrito DESPUÉS, nada está
+/// prometido.
+struct PowerCutStorage {
+    inner: MemStorage,
+    /// Contenido del medio tal como quedaría si la corriente se fuera
+    /// ahora mismo y no sobreviviera ninguna escritura pendiente: la foto
+    /// del último `sync()` correcto.
+    durable: Mutex<Vec<u8>>,
+    /// Escrituras emitidas desde ese `sync()`, en orden.
+    pending: Mutex<Vec<PendingWrite>>,
+    writes: std::sync::atomic::AtomicU64,
+    syncs: std::sync::atomic::AtomicU64,
+}
+
+impl PowerCutStorage {
+    fn new() -> Self {
+        Self {
+            inner: MemStorage::new(),
+            durable: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
+            writes: std::sync::atomic::AtomicU64::new(0),
+            syncs: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Ordinal de la última escritura emitida (1 en adelante). La prueba lo
+    /// consulta tras cada `commit` para saber DÓNDE acaba ese commit en la
+    /// secuencia física, sin necesitar saber qué contiene esa escritura.
+    fn writes(&self) -> u64 {
+        self.writes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `fsync` emitidos contra el medio desde su creación. Es la medida de
+    /// coste de la sincronización bajo demanda que la recuperación de
+    /// espacio necesita (ver el informe de esta tarea).
+    fn syncs(&self) -> u64 {
+        self.syncs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Corta la corriente: de las escrituras emitidas desde el último
+    /// `sync()`, sobreviven exactamente aquellas cuyo ordinal acepta
+    /// `keep`; el resto no llegó nunca al plato. Tras esto, el medio
+    /// contiene un estado que un `Db::open` real podría encontrarse.
+    fn cut(&self, keep: &mut dyn FnMut(u64) -> bool) {
+        let mut image = self.durable.lock().unwrap().clone();
+        let mut pending = self.pending.lock().unwrap();
+        for w in pending.iter() {
+            if !keep(w.ordinal) {
+                continue;
+            }
+            let start = w.offset as usize;
+            let end = start + w.bytes.len();
+            if image.len() < end {
+                image.resize(end, 0);
+            }
+            image[start..end].copy_from_slice(&w.bytes);
+        }
+        pending.clear();
+        self.inner.restore(image.clone());
+        *self.durable.lock().unwrap() = image;
+    }
+}
+
+impl Storage for PowerCutStorage {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> inro::Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> inro::Result<()> {
+        let ordinal = self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.pending.lock().unwrap().push(PendingWrite {
+            ordinal,
+            offset,
+            bytes: buf.to_vec(),
+        });
+        self.inner.write_at(offset, buf)
+    }
+
+    fn sync(&self) -> inro::Result<()> {
+        self.inner.sync()?;
+        // El orden importa: primero se congela la foto, y solo entonces se
+        // olvidan las pendientes. Al revés, un corte concurrente vería un
+        // instante sin ninguna de las dos cosas.
+        *self.durable.lock().unwrap() = self.inner.snapshot();
+        self.pending.lock().unwrap().clear();
+        self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn len(&self) -> inro::Result<u64> {
+        self.inner.len()
+    }
+}
+
+/// Generador determinista para elegir subconjuntos de escrituras
+/// supervivientes: xorshift64*, tres líneas, sin dependencias nuevas. La
+/// semilla viaja en el mensaje de fallo, así que cualquier corrida que
+/// falle se reproduce tal cual.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// `true` con probabilidad `percent`/100.
+    fn chance(&mut self, percent: u64) -> bool {
+        self.next() % 100 < percent
+    }
+}
+
+/// Un commit confirmado y reconocido al llamante: su `txn_id` y la clave
+/// que escribió.
+struct Acked {
+    txn: u64,
+    key: u32,
+    /// Ordinal de la ÚLTIMA escritura física de ese commit. Medido, no
+    /// supuesto: la prueba no sabe qué es esa escritura, solo que después
+    /// de ella `commit()` ya devolvió `Ok` (ver el comentario de cabecera
+    /// de este fichero sobre por qué la meta es siempre la última).
+    last_write: u64,
+}
+
+/// Confirma `commits` transacciones de una clave cada una contra un medio
+/// que va registrando lo pendiente de sincronizar, y devuelve el registro
+/// de lo que el motor RECONOCIÓ como confirmado.
+fn commit_acknowledged_keys(s: &Arc<PowerCutStorage>, opts: Options, commits: u32) -> Vec<Acked> {
+    let db = Db::create(Box::new(Arc::clone(s)), opts).unwrap();
+    let mut acked = Vec::new();
+    for key in 0..commits {
+        let mut tx = db.begin_write().unwrap();
+        tx.put(0x01, &key.to_be_bytes(), b"confirmado").unwrap();
+        let txn = tx.txn_id();
+        tx.commit().unwrap();
+        acked.push(Acked { txn, key, last_write: s.writes() });
+    }
+    drop(db);
+    acked
+}
+
+/// Reabre tras el corte y comprueba la única propiedad que un motor
+/// copy-on-write con dos ranuras de meta puede y debe garantizar sea cual
+/// sea la política de sincronización: **lo que sobrevive es un SNAPSHOT
+/// ENTERO**. Si la base reabierta dice estar en la transacción `T`, tienen
+/// que estar TODAS las claves de los commits con `txn <= T` y NINGUNA de
+/// los posteriores. Perder commits está permitido (es lo que la
+/// sincronización relajada compra); devolver medio commit, o el árbol de
+/// `T` con páginas ya reescritas por un commit posterior, no.
+fn assert_the_surviving_state_is_a_whole_snapshot(
+    s: &Arc<PowerCutStorage>,
+    opts: Options,
+    acked: &[Acked],
+    scenario: &str,
+) -> u64 {
+    let db = Db::open(Box::new(Arc::clone(s)), opts)
+        .unwrap_or_else(|e| panic!("{scenario}: reabrir tras el corte falló con {e:?}"));
+    let r = db.begin_read();
+    let survived = r.txn_id();
+    for a in acked {
+        let got = r.get(0x01, &a.key.to_be_bytes()).unwrap();
+        if a.txn <= survived {
+            assert_eq!(
+                got.as_deref(),
+                Some(b"confirmado".as_slice()),
+                "{scenario}: la base reabierta dice estar en la transaccion {survived}, pero la \
+                 clave {} —confirmada y reconocida en la transaccion {}, {} commits antes— ya no \
+                 esta: el snapshot superviviente no esta entero",
+                a.key,
+                a.txn,
+                survived.saturating_sub(a.txn)
+            );
+        } else {
+            assert_eq!(
+                got, None,
+                "{scenario}: la base reabierta dice estar en la transaccion {survived} pero \
+                 devuelve la clave {}, escrita {} commits DESPUES: eso no es ningun estado que \
+                 este motor haya confirmado jamas",
+                a.key,
+                a.txn - survived
+            );
+        }
+    }
+    // Y ninguna clave de más: `get` solo mira las que la prueba conoce.
+    let mut c = r.scan(0x01, b"", b"\xff\xff\xff\xff").unwrap();
+    let mut seen = 0u32;
+    while c.next().unwrap().is_some() {
+        seen += 1;
+    }
+    let expected = acked.iter().filter(|a| a.txn <= survived).count() as u32;
+    assert_eq!(
+        seen, expected,
+        "{scenario}: el espacio 0x01 tiene {seen} claves tras reabrir en la transaccion \
+         {survived}, no las {expected} de los commits <= {survived}"
+    );
+    drop(r);
+    assert!(
+        db.audit_pages().unwrap(),
+        "{scenario}: la contabilidad de paginas no cuadra tras reabrir"
+    );
+    survived
+}
+
+/// El defecto, en su forma más nítida: **las escrituras de datos llegan al
+/// plato, las últimas metas no.**
+///
+/// Es el caso clásico de un corte de corriente con caché de escritura: las
+/// páginas de árbol se emiten antes y son muchas; la meta es una escritura
+/// de 512 B emitida al final de cada commit y es justo la que se queda en
+/// la caché volátil. `tx::tests::PowerLossStorage` modela exactamente esto
+/// —revierte solo las ranuras de meta— pero con los offsets codificados a
+/// mano y sin volver a leer ninguna clave. Aquí las metas se identifican
+/// MIDIENDO (`Acked::last_write`: el ordinal de la última escritura de
+/// cada commit reconocido), no por su posición en el fichero.
+///
+/// Con las metas posteriores al último `sync()` descartadas, `Meta::load`
+/// no tiene más remedio que montar por la última meta DURADERA — y el
+/// árbol de esa meta tiene que seguir entero, porque ninguna transacción
+/// posterior tenía derecho a reescribir ni una de sus páginas.
+#[test]
+fn a_power_cut_that_keeps_data_pages_but_loses_the_last_metas_leaves_a_whole_snapshot() {
+    let opts = Options { sync: Sync::Never, ..Options::default() };
+    let s = Arc::new(PowerCutStorage::new());
+    let acked = commit_acknowledged_keys(&s, opts, 60);
+    let metas: std::collections::BTreeSet<u64> = acked.iter().map(|a| a.last_write).collect();
+
+    s.cut(&mut |ordinal| !metas.contains(&ordinal));
+
+    let survived = assert_the_surviving_state_is_a_whole_snapshot(
+        &s,
+        opts,
+        &acked,
+        "corte que conserva las paginas de datos y pierde las metas",
+    );
+    assert!(
+        survived < acked.last().unwrap().txn,
+        "el corte no llegó a perder ningún commit: la prueba no está ejercitando nada"
+    );
+}
+
+/// El mismo corte, pero descartando además un subconjunto ARBITRARIO de las
+/// escrituras que no son la última de su commit. Un disco real no pierde
+/// las escrituras en orden: lo que quede en la caché volátil cuando se va
+/// la corriente es cualquier cosa. Diez semillas deterministas.
+///
+/// Las metas siguen descartándose siempre, y no por comodidad: es lo que
+/// mantiene la afirmación JUSTA. Si una meta posterior sobreviviera sin
+/// que sobrevivieran las páginas que su árbol referencia, el motor
+/// devolvería basura sin tener ninguna forma de evitarlo — bajo
+/// sincronización relajada nadie promete que la meta llegue después que sus
+/// páginas, y esa es una limitación del MODO, no un defecto del motor (ver
+/// el informe: es la razón de que `Sync::Interval` no pueda prometer
+/// "nunca corrompe" sin más matices). Descartando todas las metas no
+/// duraderas, la que monta es siempre una que ya estaba en disco antes del
+/// último `sync()`, y de esa sí se puede exigir el árbol entero.
+#[test]
+fn a_power_cut_that_loses_an_arbitrary_subset_of_the_unsynced_writes_leaves_a_whole_snapshot() {
+    let opts = Options { sync: Sync::Never, ..Options::default() };
+    for seed in 1..=10u64 {
+        let s = Arc::new(PowerCutStorage::new());
+        let acked = commit_acknowledged_keys(&s, opts, 60);
+        let metas: std::collections::BTreeSet<u64> = acked.iter().map(|a| a.last_write).collect();
+
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        s.cut(&mut |ordinal| !metas.contains(&ordinal) && rng.chance(90));
+
+        assert_the_surviving_state_is_a_whole_snapshot(
+            &s,
+            opts,
+            &acked,
+            &format!("corte aleatorio con semilla {seed}"),
+        );
+    }
+}
+
+/// Guardián de premisa, del mismo tipo que
+/// `the_meta_tear_guard_is_not_satisfied_by_an_ordinary_healthy_database_past_relocation`
+/// (arriba): esta sección solo prueba algo si la política de sincronización
+/// entra de verdad en el resultado.
+///
+/// **Falla si alguien cambia `Sync::Never` por `Sync::Commit`.** Bajo
+/// `Sync::Commit` cada commit sincroniza después de escribir su meta, así
+/// que al llegar el corte no hay NADA pendiente que perder y la base
+/// reabre en el último commit reconocido; el arné entero quedaría
+/// midiendo el vacío, que es exactamente lo que le pasaba a
+/// `relaxed_sync_loses_commits_but_never_corrupts` (ver el comentario de
+/// `PowerCutStorage`).
+#[test]
+fn the_power_cut_harness_only_says_anything_because_sync_is_relaxed() {
+    let s = Arc::new(PowerCutStorage::new());
+    let strict = Options { sync: Sync::Commit, ..Options::default() };
+    let acked = commit_acknowledged_keys(&s, strict, 60);
+    let metas: std::collections::BTreeSet<u64> = acked.iter().map(|a| a.last_write).collect();
+    s.cut(&mut |ordinal| !metas.contains(&ordinal));
+    let db = Db::open(Box::new(Arc::clone(&s)), strict).unwrap();
+    assert_eq!(
+        db.begin_read().txn_id(),
+        acked.last().unwrap().txn,
+        "bajo Sync::Commit el corte no puede perder nada: si esta prueba falla, alguien ha \
+         hecho que Sync::Commit deje commits sin sincronizar"
+    );
+    drop(db);
+
+    let s = Arc::new(PowerCutStorage::new());
+    let relaxed = Options { sync: Sync::Never, ..Options::default() };
+    let acked = commit_acknowledged_keys(&s, relaxed, 60);
+    let metas: std::collections::BTreeSet<u64> = acked.iter().map(|a| a.last_write).collect();
+    s.cut(&mut |ordinal| !metas.contains(&ordinal));
+    let db = Db::open(Box::new(Arc::clone(&s)), relaxed).unwrap();
+    assert!(
+        db.begin_read().txn_id() < acked.last().unwrap().txn,
+        "bajo Sync::Never el corte TIENE que perder commits reconocidos: si no los pierde, este \
+         arné no está ejercitando la sincronización relajada y todo lo que esta sección afirma \
+         pasaría igual con Sync::Commit"
+    );
+}
+
+/// Coste MEDIDO de la sincronización relajada tras la corrección, y su
+/// cota. Es la contrapartida de `Db::durable`: gatear el reciclado por la
+/// meta durable obliga a retener las páginas liberadas desde el último
+/// `fsync`, así que el fichero ocupa más y hay que comprobar CUÁNTO más.
+///
+/// Carga de churn: 2 000 commits sobre 200 claves, `page_size` 512. El
+/// conjunto vivo es constante, así que un motor que recicle bien deja el
+/// fichero plano — cualquier crecimiento que dependa del número de
+/// commits sale aquí.
+///
+/// Cifras medidas al escribir esta prueba (las cotas de abajo dejan
+/// margen sobre ellas):
+///
+/// | modo                          | páginas | escrituras | `fsync` |
+/// |-------------------------------|---------|-----------:|--------:|
+/// | `Sync::Commit`                |      24 |      7 996 |   4 004 |
+/// | `Sync::Never`                 |      84 |      9 845 |     128 |
+///
+/// Es decir: 60 páginas de más (30 KB), CONSTANTES —con 1 000, 2 000,
+/// 4 000 y 8 000 commits el fichero se queda en 84 páginas—, un 23 % más
+/// de escrituras físicas, y un `fsync` cada ~16 commits en vez de dos por
+/// commit: 31 veces menos. Ver el informe de esta tarea para el detalle y
+/// para las cifras sin la fusión de grupos de `Freelist::flush`, que era
+/// lo que hacía el retraso cuadrático.
+#[test]
+fn relaxed_sync_costs_bounded_space_and_far_fewer_fsyncs() {
+    fn run(sync: Sync, commits: u32) -> (u64, u64, u64) {
+        let s = Arc::new(PowerCutStorage::new());
+        let opts = Options { sync, ..Options::default() };
+        let db = Db::create(Box::new(Arc::clone(&s)), opts).unwrap();
+        for i in 0..commits {
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, &(i % 200).to_be_bytes(), b"valor-de-prueba").unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(db.audit_pages().unwrap(), "la contabilidad de paginas no cuadra");
+        (s.len().unwrap() / 512, s.writes(), s.syncs())
+    }
+
+    let (strict_pages, strict_writes, strict_syncs) = run(Sync::Commit, 2000);
+    let (pages, writes, syncs) = run(Sync::Never, 2000);
+
+    assert_eq!(strict_syncs, 2 * 2000 + 4, "Sync::Commit debe sincronizar dos veces por commit");
+    assert!(
+        pages <= strict_pages + 128,
+        "sincronización relajada: {pages} páginas frente a {strict_pages} con Sync::Commit — el          margen por retener lo liberado desde el último fsync debe estar acotado por          MAX_DURABLE_LAG, no crecer con el número de commits"
+    );
+    assert!(
+        writes <= strict_writes * 3 / 2,
+        "sincronización relajada: {writes} escrituras físicas frente a {strict_writes}"
+    );
+    assert!(
+        syncs * 15 <= strict_syncs,
+        "sincronización relajada: {syncs} fsync frente a {strict_syncs} — el ahorro tiene que          seguir siendo de al menos un orden de magnitud, o el modo no sirve para lo que existe"
+    );
+
+    // Plano: cuatro veces más commits, el mismo fichero. Es la propiedad
+    // que de verdad importa (crecimiento acotado, no proporcional al
+    // trabajo), y la que un `MAX_DURABLE_LAG` mal puesto rompe.
+    let (long_pages, _, _) = run(Sync::Never, 8000);
+    assert_eq!(
+        long_pages, pages,
+        "con cuatro veces más commits sobre las mismas claves el fichero no debe crecer"
+    );
 }

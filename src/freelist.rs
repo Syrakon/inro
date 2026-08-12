@@ -116,14 +116,27 @@ pub struct Freelist {
     /// recorrerla desde la cabeza hasta encontrar `next == 0` basta, sin
     /// necesitar saber de antemano dónde termina.
     ///
-    /// **Reciclarla es seguro incluso si una meta más vieja y todavía
-    /// "actual" (bajo `Sync::Never`/`Interval`, la última sincronizada
-    /// puede ir varios `commit` por detrás) sigue señalando esta cadena
-    /// como su `freelist_head`/`freelist_tail`: `Db::open` degrada con
-    /// gracia si esa cadena ya no decodifica como lista de libres (ver su
-    /// comentario en `tx.rs`), así que este campo puede reciclar tan rápido
-    /// como el resto del motor recicla cualquier otra página liberada —
-    /// no necesita ninguna gestión de sincronía propia.**
+    /// **Reciclarla NO es libre de sincronía, y creerlo era un defecto.**
+    /// Una versión anterior de este comentario decía que reciclar esta
+    /// cadena era seguro aunque una meta más vieja y todavía "actual"
+    /// (bajo `Sync::Never`/`Interval`, la última sincronizada puede ir
+    /// varios `commit` por detrás) la siguiera señalando como su
+    /// `freelist_head`/`freelist_tail`, porque `Db::open` degrada con
+    /// gracia si esa cadena ya no decodifica. Eso confundía "el motor
+    /// sobrevive" con "no pasa nada": lo que pasaba era perder la lista de
+    /// libres entera de la meta que monta —hasta el 48 % del fichero en un
+    /// caso medido— y, con el mismo suelo equivocado en `WriteTxn::alloc`,
+    /// también páginas de ÁRBOL de esa meta.
+    ///
+    /// Las páginas que este campo devuelve al circuito se etiquetan con la
+    /// transacción que las recicla (`flush`, ver su comentario) y pasan
+    /// por el mismo suelo que cualquier otra: el de la meta DURABLE (ver
+    /// el campo `Db::durable` en `tx.rs`). Así, la cadena que la meta
+    /// durable declara como suya no puede reasignarse mientras esa meta
+    /// sea la que montaría tras un corte. La degradación con gracia de
+    /// `Db::open` sigue ahí, pero ya como defensa en profundidad contra un
+    /// medio que devuelve basura, no como red bajo un reciclado que sabía
+    /// que podía pisar datos vivos.
     written_head: PageNo,
     dirty: bool,
 }
@@ -303,32 +316,28 @@ impl Freelist {
     /// commit, sin cota mientras el proceso siga abierto). Ver
     /// `written_head`.
     ///
-    /// **Esto puede reciclar más rápido de lo que una meta vieja aún
-    /// "vigente" tolera — y la reutilización de contenedores libres como
-    /// contenedor de `flush` (más abajo, segunda ronda de revisión de la
-    /// tarea 19) lo empeora, no lo mejora: consumir con avidez hace MÁS
-    /// probable, no menos, que la meta que sobrevive a un corte describa
-    /// una cadena ya reasignada.** Bajo `Sync::Never` o un `Sync::Interval`
-    /// largo, la meta que sobrevive a un corte de corriente puede quedarse
-    /// varias transacciones atrás de la última escrita, y esa meta antigua
-    /// todavía puede señalar como `freelist_head`/`freelist_tail` una
-    /// página cuyo contenedor físico este reciclado ya reasignó como
-    /// página de datos en una transacción posterior no sincronizada. Sin
-    /// más, eso rompía `Db::open` con `Error::Corrupt { kind: PageType }`
-    /// al releer esa cadena — confirmado de punta a punta, la primera
-    /// versión de este reciclado hacía fallar
-    /// `crypto::tests::sync_never_or_long_interval_survives_simulated_power_loss_without_reusing_a_counter`
-    /// de forma determinista (`--features encryption` o `--features
-    /// aes`). La corrección no vive aquí: `Db::open` (`tx.rs`) degrada con
-    /// gracia si `Freelist::load` no puede decodificar la cadena heredada
-    /// — trata esa cadena concreta como irrecuperable en vez de negarse a
-    /// abrir un fichero por lo demás legible, el mismo criterio que ya
-    /// aplica la reparación de cabecera. **No es una pérdida pequeña**: un
-    /// caso real medido en la segunda ronda de revisión perdió el 48 % del
-    /// fichero (27 de 56 páginas) de esta forma. Cerrarlo de verdad es
-    /// trabajo de fase 2 (junto con la reforma de la lista de libres ya
-    /// pendiente), no de esta corrección — ver el comentario de `Db::open`
-    /// junto a esa llamada para el detalle completo.
+    /// **Este reciclado llegó a ir más rápido de lo que una meta vieja aún
+    /// "vigente" toleraba; ya no.** Bajo `Sync::Never` o un
+    /// `Sync::Interval` largo, la meta que sobrevive a un corte puede
+    /// quedarse varias transacciones atrás de la última escrita, y esa
+    /// meta antigua todavía señala como `freelist_head`/`freelist_tail`
+    /// una cadena concreta. Mientras el suelo de reutilización fue la meta
+    /// ESCRITA, este reciclado podía reasignar el contenedor físico de esa
+    /// cadena como página de datos en una transacción posterior sin
+    /// sincronizar: `Db::open` fallaba con `Error::Corrupt { kind:
+    /// PageType }` al releerla y solo salvaba la apertura su degradación
+    /// con gracia — perdiendo la lista de libres entera, hasta el 48 % del
+    /// fichero en un caso medido (27 de 56 páginas).
+    ///
+    /// El suelo que recibe este método (`oldest_reader`) es ahora el de la
+    /// meta DURABLE (ver el campo `Db::durable` en `tx.rs`), y con él tanto
+    /// el reciclado de `written_head` como la reutilización de contenedores
+    /// libres de más abajo quedan cerrados por construcción: ninguno puede
+    /// tocar nada que la meta durable referencie. La degradación con gracia
+    /// de `Db::open` se queda como defensa en profundidad —ver su
+    /// comentario y la prueba directa
+    /// `an_unreadable_freelist_chain_does_not_keep_the_database_from_opening`—
+    /// pero ya no es lo que sostiene la corrección.
     pub fn flush(
         &mut self,
         pager: &Pager,
@@ -392,6 +401,60 @@ impl Freelist {
         // las cuenta.
         while let Some(page) = self.reclaimed.pop_front() {
             self.push(page, txn);
+        }
+
+        // Fusiona los grupos en, como mucho, DOS: los que el suelo de
+        // reutilización ya deja servir, y los que todavía no. Cada grupo
+        // fusionado se etiqueta con el `max_txn` MÁS ALTO de los que
+        // absorbe, nunca con uno más bajo: subir la etiqueta solo puede
+        // RETRASAR la reutilización de una página, jamás adelantarla, así
+        // que la fusión no puede volver servible nada que no lo fuera ya.
+        // Y como las dos mitades se separan por el suelo, lo que era
+        // servible sigue siéndolo: el suelo nunca retrocede (`committed` y
+        // el punto durable solo avanzan, y un lector nuevo nunca nace con
+        // un snapshot más viejo que `committed`).
+        //
+        // **Sin esto, un punto durable retrasado hace crecer el fichero de
+        // forma cuadrática.** Cada transacción deja su propio grupo, y
+        // abajo se reserva al menos UNA página física por grupo aunque
+        // tenga una sola entrada; con la reutilización bloqueada por el
+        // retraso (ver `Db::durable` y `Db::reclaim_needs_a_sync` en
+        // `tx.rs`), esos contenedores no se pueden reciclar y salen de
+        // extender el fichero, que a su vez engorda la lista. Medido con
+        // 2 000 commits sobre 200 claves y `Sync::Never`: 4 308 páginas
+        // con un retraso máximo de 64 transacciones sin fusionar, 108 con
+        // un retraso de 8 — y 216 016 páginas con un retraso de 128, un
+        // fichero de 110 MB para 24 páginas de datos reales. Fusionando,
+        // el coste de serializar deja de depender de CUÁNTAS transacciones
+        // liberaron y pasa a depender solo de CUÁNTAS páginas hay libres,
+        // que es lo que de verdad describe la lista.
+        //
+        // Bajo `Sync::Commit` no cambia nada: ahí el suelo avanza una
+        // transacción por commit, así que el único grupo no servible es el
+        // de la transacción en curso — que ya era uno solo.
+        {
+            let mut ready: VecDeque<PageNo> = VecDeque::new();
+            let mut ready_txn: TxnId = 0;
+            let mut held: VecDeque<PageNo> = VecDeque::new();
+            let mut held_txn: TxnId = 0;
+            for g in core::mem::take(&mut self.groups) {
+                if g.pages.is_empty() {
+                    continue;
+                }
+                let servable = oldest_reader.is_none_or(|m| g.max_txn <= m);
+                let (bucket, tag) = if servable {
+                    (&mut ready, &mut ready_txn)
+                } else {
+                    (&mut held, &mut held_txn)
+                };
+                *tag = core::cmp::max(*tag, g.max_txn);
+                bucket.extend(g.pages);
+            }
+            for (pages, max_txn) in [(ready, ready_txn), (held, held_txn)] {
+                if !pages.is_empty() {
+                    self.groups.push_back(Group { max_txn, pages, is_preloaded_tail: false });
+                }
+            }
         }
 
         // `logical_page_size`, no `geometry().page_size` (tarea 17): las
