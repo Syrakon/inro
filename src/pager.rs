@@ -98,9 +98,20 @@ impl Pager {
 
     /// Bytes útiles de una página lógica: lo que `PageBuilder` y todo lo que
     /// construye páginas (`tree.rs`, `freelist.rs`) debe usar en vez de
-    /// `geometry().page_size`. Con cifrado, veinticuatro menos: ocho de
-    /// contador de nonce en claro y dieciséis de tag (`crypto::CIPHER_PREFIX`).
-    /// Sin cifrado, coincide con el tamaño físico.
+    /// `geometry().page_size`. Con cifrado, CUARENTA menos: veinticuatro de
+    /// nonce en claro y dieciséis de tag (`crypto::CIPHER_PREFIX`). Sin
+    /// cifrado, coincide con el tamaño físico.
+    ///
+    /// Eran veinticuatro menos (8 de contador + 16 de tag) hasta el cambio
+    /// a nonces aleatorios: el nonce ya no se deriva de `página ||
+    /// contador`, se almacena entero, así que la página lógica encoge otros
+    /// 16 bytes. Con páginas de 512 B eso deja 472 útiles (antes 488) y con
+    /// 4096 B deja 4056 (antes 4072).
+    ///
+    /// No depende del algoritmo, a propósito: el campo de nonce mide 24 B
+    /// para los dos, aunque AES-256-GCM-SIV solo use 12 — ver
+    /// `crypto::STORED_NONCE_LEN` para por qué el tamaño de página lógica
+    /// no puede depender de un dato que el fichero no contiene.
     pub fn logical_page_size(&self) -> u32 {
         match &self.encryption {
             Some(_) => self.geometry().page_size - crate::crypto::CIPHER_PREFIX as u32,
@@ -108,16 +119,12 @@ impl Pager {
         }
     }
 
-    /// Si esta base tiene cifrado por página activo. `Db::begin_write`
-    /// (`tx.rs`, tarea 17, ronda de revisión posterior a la primera
-    /// entrega) la usa para saltarse por completo la reserva duradera de
-    /// contadores de nonce (`Db::extend_counter_ceiling`) cuando no hace
-    /// falta:
-    /// sin cifrado, ningún contador se usa nunca (`write_encrypted` con
-    /// `self.encryption == None` ignora el que se le pase), así que
-    /// reservarlo sería una escritura+sincronización de meta por cada
-    /// transacción sin ningún beneficio — justo el coste que este método
-    /// existe para evitar en el caso común (bases sin cifrar).
+    /// Si esta base tiene cifrado por página activo. La usa `Db::create`/
+    /// `Db::open` (`tx.rs`) para decidir si esta apertura necesita sortear
+    /// un prefijo de nonce (`crypto::NonceStream`) o si puede prescindir de
+    /// él por completo: sin cifrado no se sella ninguna página, así que una
+    /// base sin cifrar no paga ni la lectura de `/dev/urandom` ni el estado
+    /// del contador.
     pub fn is_encrypted(&self) -> bool {
         self.encryption.is_some()
     }
@@ -167,9 +174,11 @@ impl Pager {
         // Descifrar, si procede, ANTES de cachear: la caché guarda texto
         // plano (ver el comentario de `Pager`, arriba de la struct), así que
         // un acierto de caché —el caso frecuente— no vuelve a pagar el coste
-        // de autenticar. `page_no` entra en la derivación del nonce, igual
-        // que en la escritura (`write_encrypted`): sin él, dos páginas
-        // distintas escritas por la MISMA transacción compartirían nonce.
+        // de autenticar. `page_no` va a los datos asociados, igual que en la
+        // escritura (`crypto::seal`): es lo que ata cada página a SU número
+        // ahora que el nonce se almacena en vez de derivarse de él — sin
+        // eso, copiar los bytes de una página encima de otra pasaría la
+        // autenticación.
         let bytes: Arc<[u8]> = match &self.encryption {
             None => Arc::from(buf.into_boxed_slice()),
             Some(enc) => Arc::from(self.decrypt(enc, page_no, buf)?.into_boxed_slice()),
@@ -182,7 +191,7 @@ impl Pager {
 
     /// Descifra `buf` (el contenido físico completo recién leído) y devuelve
     /// solo la porción de página lógica en claro, con el prefijo de
-    /// `txn_id`+tag ya recortado. Un fallo de autenticación —clave
+    /// nonce+tag ya recortado. Un fallo de autenticación —clave
     /// incorrecta o página manipulada— se propaga como `Error::Decrypt`, no
     /// como una página corrupta cualquiera: quien llama necesita distinguir
     /// los dos casos (ver las pruebas `a_wrong_key_fails_to_decrypt...` y
@@ -230,31 +239,47 @@ impl Pager {
     /// tamaño, así que el resultado, una vez sellado, mide exactamente
     /// `geometry().page_size` — lo que `write` exige.
     ///
-    /// `counter` es el contador de nonce de ESTA escritura concreta — NO el
-    /// `txn_id` de la transacción que la hace. Entra en la derivación del
-    /// nonce junto con `page_no` (ver `crypto::seal`). Su unicidad — la
-    /// invariante de la que depende TODA la confidencialidad de este
-    /// esquema — es responsabilidad de quien llama (`WriteTxn::write_page`,
-    /// `Freelist::flush`, ambos en `tx.rs`/`freelist.rs`, vía
-    /// `Db::extend_counter_ceiling`): un mismo par `(page_no, counter)` no
-    /// debe
-    /// pasar nunca dos veces por esta función. `Pager` no tiene forma de
-    /// comprobarlo por sí mismo — no es una precondición vacía: la primera
-    /// versión de este esquema usaba `txn_id` aquí, que SÍ podía repetirse
-    /// dentro de una transacción (`WriteTxn::alloc` recicla `own_free`,
-    /// tarea 12) y de hecho lo hacía en cualquier lote de más de un puñado
-    /// de escrituras — ver el comentario de `nonce` en `crypto.rs`.
-    pub fn write_encrypted(&self, page_no: PageNo, counter: u64, plain: &[u8]) -> Result<()> {
-        match &self.encryption {
-            None => self.write(page_no, plain),
-            Some(enc) => self.seal_and_write(enc, page_no, counter, plain),
+    /// `stream` es el flujo de nonces de ESTA apertura (`WriterState::
+    /// nonce_stream`, `tx.rs`), del que `crypto::seal` saca el nonce de
+    /// esta escritura concreta. `None` significa "esta base no está
+    /// cifrada", y entonces esta función es exactamente `write`.
+    ///
+    /// **Un `&mut` que atraviesa, no un contador suelto**, y a propósito:
+    /// el nonce ya no puede construirse a partir de argumentos sueltos que
+    /// alguien podría inventarse mal (la versión anterior tomaba un `u64` y
+    /// dependía de que el llamante lo hiciera monótono). Al pedir el flujo
+    /// entero, el único que puede producir un nonce es el propio flujo, que
+    /// no existe sin un prefijo aleatorio y que avanza solo — ver
+    /// `crypto::NonceStream`.
+    ///
+    /// Que `stream` sea `Some` cuando la base está cifrada lo garantiza
+    /// `Db::create`/`Db::open`, que construyen los dos campos a la vez. Si
+    /// aun así llegara `None` sobre una base cifrada, esto falla alto
+    /// (`Error::BadFormat`) en vez de escribir la página en claro bajo la
+    /// apariencia de que se cifró.
+    pub fn write_encrypted(
+        &self,
+        page_no: PageNo,
+        stream: Option<&mut crate::crypto::NonceStream>,
+        plain: &[u8],
+    ) -> Result<()> {
+        match (&self.encryption, stream) {
+            (None, _) => self.write(page_no, plain),
+            (Some(enc), Some(stream)) => self.seal_and_write(enc, stream, page_no, plain),
+            (Some(_), None) => Err(crate::Error::BadFormat),
         }
     }
 
     #[cfg(feature = "encryption")]
-    fn seal_and_write(&self, enc: &Encryption, page_no: PageNo, counter: u64, plain: &[u8]) -> Result<()> {
+    fn seal_and_write(
+        &self,
+        enc: &Encryption,
+        stream: &mut crate::crypto::NonceStream,
+        page_no: PageNo,
+        plain: &[u8],
+    ) -> Result<()> {
         let mut raw = vec![0u8; self.geometry().page_size as usize];
-        crate::crypto::seal(enc, page_no, counter, plain, &mut raw)?;
+        crate::crypto::seal(enc, stream, page_no, plain, &mut raw)?;
         self.write(page_no, &raw)
     }
 
@@ -263,7 +288,13 @@ impl Pager {
     /// que falla alto en vez de escribir `plain` sin cifrar bajo la
     /// apariencia de que sí se cifró.
     #[cfg(not(feature = "encryption"))]
-    fn seal_and_write(&self, _enc: &Encryption, _page_no: PageNo, _counter: u64, _plain: &[u8]) -> Result<()> {
+    fn seal_and_write(
+        &self,
+        _enc: &Encryption,
+        _stream: &mut crate::crypto::NonceStream,
+        _page_no: PageNo,
+        _plain: &[u8],
+    ) -> Result<()> {
         Err(crate::Error::BadFormat)
     }
 

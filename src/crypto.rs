@@ -1,37 +1,75 @@
-//! Cifrado autenticado por página (tarea 17).
+//! Cifrado autenticado por página (tarea 17; nonces aleatorios desde la
+//! ronda de cambio de diseño posterior).
 //!
-//! `NONCE_LEN`/`TAG_LEN`/`WRAPPED_KEY_LEN` se compilan siempre, sin
+//! `WRAP_NONCE_LEN`/`TAG_LEN`/`WRAPPED_KEY_LEN` se compilan siempre, sin
 //! condición alguna: `meta.rs` necesita `WRAPPED_KEY_LEN` incluso en una
 //! compilación `no_std` sin cifrado, porque es parte del formato de
 //! fichero puro (bytes 40..100 de cada meta-ranura), igual que
 //! `header`/`page`. Ninguno de los tres depende de
-//! `chacha20poly1305`/`aes-gcm`: son enteros calculados en tiempo de
+//! `chacha20poly1305`/`aes-gcm-siv`: son enteros calculados en tiempo de
 //! compilación.
 //!
-//! `Algorithm`/`Encryption`/`CIPHER_PREFIX`, en cambio, están tras
-//! `#[cfg(any(feature = "std", feature = "encryption"))]`: los usa
+//! `Algorithm`/`Encryption`/`NonceStream`/`CIPHER_PREFIX`, en cambio, están
+//! tras `#[cfg(any(feature = "std", feature = "encryption"))]`: los usa
 //! `pager.rs`/`tx.rs` bajo `std` (`Pager::logical_page_size`,
-//! `Options::encryption`) SIN que haga falta `encryption` — son tipos
-//! simples, no tocan las dependencias — y también `seal`/`open`, que
-//! sí las tocan, bajo `encryption` SIN que haga falta `std` (son
-//! `no_std`-compatibles, pensadas para un llamante que integre su propio
-//! almacenamiento). Sin esta doble condición, un build
+//! `Options::encryption`, `WriterState::nonce_stream`) SIN que haga falta
+//! `encryption` — son tipos simples, no tocan las dependencias — y también
+//! `seal`/`open`, que sí las tocan, bajo `encryption` SIN que haga falta
+//! `std` (son `no_std`-compatibles, pensadas para un llamante que integre su
+//! propio almacenamiento). Sin esta doble condición, un build
 //! `--no-default-features` (ninguna de las dos) los deja sin ningún
 //! llamador alcanzable y dispara aviso de código muerto — lo que de
-//! verdad toca `chacha20poly1305`/`aes-gcm` (`seal`, `open`, `wrap_key`,
-//! `unwrap_key`, `generate_data_key`/`generate_nonce`) sigue solo tras
+//! verdad toca `chacha20poly1305`/`aes-gcm-siv` (`seal`, `open`, `wrap_key`,
+//! `unwrap_key`, `generate_data_key`/`generate_wrap_nonce`) sigue solo tras
 //! `encryption`, así que ese build nunca las enlaza.
 //!
-//! Nota aparte, no cubierta por las cuatro comprobaciones que exige la
-//! tarea: `--no-default-features --features encryption` (`no_std` CON
-//! cifrado, sin `std`) compila pero avisa de código muerto en `seal`/
-//! `open`/`wrap_key`/`unwrap_key`/`nonce`/`CIPHER_PREFIX`, porque este
-//! módulo es `pub(crate)` (ver `lib.rs`) y en ese build no existe
-//! `pager.rs`/`tx.rs` (piden `std`) que los llame — no hay ningún
-//! consumidor `no_std` real todavía. El comentario de `seal`/`open` que
-//! los llama "compatibles con no_std" es cierto en el sentido de qué
-//! exige la propia función (nada de `std`), no en que hoy exista un
-//! camino público para usarlos así.
+//! # El nonce: prefijo aleatorio por apertura, contador dentro de ella
+//!
+//! ```text
+//! nonce = prefijo aleatorio (16 B, sorteado UNA vez por apertura)
+//!         || contador (8 B, monótono dentro de esa apertura)
+//! ```
+//!
+//! Y, a diferencia del diseño anterior (`página || contador`, derivado y
+//! nunca almacenado), **el nonce viaja entero en claro con cada página**
+//! — es la única forma de poder descifrarla después, porque el prefijo
+//! cambia en cada apertura y las páginas selladas por aperturas anteriores
+//! siguen ahí. Ver `CIPHER_PREFIX` para el coste en disco.
+//!
+//! **Por qué se cambió.** El contador viajaba en claro y su TECHO se
+//! persistía en la meta, junto a la clave de datos envuelta. Al vivir los
+//! dos en la meta, **retroceden juntos**: restaurar una copia de seguridad
+//! de una base cifrada reutilizaba todos los contadores bajo la misma clave
+//! de datos — medido sobre el código anterior, 296 de 296 nonces
+//! compartidos entre las dos líneas temporales, 164 con texto plano
+//! distinto y hasta un 96,52 % de bytes cero en el XOR de los textos
+//! cifrados: recuperación total del texto plano a partir de un
+//! procedimiento de operación corriente, sin ningún atacante de por medio.
+//!
+//! **Por qué NO se sortea entropía en cada escritura.** Dos razones, las
+//! dos verificadas: `read_random` (más abajo) abre `/dev/urandom` en CADA
+//! llamada, así que un nonce aleatorio por página serían un `open` y un
+//! `read` por página en un motor cuya premisa entera es el mínimo consumo
+//! de CPU; y bajo `no_std` no hay ninguna fuente de entropía — hoy la
+//! aleatoriedad solo hace falta al generar la clave, y ahí la aporta el
+//! llamante. Un sorteo por APERTURA cuesta una lectura de `/dev/urandom`
+//! por sesión, no por escritura.
+//!
+//! **Qué se gana.** Dentro de una apertura la unicidad está GARANTIZADA
+//! (el contador es monótono y no rebobina nunca, ni siquiera al abortar
+//! una transacción); entre líneas temporales distintas —una copia
+//! restaurada, dos asas, dos procesos— una colisión exige repetir 128 bits
+//! aleatorios. Una copia restaurada sortea un prefijo nuevo al abrir; dos
+//! aperturas cualesquiera sortean prefijos distintos.
+//!
+//! **Qué desapareció con el cambio**, y no es un efecto colateral sino el
+//! objetivo: el techo de contador persistido (`Meta::write_counter`, bytes
+//! 100..108), su protocolo de extensión (dos escrituras de meta con dos
+//! sincronizaciones), `COUNTER_RESERVE`, `WriterState::counter_ceiling` y
+//! el `fsync` incondicional que pagaba la primera escritura de toda
+//! apertura cifrada. Con un prefijo fresco por apertura, reiniciar el
+//! contador en cero tras una caída es seguro por construcción, así que no
+//! queda nada que persistir.
 //!
 //! ## Backend portable de ChaCha20/Poly1305: medido, no forzado
 //!
@@ -44,8 +82,8 @@
 //! el backend portable (`backends/soft.rs`), que no contiene ni una sola
 //! palabra clave `unsafe` — Rust puro, coherente con la única excepción a
 //! "cero `unsafe`" que documenta este crate (ver `Cargo.toml`). `aes`/
-//! `polyval` (el backend AES-GCM, tras la feature `aes`) tienen el mismo
-//! patrón vía `aes_force_soft`/`polyval_force_soft`.
+//! `polyval` (el backend de AES-GCM-SIV, tras la feature `aes`) tienen el
+//! mismo patrón vía `aes_force_soft`/`polyval_force_soft`.
 //!
 //! Medido (no supuesto) en un Intel Core "Haswell" con AVX2+SSE2+AES-NI,
 //! cifrando páginas de 4 KB con `encrypt_in_place_detached`, ~780 MB por
@@ -53,12 +91,15 @@
 //!
 //! | Backend | MB/s (3 corridas) | Media |
 //! |---|---|---|
-//! | Por defecto (AVX2/SSE2, `unsafe`) | 707.0 / 738.5 / 764.9 | ~737 MB/s |
-//! | Portable (`--cfg *_force_soft`, sin `unsafe`) | 359.5 / 327.7 / 376.9 | ~355 MB/s |
+//! | Por defecto (AVX2/SSE2, `unsafe`) | 707,0 / 738,5 / 764,9 | ~737 MB/s |
+//! | Portable (`--cfg *_force_soft`, sin `unsafe`) | 359,5 / 327,7 / 376,9 | ~355 MB/s |
 //!
 //! El backend portable rinde **~2,1× más lento** en este hardware — la cifra
-//! "200 a 400 MB/s" del comentario de `Algorithm::ChaCha20Poly1305`, más
+//! "200 a 400 MB/s" del comentario de `Algorithm::XChaCha20Poly1305`, más
 //! abajo, es justo el rango que dio esta medición, no una cifra inventada.
+//! La medición es del núcleo ChaCha20, que XChaCha20 comparte byte a byte:
+//! XChaCha20 solo antepone una derivación HChaCha20 de coste constante (un
+//! bloque) por MENSAJE, invisible frente a cifrar una página entera.
 //!
 //! **Esto NO se fuerza en este `Cargo.toml`.** `inro` es una biblioteca:
 //! `RUSTFLAGS`/`--cfg` es una decisión de quien construye el binario final
@@ -69,42 +110,106 @@
 //! coherente con que `forbid(unsafe_code)` en `Cargo.toml` cubre el código
 //! de `inro`, no el de sus dependencias.
 //!
-//! ## Límite conocido, fuera del alcance de esta tarea: la meta no está autenticada
+//! ## Qué autentica el tag, y qué sigue sin autenticar
+//!
+//! Cada página sellada lleva su número de página y su propio nonce
+//! almacenado como **datos asociados** (`associated_data`, más abajo), así
+//! que el tag cubre los tres: texto cifrado, número de página y nonce. De
+//! ahí salen dos propiedades concretas:
+//!
+//! - **Mover bytes de una página a otra se detecta.** Copiar la página 5
+//!   encima de la 9 falla al descifrar, porque la 9 se autentica con `9` en
+//!   los datos asociados. Esto lo daba antes, de rebote, que el nonce se
+//!   derivara de `página || contador`; al pasar a un nonce almacenado
+//!   habría desaparecido si no se pusiera el número de página en los datos
+//!   asociados a propósito.
+//! - **Ningún byte físico de la página queda fuera del tag.** El campo de
+//!   nonce mide 24 B siempre, pero AES-256-GCM-SIV solo usa 12 (ver
+//!   `NonceStream::next`); esos 12 bytes de relleno también entran en los
+//!   datos asociados, así que tocarlos invalida el tag en vez de pasar
+//!   inadvertidos.
+//!
+//! ### Límite conocido, fuera del alcance de este cambio: la meta no está autenticada
 //!
 //! La meta-página (`meta.rs`) solo lleva su CRC32 de siempre — no pasa por
-//! `seal`/`open`, por la razón que explica el comentario de `wrap_key`: no
-//! hay forma de derivar su nonce sin repetirlo, porque se reescribe en cada
-//! commit. Consecuencia: quien puede escribir el fichero puede reapuntar
-//! `root`/`freelist_head`/`freelist_tail` a cualquier OTRA página cifrada
-//! del mismo fichero (recalculando el CRC32, que no es secreto) y esa
-//! página se DESCIFRARÁ LIMPIA — el nonce que la protege liga página y
-//! contador, no el PAPEL que esa página juega en el árbol. El tag de
-//! autenticación certifica "esta página se cifró con esta clave para este
-//! `(page, counter)`", no "esta página es la raíz legítima de este árbol
-//! en este momento". Cerrarlo exigiría autenticar también la meta —
-//! diseño propio, con su propio ciclo de revisión, no un ajuste de esta
-//! ronda.
+//! `seal`/`open`, por la razón que explica el comentario de `wrap_key`: se
+//! reescribe en cada commit, y meterla en el esquema de nonces por página
+//! exigiría su propio diseño. Consecuencia: quien puede escribir el fichero
+//! puede reapuntar `root`/`freelist_head`/`freelist_tail` a cualquier OTRA
+//! página cifrada del mismo fichero (recalculando el CRC32, que no es
+//! secreto) y esa página se DESCIFRARÁ LIMPIA — los datos asociados ligan
+//! cada página con su NÚMERO, no con el PAPEL que juega en el árbol. El tag
+//! certifica "esta página se cifró con esta clave, para este número de
+//! página, con este nonce", no "esta página es la raíz legítima de este
+//! árbol en este momento". Cerrarlo exigiría autenticar también la meta —
+//! diseño propio, con su propio ciclo de revisión.
 
-// A diferencia de `Algorithm`/`Encryption`/`CIPHER_PREFIX` más abajo, esto
-// solo hace falta bajo `encryption`: son los tipos que usan `nonce`, `seal`,
-// `open`, `wrap_key`, `unwrap_key` y `generate_data_key`/`generate_nonce`,
-// todas tras esa feature — `pager.rs`/`tx.rs` (que solo piden `std`) nunca
-// tocan `Error`/`PageNo`/`Result` DESDE ESTE fichero: usan los suyos
-// propios, importados en `pager.rs`/`tx.rs`.
+// A diferencia de `Algorithm`/`Encryption`/`NonceStream`/`CIPHER_PREFIX` más
+// abajo, esto solo hace falta bajo `encryption`: son los tipos que usan
+// `seal`, `open`, `wrap_key`, `unwrap_key` y
+// `generate_data_key`/`generate_wrap_nonce`, todas tras esa feature —
+// `pager.rs`/`tx.rs` (que solo piden `std`) nunca tocan `Error`/`PageNo`/
+// `Result` DESDE ESTE fichero: usan los suyos propios, importados en
+// `pager.rs`/`tx.rs`.
 #[cfg(feature = "encryption")]
 use crate::{Error, PageNo, Result};
 
-pub const NONCE_LEN: usize = 12;
+/// Nonce del envoltorio de la clave de datos en la meta (`wrap_key`), no el
+/// de una página: doce bytes, aleatorios, de un solo uso por base. No lo
+/// toca el cambio a nonces por apertura — ver `wrap_key`.
+pub const WRAP_NONCE_LEN: usize = 12;
+
 pub const TAG_LEN: usize = 16;
 
 /// Envoltorio de la clave de datos: nonce de 12, texto cifrado de 32 y tag de
 /// 16, en los bytes 40..100 de la meta.
-pub const WRAPPED_KEY_LEN: usize = NONCE_LEN + 32 + TAG_LEN;
+pub const WRAPPED_KEY_LEN: usize = WRAP_NONCE_LEN + 32 + TAG_LEN;
 
-/// Bytes en claro al principio de una página cifrada: contador de nonce (no
-/// `txn_id` — ver el comentario de `nonce`, más abajo) y tag.
+/// Bytes del prefijo aleatorio que se sortea UNA vez por apertura. Dieciséis
+/// es lo que le sobra a XChaCha20-Poly1305 tras reservar ocho para el
+/// contador; AES-256-GCM-SIV solo puede usar los ocho primeros (ver
+/// `NonceStream::next`), pero el prefijo se sortea entero siempre — sortear
+/// menos bytes según el algoritmo no ahorra nada (es una sola lectura de
+/// `/dev/urandom` por apertura) y sí complicaría el tipo.
 #[cfg(any(feature = "std", feature = "encryption"))]
-pub const CIPHER_PREFIX: usize = 8 + TAG_LEN;
+pub const NONCE_PREFIX_LEN: usize = 16;
+
+/// Bytes de nonce que cada página cifrada almacena en claro. Veinticuatro,
+/// el tamaño del nonce de XChaCha20-Poly1305, para los DOS algoritmos:
+/// AES-256-GCM-SIV usa solo los doce primeros y deja el resto a cero.
+///
+/// **Un campo de tamaño fijo, no uno por algoritmo, y a propósito.** El
+/// algoritmo NO viaja en el fichero (solo el flag `FLAG_ENCRYPTED`, ver
+/// `header.rs`): lo aporta quien abre, en `Options::encryption`. Si el
+/// tamaño del campo dependiera de él, el tamaño de página LÓGICA
+/// (`Pager::logical_page_size`) dependería de un dato que el fichero no
+/// contiene, y abrir con el algoritmo equivocado dejaría de ser un fallo
+/// limpio de autenticación para convertirse en una geometría distinta. Los
+/// doce bytes que AES desaprovecha se pagan una vez por página y entran en
+/// los datos asociados, así que tampoco quedan sin autenticar (ver el
+/// comentario del módulo).
+#[cfg(any(feature = "std", feature = "encryption"))]
+pub const STORED_NONCE_LEN: usize = 24;
+
+/// Nonce de AES-256-GCM-SIV: doce bytes, de los cuales ocho son prefijo
+/// aleatorio y cuatro contador (ver `NonceStream::next`).
+#[cfg(feature = "encryption")]
+pub const AES_NONCE_LEN: usize = 12;
+
+/// Prefijo aleatorio que le cabe al nonce de AES-256-GCM-SIV: ocho bytes de
+/// los doce, dejando cuatro para el contador. Ver `NonceStream::next` para
+/// por qué este reparto y no otro.
+#[cfg(feature = "encryption")]
+pub const AES_PREFIX_LEN: usize = 8;
+
+/// Bytes en claro al principio de una página cifrada: nonce completo y tag.
+///
+/// Cuarenta, frente a los veinticuatro del diseño anterior (8 de contador +
+/// 16 de tag): el nonce ya no se deriva de `página || contador`, se
+/// almacena entero, así que el sobrecoste sube 16 bytes por página y el
+/// tamaño de página LÓGICA baja otros tantos.
+#[cfg(any(feature = "std", feature = "encryption"))]
+pub const CIPHER_PREFIX: usize = STORED_NONCE_LEN + TAG_LEN;
 
 #[cfg(any(feature = "std", feature = "encryption"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,9 +217,25 @@ pub enum Algorithm {
     /// Por defecto. Sin aceleración por hardware mantiene entre 200 y 400 MB/s,
     /// cuatro veces más que AES en software, que es el caso de los procesadores
     /// IoT sin extensiones criptográficas.
-    ChaCha20Poly1305,
+    ///
+    /// **X**ChaCha20, no ChaCha20 a secas: su nonce de 24 bytes es lo que
+    /// deja meter un prefijo aleatorio de 16 B junto al contador de 8 B.
+    /// El coste frente a ChaCha20-Poly1305 es una derivación HChaCha20 por
+    /// página (un bloque), invisible frente a cifrar la página entera.
+    XChaCha20Poly1305,
     /// Para entornos con AES-NI o requisitos de cumplimiento que lo exijan.
-    Aes256Gcm,
+    ///
+    /// **-SIV, no GCM a secas** (cambio de esta ronda). AES-256-GCM tiene un
+    /// nonce de 12 bytes: no caben 16 de prefijo más 8 de contador, así que
+    /// el prefijo aleatorio que le toca es corto y una colisión entre dos
+    /// aperturas deja de ser despreciable — ver la aritmética en
+    /// `NonceStream::next`. AES-256-GCM-SIV (RFC 8452) es resistente a la
+    /// reutilización de nonce por construcción: si dos aperturas llegaran a
+    /// sortear el mismo prefijo, lo que un observador aprende es que dos
+    /// textos planos eran iguales, no cuáles eran — con GCM a secas
+    /// aprendería su XOR, que para páginas de este motor (casi todo relleno
+    /// a cero y cabeceras iguales) es texto plano.
+    Aes256GcmSiv,
 }
 
 #[cfg(any(feature = "std", feature = "encryption"))]
@@ -136,36 +257,227 @@ impl core::fmt::Debug for Encryption {
     }
 }
 
-/// Nonce derivado, nunca almacenado. Su unicidad depende de que `counter`
-/// nunca se repita para una misma `page` — ver `crate::tx::WriteTxn`, que es
-/// quien garantiza eso reservando un tramo de contadores por adelantado
-/// (`Db::extend_counter_ceiling`) en vez de derivar de `txn_id` (ronda de revisión
-/// posterior a la primera entrega: `txn_id` es el mismo para TODAS las
-/// páginas de una transacción, y `own_free` — tarea 12 — puede hacer que la
-/// MISMA página se escriba varias veces dentro de una sola transacción,
-/// reutilizando ese `txn_id` y por tanto el nonce; `counter` es un valor
-/// nuevo por cada llamada a `write_page`, nunca por transacción).
+/// Fuente de nonces de UNA apertura: el prefijo aleatorio que se sorteó al
+/// abrir, más cuántos nonces se han entregado desde entonces.
 ///
-/// Bytes literales: `page.to_le_bytes() ++ counter.to_le_bytes()`, doce en
-/// total — lo comprueba `nonce_is_exactly_page_then_counter_little_endian`.
+/// **Es el tipo que hace imposible sellar sin prefijo.** `seal` no toma un
+/// nonce ni un contador sueltos: toma `&mut NonceStream`, y un
+/// `NonceStream` no se puede construir sin dar 16 bytes de prefijo
+/// (`from_prefix`) o sin pedirle al sistema que los sortee
+/// (`random`, solo bajo `std`). No hay ningún camino que selle una página
+/// con un prefijo por defecto, a cero, o sin inicializar.
+///
+/// **Dónde vive y por qué ahí.** Bajo `std` lo guarda
+/// `WriterState::nonce_stream` (`tx.rs`): estado de la BASE, no de una
+/// transacción, para que sobreviva a un aborto sin rebobinar — una
+/// transacción descartada no puede devolver a circulación un contador que
+/// ya usó para sellar páginas que sí llegaron al medio. Bajo `no_std` lo
+/// guarda quien integre su propio almacenamiento, que es también quien
+/// aporta el prefijo, igual que ya aporta la clave de datos.
+///
+/// `issued` no rebobina JAMÁS — ni al abortar, ni cuando el prefijo se
+/// vuelve a sortear por agotamiento del campo de contador de AES (ver
+/// `next`). Por eso sirve además como identificador único de escritura
+/// dentro de la apertura, que es lo que usa la comprobación defensiva de
+/// `WriteTxn::write_page`.
+///
+/// **Bajo `std` SIN `encryption`** este tipo existe solo para que
+/// `tx.rs`/`pager.rs`/`freelist.rs` puedan nombrarlo — `WriterState` lleva
+/// un `Option<NonceStream>` que en ese build es siempre `None`, porque
+/// `Db::create`/`open` ya rechazan cualquier petición de cifrado antes de
+/// llegar ahí. En ese build no hay constructor alcanzable ni nadie que lea
+/// `prefix`, así que el análisis de código muerto lo señalaría con razón:
+/// de ahí el `allow` condicionado, que NO se aplica a ningún build donde el
+/// tipo se use de verdad.
+#[cfg(any(feature = "std", feature = "encryption"))]
+#[cfg_attr(not(feature = "encryption"), allow(dead_code))]
+pub struct NonceStream {
+    prefix: [u8; NONCE_PREFIX_LEN],
+    issued: u64,
+}
+
+/// A mano, igual que el de `Encryption` y por el mismo motivo: el prefijo no
+/// es secreto (viaja en claro en cada página), pero volcarlo en un `{:?}`
+/// accidental invita a confundirlo con material público de depuración
+/// cuando en realidad es el que separa una línea temporal de otra.
+#[cfg(any(feature = "std", feature = "encryption"))]
+impl core::fmt::Debug for NonceStream {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NonceStream")
+            .field("prefix", &"[omitido]")
+            .field("issued", &self.issued)
+            .finish()
+    }
+}
+
+/// Lo único que necesita `WriteTxn::write_page` bajo `std` sin `encryption`
+/// (donde el resto del `impl`, más abajo, no se compila): ver el comentario
+/// del tipo.
+#[cfg(any(feature = "std", feature = "encryption"))]
+impl NonceStream {
+    /// Cuántos nonces ha entregado esta apertura. Estrictamente creciente y
+    /// sin rebobinar nunca (ver el comentario del tipo), así que identifica
+    /// de forma única cada escritura sellada dentro de la apertura.
+    pub fn issued(&self) -> u64 {
+        self.issued
+    }
+}
+
+#[cfg(all(test, feature = "encryption"))]
+impl NonceStream {
+    /// Coloca el flujo justo donde estaría tras `issued` sellados, sin
+    /// hacerlos. Lo necesita
+    /// `exhausting_the_aes_counter_field_renews_the_prefix_instead_of_repeating`:
+    /// el borde que esa prueba comprueba está a 2^32 escrituras, y llegar
+    /// ahí de verdad no es una prueba, es un banco de varias horas. El
+    /// estado resultante es exactamente el mismo — `prefix` e `issued` son
+    /// los dos únicos campos del tipo.
+    pub(crate) fn at_issued_for_test(prefix: [u8; NONCE_PREFIX_LEN], issued: u64) -> Self {
+        Self { prefix, issued }
+    }
+}
+
 #[cfg(feature = "encryption")]
-fn nonce(page: PageNo, counter: u64) -> [u8; NONCE_LEN] {
-    let mut n = [0u8; NONCE_LEN];
-    n[..4].copy_from_slice(&page.to_le_bytes());
-    n[4..].copy_from_slice(&counter.to_le_bytes());
-    n
+impl NonceStream {
+    /// Con el prefijo que aporta el llamante. Es el constructor de `no_std`:
+    /// sin sistema operativo no hay fuente de entropía portable, así que los
+    /// 16 bytes los pone quien integra el motor — exactamente igual que ya
+    /// pone la clave de datos.
+    pub fn from_prefix(prefix: [u8; NONCE_PREFIX_LEN]) -> Self {
+        Self { prefix, issued: 0 }
+    }
+
+    /// Sorteando el prefijo de `/dev/urandom`. Es lo que hacen `Db::create`
+    /// y `Db::open` (`tx.rs`) en cada apertura de una base cifrada: UNA
+    /// lectura por apertura, no una por escritura.
+    #[cfg(feature = "std")]
+    pub fn random() -> Result<Self> {
+        let mut prefix = [0u8; NONCE_PREFIX_LEN];
+        read_random(&mut prefix)?;
+        Ok(Self::from_prefix(prefix))
+    }
+
+    /// El siguiente nonce, ya en el formato de 24 bytes que se almacena con
+    /// la página.
+    ///
+    /// # El reparto, por algoritmo
+    ///
+    /// - **XChaCha20-Poly1305 (24 B):** `prefijo (16) || contador (8, LE)`.
+    ///   El contador es el `issued` entero, así que agotarlo exige 2^64
+    ///   escrituras: inalcanzable, y aun así se comprueba en vez de
+    ///   suponerse.
+    /// - **AES-256-GCM-SIV (12 B):** `prefijo (8) || contador (4, LE)`, con
+    ///   los 12 bytes restantes del campo almacenado a cero.
+    ///
+    /// # Por qué 8+4 en el caso de 12 bytes, y qué probabilidad se acepta
+    ///
+    /// El reparto es un intercambio directo: cada byte que se le da al
+    /// prefijo se lo quita al contador. Lo que hay que acotar son dos cosas
+    /// distintas.
+    ///
+    /// **(a) Colisión de prefijos entre dos sorteos.** Solo importa dentro
+    /// de UNA base: la clave de datos es aleatoria y distinta por base
+    /// (`generate_data_key`), así que dos bases nunca comparten el espacio
+    /// de nonces. Con un prefijo de 8 B el espacio es 2^64 y, por la
+    /// aproximación del cumpleaños, `n` sorteos colisionan con
+    /// probabilidad ≈ `n² / 2^65`:
+    ///
+    /// | sorteos sobre una misma base | probabilidad de colisión |
+    /// |---|---|
+    /// | 10^4 (un reinicio por hora durante un año) | ≈ 2,7 × 10⁻¹² |
+    /// | 10^6 | ≈ 2,7 × 10⁻⁸ |
+    /// | 10^9 | ≈ 2,7 × 10⁻² |
+    ///
+    /// Un sorteo por apertura, más uno por cada 2^32 escrituras (ver (b)).
+    /// **Y una colisión no es catastrófica**: por eso el algoritmo es
+    /// GCM-SIV y no GCM. Con nonce repetido, GCM-SIV filtra únicamente que
+    /// dos textos planos eran iguales; GCM filtraría su XOR, que sobre
+    /// páginas de este motor equivale al texto plano — es literalmente el
+    /// defecto que este cambio de diseño cierra. Con 4 B de prefijo (el
+    /// reparto 4+8, que conservaría el contador de 8 B) la tabla sería
+    /// inaceptable: 10^5 aperturas dan probabilidad ≈ 1.
+    ///
+    /// **(b) Agotamiento del contador de 4 B.** 2^32 = 4 294 967 296
+    /// escrituras de página en UNA sola apertura. Es mucho, pero no
+    /// inalcanzable en un proceso de larga vida, así que no se deja como
+    /// precipicio: al desbordar el campo se sortea un prefijo nuevo y se
+    /// sigue. Cuesta una lectura de `/dev/urandom` cada 2^32 escrituras —
+    /// nada — y `issued` sigue avanzando sin rebobinar, así que ni el
+    /// contador ni la comprobación defensiva de `write_page` se confunden.
+    /// Bajo `no_std` no hay de dónde sortear: ahí el agotamiento es un
+    /// error explícito (`Error::NonceExhausted`) y no un nonce repetido en
+    /// silencio.
+    ///
+    /// XChaCha20-Poly1305 no tiene ninguno de los dos problemas: 16 B de
+    /// prefijo dan ≈ `n² / 2^129` (para 10^9 sorteos, ≈ 1,5 × 10⁻²¹) y el
+    /// contador de 8 B no se agota.
+    pub fn next(&mut self, algorithm: Algorithm) -> Result<[u8; STORED_NONCE_LEN]> {
+        let mut nonce = [0u8; STORED_NONCE_LEN];
+        match algorithm {
+            Algorithm::XChaCha20Poly1305 => {
+                nonce[..NONCE_PREFIX_LEN].copy_from_slice(&self.prefix);
+                nonce[NONCE_PREFIX_LEN..].copy_from_slice(&self.issued.to_le_bytes());
+            }
+            Algorithm::Aes256GcmSiv => {
+                // El campo de contador es de 32 bits, así que se agota cada
+                // 2^32 escrituras: cuando `issued` vuelve a caer en un
+                // múltiplo de 2^32 (y no es la primera vez), el contador
+                // repetiría — hay que renovar el prefijo ANTES de usarlo.
+                if self.issued != 0 && self.issued as u32 == 0 {
+                    self.renew_prefix()?;
+                }
+                nonce[..AES_PREFIX_LEN].copy_from_slice(&self.prefix[..AES_PREFIX_LEN]);
+                nonce[AES_PREFIX_LEN..AES_NONCE_LEN]
+                    .copy_from_slice(&(self.issued as u32).to_le_bytes());
+            }
+        }
+        // Nunca puede desbordar en la práctica (2^64 escrituras), pero
+        // `checked_add` en vez de `+= 1` deja el caso imposible como un
+        // error explícito en lugar de como un `wrapping` silencioso que
+        // devolvería un nonce ya usado.
+        self.issued = self.issued.checked_add(1).ok_or(Error::NonceExhausted)?;
+        Ok(nonce)
+    }
+
+    /// Vuelve a sortear el prefijo cuando el campo de contador de AES se
+    /// agota. Ver `next`.
+    #[cfg(feature = "std")]
+    fn renew_prefix(&mut self) -> Result<()> {
+        read_random(&mut self.prefix)
+    }
+
+    /// Sin `std` no hay `/dev/urandom` ni ninguna otra fuente portable, y el
+    /// prefijo lo aportó el llamante una sola vez: el agotamiento tiene que
+    /// ser un error, no un nonce repetido en silencio. Ver `next`.
+    #[cfg(not(feature = "std"))]
+    fn renew_prefix(&mut self) -> Result<()> {
+        Err(Error::NonceExhausted)
+    }
+}
+
+/// Datos asociados de una página sellada: su número y su propio nonce.
+/// Autenticados, no cifrados — ver "Qué autentica el tag" en el comentario
+/// del módulo para las dos propiedades concretas que dan.
+#[cfg(feature = "encryption")]
+fn associated_data(page: PageNo, nonce: &[u8; STORED_NONCE_LEN]) -> [u8; 4 + STORED_NONCE_LEN] {
+    let mut aad = [0u8; 4 + STORED_NONCE_LEN];
+    aad[..4].copy_from_slice(&page.to_le_bytes());
+    aad[4..].copy_from_slice(nonce);
+    aad
 }
 
 /// Cifra `plain` en `out`, que debe medir `CIPHER_PREFIX + plain.len()`.
-/// `counter` es el contador de nonce de esta escritura concreta — NO el
-/// `txn_id` de la transacción, ver el comentario de `nonce` — y viaja en
-/// claro en los primeros 8 bytes de `out`, que es de donde `open` lo vuelve
-/// a leer para poder rederivar el mismo nonce sin almacenarlo.
+///
+/// Toma el `NonceStream` de la apertura, no un nonce ni un contador sueltos
+/// (ver el comentario de `NonceStream`): el nonce se saca de ahí, se
+/// escribe en claro en los primeros `STORED_NONCE_LEN` bytes de `out` — de
+/// donde `open` lo vuelve a leer — y entra además en los datos asociados
+/// junto con `page`.
 #[cfg(feature = "encryption")]
 pub fn seal(
     enc: &Encryption,
+    stream: &mut NonceStream,
     page: PageNo,
-    counter: u64,
     plain: &[u8],
     out: &mut [u8],
 ) -> Result<()> {
@@ -180,30 +492,132 @@ pub fn seal(
         return Err(Error::BadFormat);
     }
 
-    out[..8].copy_from_slice(&counter.to_le_bytes());
+    // El nonce se saca ANTES de tocar `out`: si el flujo estuviera agotado
+    // (ver `NonceStream::next`), esto falla sin haber dejado la página a
+    // medio construir.
+    let nonce = stream.next(enc.algorithm)?;
+    let aad = associated_data(page, &nonce);
+    out[..STORED_NONCE_LEN].copy_from_slice(&nonce);
     out[CIPHER_PREFIX..].copy_from_slice(plain);
-    let n = nonce(page, counter);
 
     let tag = match enc.algorithm {
-        Algorithm::ChaCha20Poly1305 => {
-            let cipher = chacha20poly1305::ChaCha20Poly1305::new((&enc.key).into());
+        Algorithm::XChaCha20Poly1305 => {
+            let cipher = chacha20poly1305::XChaCha20Poly1305::new((&enc.key).into());
             cipher
-                .encrypt_in_place_detached((&n).into(), &[], &mut out[CIPHER_PREFIX..])
+                .encrypt_in_place_detached((&nonce).into(), &aad, &mut out[CIPHER_PREFIX..])
                 .map_err(|_| Error::Decrypt { page })?
         }
         #[cfg(feature = "aes")]
-        Algorithm::Aes256Gcm => {
-            use aes_gcm::aead::{AeadInPlace as _, KeyInit as _};
-            let cipher = aes_gcm::Aes256Gcm::new((&enc.key).into());
+        Algorithm::Aes256GcmSiv => {
+            use aes_gcm_siv::aead::{AeadInPlace as _, KeyInit as _};
+            let cipher = aes_gcm_siv::Aes256GcmSiv::new((&enc.key).into());
             cipher
-                .encrypt_in_place_detached((&n).into(), &[], &mut out[CIPHER_PREFIX..])
+                .encrypt_in_place_detached(
+                    (&aes_nonce(&nonce)).into(),
+                    &aad,
+                    &mut out[CIPHER_PREFIX..],
+                )
                 .map_err(|_| Error::Decrypt { page })?
         }
         #[cfg(not(feature = "aes"))]
-        Algorithm::Aes256Gcm => return Err(Error::BadFormat),
+        Algorithm::Aes256GcmSiv => return Err(Error::BadFormat),
     };
-    out[8..CIPHER_PREFIX].copy_from_slice(&tag);
+    out[STORED_NONCE_LEN..CIPHER_PREFIX].copy_from_slice(&tag);
+    // Instrumentación de pruebas EN EL PROPIO `seal`, no reconstruyendo
+    // nonces a partir de las escrituras físicas (ver `probe`): es el único
+    // punto por el que pasa absolutamente todo sellado de este motor —
+    // árbol, lista de libres, cualquier camino presente o futuro — así que
+    // un contador aquí no puede quedarse corto por haber olvidado filtrar
+    // bien qué offsets son meta y cuáles datos, que es de lo que dependía
+    // el arnés anterior.
+    #[cfg(all(test, feature = "std"))]
+    probe::record(page, &nonce, &out[CIPHER_PREFIX..]);
     Ok(())
+}
+
+/// Registro de todos los nonces que `seal` produce mientras una prueba
+/// mantiene abierta una sesión de captura.
+///
+/// **Por qué aquí dentro y no en un `Storage` envolvente.** La prueba de
+/// unicidad de nonces anterior a este cambio deducía el nonce de cada
+/// escritura física: leía los ocho primeros bytes de cada página escrita y
+/// los interpretaba como el contador, descartando por offset las escrituras
+/// de cabecera y de meta. Eso obligaba a mantener, dentro del arnés, un
+/// modelo de qué offsets son meta en cada instante — que cambió tres veces
+/// (meta B estática, meta B reubicable, meta B reubicada y luego
+/// reciclada) y en el que un fallo se manifiesta como nonces que el
+/// auditor NO mira, es decir como una prueba que pasa por no haber
+/// comprobado nada. Capturando en `seal` no hay nada que deducir ni que
+/// filtrar: lo que se cuenta son los nonces que de verdad se usaron.
+///
+/// La sesión es exclusiva (`SESSION`) porque las pruebas del mismo binario
+/// corren en paralelo y el registro es global: sin esa exclusión, dos
+/// pruebas instrumentadas a la vez mezclarían sus nonces. No serializa la
+/// suite entera, solo las pruebas que capturan.
+#[cfg(all(test, feature = "encryption", feature = "std"))]
+pub(crate) mod probe {
+    use super::{PageNo, STORED_NONCE_LEN};
+    use alloc::vec::Vec;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Un sellado tal como lo produjo `seal`.
+    pub struct Sealed {
+        pub page: PageNo,
+        pub nonce: [u8; STORED_NONCE_LEN],
+        pub ciphertext: Vec<u8>,
+    }
+
+    static SESSION: Mutex<()> = Mutex::new(());
+    static RECORD: Mutex<Option<Vec<Sealed>>> = Mutex::new(None);
+
+    /// Sesión de captura viva. Mientras exista, `seal` anota cada nonce que
+    /// produce; al soltarla, la captura se apaga.
+    pub struct Capture {
+        _session: MutexGuard<'static, ()>,
+    }
+
+    impl Capture {
+        pub fn start() -> Self {
+            // `into_inner` en vez de `unwrap`: si una prueba instrumentada
+            // entra en pánico, el candado queda envenenado y TODAS las
+            // demás fallarían por un motivo ajeno al que se está probando.
+            let session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+            *RECORD.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+            Self { _session: session }
+        }
+
+        /// Se lleva lo capturado hasta ahora y deja el registro vacío pero
+        /// activo: sirve para separar en tramos una misma sesión (p. ej. lo
+        /// que selló el original de una copia de seguridad y lo que selló
+        /// la copia restaurada).
+        pub fn take(&self) -> Vec<Sealed> {
+            let mut r = RECORD.lock().unwrap_or_else(|e| e.into_inner());
+            r.replace(Vec::new()).unwrap_or_default()
+        }
+    }
+
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            *RECORD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    pub(super) fn record(page: PageNo, nonce: &[u8; STORED_NONCE_LEN], ciphertext: &[u8]) {
+        let mut r = RECORD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = r.as_mut() {
+            v.push(Sealed { page, nonce: *nonce, ciphertext: ciphertext.to_vec() });
+        }
+    }
+}
+
+/// Los doce bytes de nonce que usa AES-256-GCM-SIV, recortados del campo
+/// almacenado de 24. Los otros doce van a cero y se autentican como datos
+/// asociados; ver `STORED_NONCE_LEN`.
+#[cfg(all(feature = "encryption", feature = "aes"))]
+fn aes_nonce(nonce: &[u8; STORED_NONCE_LEN]) -> [u8; AES_NONCE_LEN] {
+    let mut n = [0u8; AES_NONCE_LEN];
+    n.copy_from_slice(&nonce[..AES_NONCE_LEN]);
+    n
 }
 
 /// Descifra `raw` en sitio: tras devolver `Ok`, `raw[CIPHER_PREFIX..]`
@@ -221,51 +635,57 @@ pub fn open(enc: &Encryption, page: PageNo, raw: &mut [u8]) -> Result<()> {
         return Err(Error::BadFormat);
     }
 
-    let counter = u64::from_le_bytes(raw[..8].try_into().unwrap());
+    let mut nonce = [0u8; STORED_NONCE_LEN];
+    nonce.copy_from_slice(&raw[..STORED_NONCE_LEN]);
     let mut tag = [0u8; TAG_LEN];
-    tag.copy_from_slice(&raw[8..CIPHER_PREFIX]);
-    let n = nonce(page, counter);
+    tag.copy_from_slice(&raw[STORED_NONCE_LEN..CIPHER_PREFIX]);
+    let aad = associated_data(page, &nonce);
 
     match enc.algorithm {
-        Algorithm::ChaCha20Poly1305 => {
-            let cipher = chacha20poly1305::ChaCha20Poly1305::new((&enc.key).into());
+        Algorithm::XChaCha20Poly1305 => {
+            let cipher = chacha20poly1305::XChaCha20Poly1305::new((&enc.key).into());
             cipher
                 .decrypt_in_place_detached(
-                    (&n).into(),
-                    &[],
+                    (&nonce).into(),
+                    &aad,
                     &mut raw[CIPHER_PREFIX..],
                     (&tag).into(),
                 )
                 .map_err(|_| Error::Decrypt { page })
         }
         #[cfg(feature = "aes")]
-        Algorithm::Aes256Gcm => {
-            use aes_gcm::aead::{AeadInPlace as _, KeyInit as _};
-            let cipher = aes_gcm::Aes256Gcm::new((&enc.key).into());
+        Algorithm::Aes256GcmSiv => {
+            use aes_gcm_siv::aead::{AeadInPlace as _, KeyInit as _};
+            let cipher = aes_gcm_siv::Aes256GcmSiv::new((&enc.key).into());
             cipher
                 .decrypt_in_place_detached(
-                    (&n).into(),
-                    &[],
+                    (&aes_nonce(&nonce)).into(),
+                    &aad,
                     &mut raw[CIPHER_PREFIX..],
                     (&tag).into(),
                 )
                 .map_err(|_| Error::Decrypt { page })
         }
         #[cfg(not(feature = "aes"))]
-        Algorithm::Aes256Gcm => Err(Error::BadFormat),
+        Algorithm::Aes256GcmSiv => Err(Error::BadFormat),
     }
 }
 
-/// Fuente común de bytes aleatorios para `generate_data_key` y
-/// `generate_nonce`: ambos leen `/dev/urandom` exactamente igual, así que
-/// factorizarlo evita que diverjan por accidente. Gateado con
-/// `encryption` además de `std` (a diferencia de lo que sugería el brief
-/// original, que solo pedía `std`): sin esa `encryption` extra, esta
-/// función — y `generate_data_key`/`generate_nonce` — compilarían igual en
-/// un build `cargo test` (std sin cifrado), pero sin ningún llamador
-/// alcanzable (`Db::create`/`open` solo las invocan bajo `encryption`,
-/// ver `tx.rs`), lo que dispara el aviso de código muerto que pide
-/// mantener limpio el fichero.
+/// Fuente común de bytes aleatorios para `generate_data_key`,
+/// `generate_wrap_nonce` y `NonceStream::random`/`renew_prefix`: todos leen
+/// `/dev/urandom` exactamente igual, así que factorizarlo evita que diverjan
+/// por accidente. Gateado con `encryption` además de `std`: sin esa
+/// `encryption` extra, esta función — y sus llamadores — compilarían igual
+/// en un build `cargo test` (std sin cifrado), pero sin ningún llamador
+/// alcanzable (`Db::create`/`open` solo las invocan bajo `encryption`, ver
+/// `tx.rs`), lo que dispara el aviso de código muerto que pide mantener
+/// limpio el fichero.
+///
+/// **Abre `/dev/urandom` en CADA llamada**, y es justo la razón de que el
+/// prefijo de nonce se sortee una vez por apertura y no una vez por
+/// escritura: un `open` más un `read` por página convertirían el camino
+/// caliente de un motor pensado para IoT en dos llamadas al sistema por
+/// página escrita. Ver el comentario del módulo.
 #[cfg(all(feature = "encryption", feature = "std"))]
 fn read_random(buf: &mut [u8]) -> Result<()> {
     use std::io::Read;
@@ -292,7 +712,8 @@ fn read_random(buf: &mut [u8]) -> Result<()> {
 ///
 /// Se lee de `/dev/urandom` en lugar de añadir `getrandom` como dependencia.
 /// Bajo `no_std` la aporta el llamante, porque no hay fuente de entropía
-/// portable sin sistema operativo.
+/// portable sin sistema operativo — igual que el prefijo de nonce, ver
+/// `NonceStream::from_prefix`.
 #[cfg(all(feature = "encryption", feature = "std"))]
 pub fn generate_data_key() -> Result<[u8; 32]> {
     let mut key = [0u8; 32];
@@ -300,52 +721,60 @@ pub fn generate_data_key() -> Result<[u8; 32]> {
     Ok(key)
 }
 
-/// Nonce del envoltorio de la clave de datos (ver `wrap_key`): aleatorio, no
-/// derivado — la meta se reescribe en cada commit, así que un nonce
-/// derivado de página+transacción se repetiría. No lo especificaba el
-/// brief como función aparte, pero `wrap_key` exige un nonce fresco en
-/// cada llamada y `Db::create`/rotar la maestra necesitan generarlo desde
-/// algún sitio; misma fuente de entropía que `generate_data_key`, por la
-/// misma razón.
+/// Nonce del envoltorio de la clave de datos (ver `wrap_key`): aleatorio, de
+/// un solo uso. No es un nonce de página y no pasa por `NonceStream`: la
+/// meta se reescribe en cada commit, pero el envoltorio de la clave se sella
+/// UNA vez en la vida de la base (`Db::create`) y se copia tal cual en cada
+/// escritura de meta posterior, así que doce bytes aleatorios de un solo uso
+/// son exactamente lo que hace falta.
 #[cfg(all(feature = "encryption", feature = "std"))]
-pub fn generate_nonce() -> Result<[u8; NONCE_LEN]> {
-    let mut n = [0u8; NONCE_LEN];
+pub fn generate_wrap_nonce() -> Result<[u8; WRAP_NONCE_LEN]> {
+    let mut n = [0u8; WRAP_NONCE_LEN];
     read_random(&mut n)?;
     Ok(n)
 }
 
 /// Cifra la clave de datos con la maestra. El nonce va en claro dentro del
-/// propio envoltorio: aquí no puede derivarse de página y transacción, porque
-/// la meta se reescribe en cada commit y eso repetiría el nonce.
+/// propio envoltorio.
+///
+/// **Sigue siendo ChaCha20-Poly1305 (nonce de 12 B), no XChaCha20 ni
+/// AES-GCM-SIV, sea cual sea el `Algorithm` de las páginas.** No es un
+/// descuido: este sellado ocurre una sola vez por base, con un nonce
+/// aleatorio de 12 B que no se reutiliza jamás — no hay ninguna secuencia
+/// que pueda colisionar, así que ni el nonce extendido ni la resistencia a
+/// la reutilización aportan nada aquí. Mantenerlo fijo también deja el
+/// envoltorio (y con él los bytes 40..100 de la meta) independiente del
+/// algoritmo de página, que es lo que permite abrir el fichero y
+/// desenvolver la clave antes de saber nada más.
 #[cfg(feature = "encryption")]
-pub fn wrap_key(master: &[u8; 32], data_key: &[u8; 32], nonce_bytes: [u8; NONCE_LEN])
+pub fn wrap_key(master: &[u8; 32], data_key: &[u8; 32], nonce_bytes: [u8; WRAP_NONCE_LEN])
     -> Result<[u8; WRAPPED_KEY_LEN]>
 {
     use chacha20poly1305::aead::{AeadInPlace, KeyInit};
     let mut out = [0u8; WRAPPED_KEY_LEN];
-    out[..NONCE_LEN].copy_from_slice(&nonce_bytes);
-    out[NONCE_LEN..NONCE_LEN + 32].copy_from_slice(data_key);
+    out[..WRAP_NONCE_LEN].copy_from_slice(&nonce_bytes);
+    out[WRAP_NONCE_LEN..WRAP_NONCE_LEN + 32].copy_from_slice(data_key);
     let cipher = chacha20poly1305::ChaCha20Poly1305::new(master.into());
     let tag = cipher
         .encrypt_in_place_detached(
             (&nonce_bytes).into(),
             &[],
-            &mut out[NONCE_LEN..NONCE_LEN + 32],
+            &mut out[WRAP_NONCE_LEN..WRAP_NONCE_LEN + 32],
         )
         .map_err(|_| Error::Decrypt { page: 0 })?;
-    out[NONCE_LEN + 32..].copy_from_slice(&tag);
+    out[WRAP_NONCE_LEN + 32..].copy_from_slice(&tag);
     Ok(out)
 }
 
 #[cfg(feature = "encryption")]
 pub fn unwrap_key(master: &[u8; 32], wrapped: &[u8; WRAPPED_KEY_LEN]) -> Result<[u8; 32]> {
     use chacha20poly1305::aead::{AeadInPlace, KeyInit};
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    nonce_bytes.copy_from_slice(&wrapped[..NONCE_LEN]);
+    let mut nonce_bytes = [0u8; WRAP_NONCE_LEN];
+    nonce_bytes.copy_from_slice(&wrapped[..WRAP_NONCE_LEN]);
     let mut buf = [0u8; 32];
-    buf.copy_from_slice(&wrapped[NONCE_LEN..NONCE_LEN + 32]);
+    buf.copy_from_slice(&wrapped[WRAP_NONCE_LEN..WRAP_NONCE_LEN + 32]);
     let mut tag = [0u8; TAG_LEN];
-    tag.copy_from_slice(&wrapped[NONCE_LEN + 32..]);
+    tag.copy_from_slice(&wrapped[WRAP_NONCE_LEN + 32..]);
 
     let cipher = chacha20poly1305::ChaCha20Poly1305::new(master.into());
     cipher
@@ -353,7 +782,6 @@ pub fn unwrap_key(master: &[u8; 32], wrapped: &[u8; WRAPPED_KEY_LEN]) -> Result<
         .map_err(|_| Error::Decrypt { page: 0 })?;
     Ok(buf)
 }
-
 #[cfg(all(test, feature = "encryption"))]
 mod tests {
     use super::*;
@@ -367,169 +795,83 @@ mod tests {
 
     /// Parametrizado por algoritmo (ronda de revisión posterior a la
     /// primera entrega, hallazgo MEDIUM): sin esto, `--features aes`
-    /// compilaba el backend AES-GCM pero ninguna prueba lo instanciaba de
-    /// verdad — cobertura de compilación, no de ejecución. `opts` (más
-    /// abajo) sigue siendo ChaCha20-Poly1305 para las pruebas que no
-    /// necesitan variar el algoritmo; las pruebas específicas de AES-GCM
-    /// usan `opts_with` directamente.
+    /// compilaba el backend AES pero ninguna prueba lo instanciaba de
+    /// verdad — cobertura de compilación, no de ejecución.
     fn opts_with(key: [u8; 32], algorithm: Algorithm) -> Options {
         Options { encryption: Some(Encryption { key, algorithm }), ..Options::default() }
     }
 
     fn opts(key: [u8; 32]) -> Options {
-        opts_with(key, Algorithm::ChaCha20Poly1305)
+        opts_with(key, Algorithm::XChaCha20Poly1305)
     }
 
-    /// Una escritura física tal como llegó al medio: offset y bytes
-    /// completos.
-    type PhysWrite = (u64, Vec<u8>);
+    /// **Todos los algoritmos compilados, no solo el de por defecto.** El
+    /// cambio a nonces aleatorios toca a los dos por igual —cambia el
+    /// nonce, el reparto prefijo/contador, los datos asociados y el
+    /// formato de página— así que las pruebas de esta ronda recorren esta
+    /// lista en vez de fijar ChaCha y dejar AES con un puñado de casos
+    /// aparte, que era la situación anterior (3 pruebas de AES contra la
+    /// suite entera de ChaCha).
+    ///
+    /// Sin `--features aes` la lista tiene un solo elemento y las mismas
+    /// pruebas siguen valiendo: no hay ninguna rama de prueba que solo
+    /// exista en una configuración.
+    const ALGORITHMS: &[Algorithm] = &[
+        Algorithm::XChaCha20Poly1305,
+        #[cfg(feature = "aes")]
+        Algorithm::Aes256GcmSiv,
+    ];
 
     /// Todas las pruebas de este módulo usan `Options::default()`
     /// (`page_size` 512, meta A siempre en la página 1, meta B en la 2
-    /// hasta que `relocate_meta_b` la traslada a la 8 — ver `opts_with` y
-    /// `is_meta_offset_at`, justo abajo).
+    /// hasta que `relocate_meta_b` la traslada a la 8).
     const TEST_PAGE_SIZE: u64 = 512;
 
-    /// Offsets que corresponden a una ranura de meta EN CUALQUIERA de sus
-    /// posiciones posibles (tarea 18): la meta B vive en la página `2`
-    /// hasta que el fichero crece más allá de 4 KB, y en su destino final
-    /// —la `8`, con `TEST_PAGE_SIZE` de 512 B; misma fórmula que
-    /// `WriteTxn::final_meta_b_page` en `tx.rs`— desde entonces. Nunca las
-    /// dos posiciones a la vez, pero sí las dos en algún momento de la vida
-    /// del fichero si la prueba llega a cruzar los 4 KB, así que las dos
-    /// cuentan siempre — no solo la que esté activa ahora mismo.
-    ///
-    /// Antes de esta ronda (autorrevisión de la tarea 18) esto era un
-    /// simple SUELO (`first_data_page`, la primera página que ya no podía
-    /// ser meta): válido mientras la meta B era estática desde la
-    /// creación, pero con la reubicación las páginas `3..8` son datos
-    /// legítimos DESDE EL PRINCIPIO, así que un suelo en la `9` las
-    /// contaba erróneamente como "todavía no hay datos" — el auditor de
-    /// nonces veía cero páginas selladas en una base que sí las tenía
-    /// (`every_sync_policy_survives_a_torn_meta_write_at_every_point`). Ni
-    /// la meta A ni la B pasan nunca por `write_encrypted` (ver el
-    /// comentario de `wrap_key`), así que la comprobación correcta es
-    /// justo la contraria: excluir estos offsets concretos, no poner un
-    /// suelo.
-    ///
-    /// **La posición INICIAL de la meta B (`meta_b_initial`, offset 1024)
-    /// deja de ser meta en cuanto la reubicación se confirma** — ronda de
-    /// revisión posterior a la corrección del hallazgo HIGH:
-    /// `WriteTxn::relocate_meta_b` la libera de verdad (`self.free`,
-    /// `tx.rs`) una vez completa, y a partir de ahí puede reciclarse como
-    /// una página de datos normal — `free_subtree_accepts_a_child_at_the_old_meta_b_page_once_it_has_been_recycled`
-    /// (`tree.rs`) construye exactamente ese caso. Tratar el offset 1024
-    /// como meta PARA SIEMPRE, sin importar cuándo ocurrió cada escritura,
-    /// tenía dos consecuencias: una escritura sellada legítima que
-    /// aterrizara ahí después de reciclarse quedaba excluida del auditor de
-    /// nonces (podía esconder una reutilización real), y
-    /// `simulate_power_loss` la revertía como si fuera una ranura de meta
-    /// en vez de tratarla como cualquier otra página de datos (que este
-    /// arnés modela como "llegada sin condición" — ver su comentario). La
-    /// meta A (1024... la 512) y la posición FINAL de la meta B (4096)
-    /// nunca se reciclan (`skip_meta_b_target` en `tx.rs` las reserva para
-    /// siempre), así que esas dos siguen siendo meta incondicionalmente.
-    ///
-    /// `idx` es la posición de esta escritura dentro de la lista completa
-    /// (`writes`, en orden); `relocated_at`, si existe, es el índice de la
-    /// primera escritura de cabecera (principal o espejo) que confirma la
-    /// reubicación — ver `relocation_completed_at`. Una escritura al offset
-    /// 1024 EN O ANTES de ese índice es meta; después, dato.
-    fn is_meta_offset_at(o: u64, idx: usize, relocated_at: Option<usize>) -> bool {
-        let meta_a = TEST_PAGE_SIZE;
-        let meta_b_initial = 2 * TEST_PAGE_SIZE;
-        let meta_b_final = core::cmp::max(2, 4096 / TEST_PAGE_SIZE) * TEST_PAGE_SIZE;
-        if o == meta_a || o == meta_b_final {
-            return true;
-        }
-        if o == meta_b_initial {
-            return match relocated_at {
-                Some(cutoff) => idx <= cutoff,
-                None => true,
-            };
-        }
-        false
-    }
-
-    /// Índice, dentro de `writes`, de la primera escritura de cabecera
-    /// (principal, offset `0`, o espejo, `HEADER_MIRROR_OFFSET`) cuyo
-    /// contenido decodifica con `meta_b_page` ya en su destino final — la
-    /// señal más temprana posible de que la reubicación se confirmó de
-    /// verdad (no una escritura desgarrada: esas miden menos de
-    /// `HEADER_SIZE` y no decodifican, así que no cuentan). `None` si la
-    /// reubicación nunca llegó a confirmarse en esta corrida.
-    fn relocation_completed_at(writes: &[PhysWrite]) -> Option<usize> {
-        let target_meta_b_page = (core::cmp::max(2, 4096 / TEST_PAGE_SIZE)) as u32;
-        writes.iter().position(|(o, b)| {
-            (*o == 0 || *o == crate::header::HEADER_MIRROR_OFFSET)
-                && b.len() == crate::header::HEADER_SIZE
-                && <&[u8; crate::header::HEADER_SIZE]>::try_from(b.as_slice())
-                    .ok()
-                    .and_then(|arr| crate::header::Geometry::decode(arr).ok())
-                    .is_some_and(|g| g.meta_b_page == target_meta_b_page)
-        })
-    }
-
-    /// `(página, contador, texto cifrado)` de cada escritura que de verdad
-    /// pasó por `Pager::write_encrypted`. El contador viaja en claro en los
-    /// ocho primeros bytes de una página sellada (ver `seal`), así que el
-    /// par `(página, contador)` ES el nonce, leído del fichero igual que lo
-    /// leería un atacante.
-    fn sealed_writes(writes: &[PhysWrite]) -> Vec<(PageNo, u64, &[u8])> {
-        let relocated_at = relocation_completed_at(writes);
-        writes
-            .iter()
-            .enumerate()
-            .filter(|(idx, (o, b))| {
-                *o > 0 && !is_meta_offset_at(*o, *idx, relocated_at) && b.len() == TEST_PAGE_SIZE as usize
-            })
-            .map(|(_, w)| w)
-            .map(|(o, b)| {
-                let page = (*o / TEST_PAGE_SIZE) as PageNo;
-                let counter = u64::from_le_bytes(b[..8].try_into().unwrap());
-                (page, counter, &b[CIPHER_PREFIX..])
-            })
-            .collect()
-    }
-
-    /// Porcentaje de bytes CERO del XOR de dos textos cifrados. Es el
-    /// detector que pide la tercera ronda de revisión, y no es una
-    /// heurística: con el mismo nonce y la misma clave, el flujo de clave
-    /// es idéntico, así que `C1 XOR C2 == P1 XOR P2` — y dos páginas de
-    /// este motor comparten casi todos sus bytes (relleno a cero, misma
-    /// cabecera de página), de modo que ese XOR sale casi todo ceros. Con
-    /// nonces distintos el XOR es de dos flujos de clave independientes:
-    /// un byte cero cae con probabilidad 1/256, ~0,39 %.
+    /// Porcentaje de bytes CERO del XOR de dos textos cifrados. No es una
+    /// heurística: con el mismo nonce y la misma clave bajo un cifrado de
+    /// flujo, el flujo de clave es idéntico, así que `C1 XOR C2 == P1 XOR
+    /// P2` — y dos páginas de este motor comparten casi todos sus bytes
+    /// (relleno a cero, misma cabecera de página), de modo que ese XOR sale
+    /// casi todo ceros. Con nonces distintos el XOR es de dos flujos
+    /// independientes: un byte cero cae con probabilidad 1/256, ~0,39 %.
     fn xor_zero_pct(a: &[u8], b: &[u8]) -> f64 {
         let n = core::cmp::min(a.len(), b.len());
         let zeros = (0..n).filter(|&i| a[i] ^ b[i] == 0).count();
         100.0 * zeros as f64 / n as f64
     }
 
-    /// Veredicto sobre TODAS las escrituras selladas de una corrida.
+    /// Veredicto sobre TODOS los sellados que `crypto::seal` produjo
+    /// durante una captura.
     #[derive(Debug)]
     struct NonceAudit {
-        /// Escrituras que pasaron por `write_encrypted`.
+        /// Llamadas a `seal` observadas.
         sealed: usize,
-        /// Nonces `(página, contador)` usados por más de una escritura.
+        /// Nonces usados por más de un sellado.
         reused_nonces: usize,
         /// El peor par con nonce repetido, si lo hay: porcentaje de bytes
         /// cero de `C1 XOR C2`.
         worst_xor_zero_pct: f64,
+        /// Las dos páginas de ese peor par.
+        worst_pages: Option<(PageNo, PageNo)>,
         /// Línea base sobre pares con nonces DISTINTOS, para contrastar.
         baseline_xor_zero_pct: f64,
     }
 
-    fn audit_nonces(writes: &[PhysWrite]) -> NonceAudit {
-        let sealed = sealed_writes(writes);
-        let mut by_nonce: alloc::collections::BTreeMap<(PageNo, u64), Vec<&[u8]>> =
-            alloc::collections::BTreeMap::new();
-        for (page, counter, ct) in &sealed {
-            by_nonce.entry((*page, *counter)).or_default().push(ct);
+    /// Audita lo capturado. A diferencia del auditor anterior a este
+    /// cambio, no deduce nada de las escrituras físicas ni necesita saber
+    /// qué offsets son meta: recibe los nonces que `seal` usó de verdad.
+    fn audit(sealed: &[probe::Sealed]) -> NonceAudit {
+        let mut by_nonce: alloc::collections::BTreeMap<
+            [u8; STORED_NONCE_LEN],
+            Vec<(PageNo, &[u8])>,
+        > = alloc::collections::BTreeMap::new();
+        for s in sealed {
+            by_nonce.entry(s.nonce).or_default().push((s.page, &s.ciphertext));
         }
 
         let mut reused = 0usize;
         let mut worst = 0.0f64;
+        let mut worst_pages = None;
         for texts in by_nonce.values() {
             if texts.len() < 2 {
                 continue;
@@ -537,17 +879,23 @@ mod tests {
             reused += 1;
             for i in 0..texts.len() {
                 for j in i + 1..texts.len() {
-                    worst = worst.max(xor_zero_pct(texts[i], texts[j]));
+                    let pct = xor_zero_pct(texts[i].1, texts[j].1);
+                    if pct > worst {
+                        worst = pct;
+                        // Las páginas concretas, no solo el porcentaje: al
+                        // depurar una reutilización lo primero que hace
+                        // falta es saber QUÉ dos escrituras chocaron.
+                        worst_pages = Some((texts[i].0, texts[j].0));
+                    }
                 }
             }
         }
 
-        // Línea base: pares consecutivos con nonces distintos.
         let mut base_sum = 0.0f64;
         let mut base_n = 0usize;
         for w in sealed.windows(2) {
-            if (w[0].0, w[0].1) != (w[1].0, w[1].1) {
-                base_sum += xor_zero_pct(w[0].2, w[1].2);
+            if w[0].nonce != w[1].nonce {
+                base_sum += xor_zero_pct(&w[0].ciphertext, &w[1].ciphertext);
                 base_n += 1;
             }
         }
@@ -556,8 +904,39 @@ mod tests {
             sealed: sealed.len(),
             reused_nonces: reused,
             worst_xor_zero_pct: worst,
+            worst_pages,
             baseline_xor_zero_pct: if base_n == 0 { 0.0 } else { base_sum / base_n as f64 },
         }
+    }
+
+    /// Comprobación que hacen TODAS las pruebas que capturan: cero nonces
+    /// repetidos, y al menos un sellado observado.
+    ///
+    /// El segundo `assert` no es decoración: sin él, cualquier cambio que
+    /// dejara de sellar —o de capturar— haría pasar "cero nonces
+    /// repetidos" sin haber mirado una sola página, que es exactamente el
+    /// modo de fallo silencioso que este arnés existe para no tener.
+    fn assert_no_reuse(sealed: &[probe::Sealed], context: &str) -> NonceAudit {
+        let a = audit(sealed);
+        assert!(a.sealed > 0, "{context}: no se capturo ningun sellado: {a:?}");
+        assert_eq!(
+            a.reused_nonces, 0,
+            "{context}: nonce reutilizado ({} nonces afectados, {} sellados en total); \
+             el peor par son las paginas {:?}, con un {:.2} % de bytes cero en el XOR de sus \
+             textos cifrados — linea base con nonces distintos: {:.2} %",
+            a.reused_nonces,
+            a.sealed,
+            a.worst_pages,
+            a.worst_xor_zero_pct,
+            a.baseline_xor_zero_pct
+        );
+        a
+    }
+
+    /// Los nonces de una captura, como conjunto: lo que hace falta para
+    /// comprobar que dos líneas temporales no comparten ninguno.
+    fn nonce_set(sealed: &[probe::Sealed]) -> alloc::collections::BTreeSet<[u8; STORED_NONCE_LEN]> {
+        sealed.iter().map(|s| s.nonce).collect()
     }
 
     /// Permite conservar el medio tras cerrar la base, para reabrirla. Cada
@@ -572,473 +951,780 @@ mod tests {
         fn len(&self) -> Result<u64> { self.0.len() }
     }
 
-    /// Envuelve `MemStorage` y guarda el par `(offset, primeros 8 bytes
-    /// escritos)` de cada escritura — exactamente `(página, contador de
-    /// nonce)` para cualquier página que pase por `Pager::write_encrypted`
-    /// (el contador va en claro en los primeros 8 bytes de una página
-    /// cifrada, ver `CIPHER_PREFIX`). Es la instrumentación central de
-    /// `no_nonce_is_ever_reused`.
-    ///
-    /// **Historia (ronda de revisión posterior a la primera entrega):** la
-    /// primera versión de esta prueba hacía UNA `put` por transacción, 200
-    /// veces. Con el nonce derivado de `page || txn_id` (el diseño
-    /// original), eso nunca puede colisionar — cada transacción tiene su
-    /// propio `txn_id` — así que la prueba pasaba sin ejercitar el caso
-    /// real: `WriteTxn::alloc` recicla `own_free` (páginas que la MISMA
-    /// transacción asignó y liberó ella misma, tarea 12) dentro de una
-    /// única transacción, y una carga con varias `put` en una sola
-    /// transacción reescribe la MISMA página muchas veces con el MISMO
-    /// `txn_id` — 121 veces la página 9 sobre 200 `put`s en una transacción,
-    /// medido. El nonce ahora se deriva de un contador monótono por
-    /// escritura (`page || contador`, nunca `txn_id`), así que el mismo
-    /// escenario ya no colisiona — ver el comentario de `nonce` y de
-    /// `Db::extend_counter_ceiling` en `tx.rs`.
-    struct RecordingStorage {
-        inner: MemStorage,
-        writes: Mutex<Vec<PhysWrite>>,
-    }
-
-    impl RecordingStorage {
-        fn new() -> Self {
-            Self { inner: MemStorage::new(), writes: Mutex::new(Vec::new()) }
-        }
-
-        /// Escrituras físicas completas (offset y TODOS los bytes), no solo
-        /// los ocho primeros (tercera ronda de revisión): el detector
-        /// estadístico `audit_nonces` necesita el texto cifrado entero para
-        /// poder xorear dos sellados que compartan nonce — el par
-        /// `(offset, contador)` prueba que el nonce se repitió, pero es el
-        /// XOR el que demuestra qué se pierde cuando eso pasa.
-        fn raw_writes(&self) -> Vec<PhysWrite> {
-            self.writes.lock().unwrap().clone()
-        }
-
-        /// Solo los pares que de verdad representan `(página, contador de
-        /// nonce)`, descartando cabecera y meta-ranuras (ronda de revisión
-        /// posterior a la primera entrega: los pares de `self.writes` sin
-        /// filtrar hacían fallar esta prueba por una razón que NO es un
-        /// nonce repetido).
-        ///
-        /// `Db::extend_counter_ceiling`/`WriteTxn::commit` escriben
-        /// ranuras de meta con el MISMO `txn_id` en claro en sus primeros
-        /// 8 bytes (`Meta::encode` los pone ahí,
-        /// nada que ver con el contador de nonce: la meta nunca pasa por
-        /// `write_encrypted`, ver el comentario de `wrap_key`). Eso
-        /// produce, a propósito, un `(offset, primeros 8 bytes)` repetido
-        /// por transacción que NO es un fallo de seguridad — no hay ningún
-        /// nonce de por medio — pero sí lo detectaría un `dedup` que no
-        /// distinguiera meta de datos. `is_meta_offset_at` (tarea 18,
-        /// autorrevisión: sustituye el suelo `meta_b_page + 1` de antes,
-        /// que asumía la meta B estática desde la creación — ver su
-        /// comentario) excluye las ranuras de meta EN CUALQUIERA de sus
-        /// posiciones posibles, no solo las páginas por debajo de un suelo
-        /// fijo — y, desde la ronda de revisión posterior a la corrección
-        /// del hallazgo HIGH, solo mientras la posición inicial de la meta
-        /// B siga siéndolo de verdad (ver su comentario): opera sobre
-        /// `self.writes` directamente, no sobre `self.nonces()`, porque
-        /// necesita el ÍNDICE de cada escritura dentro de la lista para
-        /// saber si ocurrió antes o después de que la reubicación se
-        /// confirmara.
-        fn encrypted_page_nonces(&self) -> Vec<(u64, [u8; 8])> {
-            let writes = self.writes.lock().unwrap();
-            let relocated_at = relocation_completed_at(&writes);
-            writes
-                .iter()
-                .enumerate()
-                .filter(|(idx, (o, _))| *o > 0 && !is_meta_offset_at(*o, *idx, relocated_at))
-                .map(|(_, (o, b))| {
-                    let mut first8 = [0u8; 8];
-                    first8.copy_from_slice(&b[..8]);
-                    (*o, first8)
-                })
-                .collect()
-        }
-    }
-
-    impl Storage for RecordingStorage {
-        fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> {
-            self.inner.read_at(o, b)
-        }
-
-        fn write_at(&self, o: u64, b: &[u8]) -> Result<()> {
-            // Toda escritura real de este motor mide al menos una página
-            // (>= `MIN_PAGE_SIZE` = 512) salvo la cabecera (64 bytes): nunca
-            // menos de 8. El guard es solo defensivo, para no entrar en
-            // pánico si algún día deja de ser cierto.
-            if b.len() >= 8 {
-                self.writes.lock().unwrap().push((o, b.to_vec()));
-            }
-            self.inner.write_at(o, b)
-        }
-
-        fn sync(&self) -> Result<()> { self.inner.sync() }
-        fn len(&self) -> Result<u64> { self.inner.len() }
-    }
-
-    struct ArcRecording(Arc<RecordingStorage>);
-    impl Storage for ArcRecording {
-        fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> { self.0.read_at(o, b) }
-        fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
-        fn sync(&self) -> Result<()> { self.0.sync() }
-        fn len(&self) -> Result<u64> { self.0.len() }
-    }
-
     #[test]
     fn data_roundtrips_through_encryption() {
-        let db = Db::create(Box::new(MemStorage::new()), opts([1; 32])).unwrap();
-        let mut tx = db.begin_write().unwrap();
-        tx.put(0x01, b"secreto", b"valor").unwrap();
-        tx.commit().unwrap();
-        assert_eq!(db.begin_read().get(0x01, b"secreto").unwrap().as_deref(), Some(b"valor".as_slice()));
+        for &algorithm in ALGORITHMS {
+            let db =
+                Db::create(Box::new(MemStorage::new()), opts_with([1; 32], algorithm)).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"secreto", b"valor").unwrap();
+            tx.commit().unwrap();
+            assert_eq!(
+                db.begin_read().get(0x01, b"secreto").unwrap().as_deref(),
+                Some(b"valor".as_slice()),
+                "{algorithm:?}"
+            );
+        }
     }
 
-    /// Autorrevisión (ronda propia, no del brief): las 187 pruebas
-    /// existentes de `tree.rs`/`tx.rs` no se pueden correr tal cual con
-    /// cifrado activo — varias construyen páginas A MANO al tamaño físico
-    /// exacto (`tree.rs::raw_overflow_page` y compañía), y cambiar el
-    /// tamaño de página a mitad de esas pruebas las rompería por una razón
-    /// ajena a esta tarea. Esta prueba es el sustituto deliberado: el mismo
-    /// TIPO de carga que esas — muchas inserciones que fuerzan divisiones
-    /// de nodo, un valor por encima del umbral de overflow, borrados
-    /// intercalados — pero pasando siempre por `Options.encryption =
-    /// Some(...)`, que es exactamente donde se manifestaría un
-    /// `page_size()` olvidado en vez de `logical_page_size()`: o
-    /// `PageBuilder` construiría páginas "lógicas" de 512 B que, tras
-    /// sellar, medirían 536 B físicos — reventando el
-    /// `debug_assert_eq!` de `Pager::write` en cuanto se compila en modo
-    /// debug — o el límite de tamaño de clave (`logical_page_size / 4`)
-    /// aceptaría una clave que de verdad no cabe en la página que se
-    /// termina construyendo.
+    /// Autorrevisión (ronda propia, no del brief): las pruebas existentes
+    /// de `tree.rs`/`tx.rs` no se pueden correr tal cual con cifrado activo
+    /// — varias construyen páginas A MANO al tamaño físico exacto
+    /// (`tree.rs::raw_overflow_page` y compañía), y cambiar el tamaño de
+    /// página a mitad de esas pruebas las rompería por una razón ajena a
+    /// esta tarea. Esta prueba es el sustituto deliberado: el mismo TIPO de
+    /// carga que esas — muchas inserciones que fuerzan divisiones de nodo,
+    /// un valor por encima del umbral de overflow, borrados intercalados —
+    /// pero pasando siempre por `Options.encryption = Some(...)`, que es
+    /// exactamente donde se manifestaría un `page_size()` olvidado en vez
+    /// de `logical_page_size()`: o `PageBuilder` construiría páginas
+    /// "lógicas" de 512 B que, tras sellar, medirían 552 B físicos —
+    /// reventando el `debug_assert_eq!` de `Pager::write` en cuanto se
+    /// compila en modo debug — o el límite de tamaño de clave
+    /// (`logical_page_size / 4`) aceptaría una clave que de verdad no cabe
+    /// en la página que se termina construyendo.
+    ///
+    /// Las dos cifras subieron con el cambio a nonces aleatorios (el
+    /// prefijo de cifrado pasó de 24 a 40 bytes): la página física de una
+    /// lógica de 512 B mide ahora 552, y el límite de clave con páginas de
+    /// 512 B es `472 / 4 = 118`, no `488 / 4 = 122`.
     #[test]
     fn a_large_encrypted_workload_round_trips_through_splits_and_overflow() {
-        let db = Db::create(Box::new(MemStorage::new()), opts([7; 32])).unwrap();
+        for &algorithm in ALGORITHMS {
+            let db =
+                Db::create(Box::new(MemStorage::new()), opts_with([7; 32], algorithm)).unwrap();
 
-        let mut tx = db.begin_write().unwrap();
-        for i in 0..300u32 {
-            let value = alloc::vec![(i % 251) as u8; 20];
-            tx.put(0x01, &i.to_be_bytes(), &value).unwrap();
-        }
-        // Por encima de `overflow_threshold(logical_page_size)` — con
-        // cifrado y página de 512 B, 488 / 4 = 122 — para forzar una cadena
-        // de overflow real construida a tamaño lógico.
-        let big = alloc::vec![0xabu8; 300];
-        tx.put(0x01, b"grande", &big).unwrap();
-        // Borrados intercalados: ejercitan `free_overflow`/`emit`
-        // reconstruyendo hojas ya existentes, no solo insertando en unas
-        // nuevas.
-        for i in (0..300u32).step_by(3) {
-            tx.delete(0x01, &i.to_be_bytes()).unwrap();
-        }
-        tx.commit().unwrap();
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..300u32 {
+                let value = alloc::vec![(i % 251) as u8; 20];
+                tx.put(0x01, &i.to_be_bytes(), &value).unwrap();
+            }
+            // Por encima de `overflow_threshold(logical_page_size)` — con
+            // cifrado y página de 512 B, 472 / 4 = 118 — para forzar una
+            // cadena de overflow real construida a tamaño lógico.
+            let big = alloc::vec![0xabu8; 300];
+            tx.put(0x01, b"grande", &big).unwrap();
+            // Borrados intercalados: ejercitan `free_overflow`/`emit`
+            // reconstruyendo hojas ya existentes, no solo insertando en unas
+            // nuevas.
+            for i in (0..300u32).step_by(3) {
+                tx.delete(0x01, &i.to_be_bytes()).unwrap();
+            }
+            tx.commit().unwrap();
 
-        let r = db.begin_read();
-        for i in 0..300u32 {
-            let expected = if i % 3 == 0 { None } else { Some(alloc::vec![(i % 251) as u8; 20]) };
-            assert_eq!(r.get(0x01, &i.to_be_bytes()).unwrap(), expected, "clave {i}");
-        }
-        assert_eq!(r.get(0x01, b"grande").unwrap(), Some(big));
+            let r = db.begin_read();
+            for i in 0..300u32 {
+                let expected =
+                    if i % 3 == 0 { None } else { Some(alloc::vec![(i % 251) as u8; 20]) };
+                assert_eq!(r.get(0x01, &i.to_be_bytes()).unwrap(), expected, "{algorithm:?} clave {i}");
+            }
+            assert_eq!(r.get(0x01, b"grande").unwrap(), Some(big));
 
-        let mut cursor = r.scan(0x01, &0u32.to_be_bytes(), &300u32.to_be_bytes()).unwrap();
-        let mut count = 0u32;
-        while cursor.next().unwrap().is_some() {
-            count += 1;
+            let mut cursor = r.scan(0x01, &0u32.to_be_bytes(), &300u32.to_be_bytes()).unwrap();
+            let mut count = 0u32;
+            while cursor.next().unwrap().is_some() {
+                count += 1;
+            }
+            assert_eq!(
+                count, 200,
+                "{algorithm:?}: 200 de las 300 claves deberian sobrevivir al borrado de una de cada tres"
+            );
         }
-        assert_eq!(count, 200, "200 de las 300 claves deberían sobrevivir al borrado de una de cada tres");
     }
 
-    /// Autorrevisión: `no_nonce_is_ever_reused` (más abajo) comprueba una
-    /// propiedad de CAJA NEGRA sobre el patrón de escrituras — que el par
-    /// `(offset, primeros 8 bytes)` nunca se repite — pero eso por sí solo
-    /// NO demuestra que `nonce(page, counter)` de verdad combine los dos
-    /// valores al derivar el nonce real que ve el cifrador: cifrado y
-    /// descifrado son simétricos entre sí (usan la misma función en los dos
-    /// sentidos), así que un `nonce` roto que aun así fuera determinista
-    /// deja el roundtrip funcional en verde. Es exactamente el "test que
-    /// pasa por la razón equivocada" que pide evitar el brief.
+    /// El reparto EXACTO de bytes del nonce, por algoritmo. Sustituye a
+    /// `nonce_is_exactly_page_then_counter_little_endian`, que fijaba la
+    /// representación del nonce derivado anterior.
     ///
-    /// Primera versión de esta prueba (ronda de revisión posterior a la
-    /// primera entrega, hallazgo HIGH): solo comprobaba `!=` en un puñado de
-    /// puntos — "página distinta cambia el nonce", "contador distinto
-    /// cambia el nonce". Insuficiente: la revisión construyó cinco
-    /// `nonce()` alternativas que PASABAN esa comprobación (cambiaban ANTE
-    /// el punto de prueba elegido) sin ser inyectivas — cuatro de ellas
-    /// romperían la unicidad en producción:
-    /// - página truncada a un byte (`1` y `257` colisionan),
-    /// - contador truncado a `u32` (`counter=1` y `counter=2^32+1` colisionan),
-    /// - campos solapados en la escritura de los 12 bytes,
-    /// - `counter XOR page` en vez de concatenación (`(1,100)` y `(0,101)` colisionan).
-    ///
-    /// Esta versión comprueba la representación EXACTA (no solo "cambia
-    /// algo") y un barrido de inyectividad denso más uno disperso en las
-    /// fronteras de `u32`/`u64` y del posible solape de bytes.
+    /// **Por qué comprobar la representación y no solo "cambia algo".** El
+    /// mismo argumento que aquella prueba: cifrar y descifrar usan la MISMA
+    /// derivación en los dos sentidos, así que un reparto roto pero
+    /// determinista deja el roundtrip funcional en verde. Aquí, además, hay
+    /// un modo de fallo nuevo y peor: un reparto que le diera al contador
+    /// bytes que pisaran el prefijo, o que dejara el prefijo fuera del
+    /// nonce, produciría nonces que se repiten entre aperturas sin que
+    /// ninguna prueba de una sola apertura lo note.
     #[test]
-    fn nonce_is_exactly_page_then_counter_little_endian() {
-        let page: PageNo = 0x0102_0304;
-        let counter: u64 = 0x1122_3344_5566_7788;
-        let mut expected = [0u8; NONCE_LEN];
-        expected[..4].copy_from_slice(&page.to_le_bytes());
-        expected[4..].copy_from_slice(&counter.to_le_bytes());
-        assert_eq!(nonce(page, counter), expected);
+    fn the_nonce_is_exactly_prefix_then_counter() {
+        let prefix: [u8; NONCE_PREFIX_LEN] = core::array::from_fn(|i| 0xa0 | i as u8);
+
+        // XChaCha20-Poly1305: 16 de prefijo, 8 de contador, los 24 usados.
+        let mut s = NonceStream::from_prefix(prefix);
+        assert_eq!(s.issued(), 0);
+        let n0 = s.next(Algorithm::XChaCha20Poly1305).unwrap();
+        assert_eq!(&n0[..NONCE_PREFIX_LEN], &prefix[..]);
+        assert_eq!(&n0[NONCE_PREFIX_LEN..], &0u64.to_le_bytes()[..]);
+        assert_eq!(s.issued(), 1);
+        let n1 = s.next(Algorithm::XChaCha20Poly1305).unwrap();
+        assert_eq!(&n1[..NONCE_PREFIX_LEN], &prefix[..], "el prefijo no cambia dentro de la apertura");
+        assert_eq!(&n1[NONCE_PREFIX_LEN..], &1u64.to_le_bytes()[..]);
+
+        // AES-256-GCM-SIV: 8 de prefijo, 4 de contador, y los 12 restantes
+        // del campo almacenado a cero — no basura, porque entran en los
+        // datos asociados y tienen que ser reproducibles.
+        let mut s = NonceStream::from_prefix(prefix);
+        let n0 = s.next(Algorithm::Aes256GcmSiv).unwrap();
+        assert_eq!(&n0[..AES_PREFIX_LEN], &prefix[..AES_PREFIX_LEN]);
+        assert_eq!(&n0[AES_PREFIX_LEN..AES_NONCE_LEN], &0u32.to_le_bytes()[..]);
+        assert_eq!(&n0[AES_NONCE_LEN..], &[0u8; STORED_NONCE_LEN - AES_NONCE_LEN][..]);
+        let n1 = s.next(Algorithm::Aes256GcmSiv).unwrap();
+        assert_eq!(&n1[AES_PREFIX_LEN..AES_NONCE_LEN], &1u32.to_le_bytes()[..]);
     }
 
+    /// Inyectividad del flujo dentro de una apertura: un barrido denso más
+    /// uno disperso en las fronteras de representación de cada campo.
+    ///
+    /// El barrido disperso es el que de verdad importa aquí: colocar el
+    /// contador en `issued` sin más y truncarlo al ancho del campo es
+    /// correcto solo mientras el prefijo se renueve al desbordar, y esta
+    /// prueba llega hasta esa frontera (2^32 para AES) por el camino
+    /// barato — fijando `issued` a mano — en vez de con cuatro mil
+    /// millones de escrituras reales.
     #[test]
-    fn nonce_is_injective_over_page_and_counter() {
-        // Barrido denso: cubre, entre otras, la colisión de "página
-        // truncada a un byte" (1 y 257 caen dentro del rango) y la de
-        // "counter XOR page" ((1,100) y (0,101) también).
-        let mut seen = alloc::collections::BTreeSet::new();
-        for page in 0..260u32 {
-            for counter in 0..60u64 {
+    fn the_nonce_stream_is_injective_within_an_open() {
+        for &algorithm in &[Algorithm::XChaCha20Poly1305, Algorithm::Aes256GcmSiv] {
+            let mut s = NonceStream::from_prefix([0x5a; NONCE_PREFIX_LEN]);
+            let mut seen = alloc::collections::BTreeSet::new();
+            for i in 0..4000u32 {
                 assert!(
-                    seen.insert(nonce(page, counter)),
-                    "colision en el barrido denso: page={page} counter={counter}"
+                    seen.insert(s.next(algorithm).unwrap()),
+                    "{algorithm:?}: nonce repetido en el barrido denso, escritura {i}"
                 );
             }
         }
+    }
 
-        // Barrido disperso en las fronteras de representación: cubre la
-        // colisión de "contador truncado a u32" (necesita counter ~ 2^32,
-        // fuera del barrido denso) y cualquier solape de bytes en los
-        // límites de `page` (bit 24) o `counter` (bits 32/63).
-        let mut seen_sparse = alloc::collections::BTreeSet::new();
-        let pages = [0u32, 1, 2, 1 << 24, (1 << 24) + 1, u32::MAX - 1, u32::MAX];
-        let counters = [0u64, 1, 2, 1 << 24, 1u64 << 32, (1u64 << 32) + 1, u64::MAX];
-        for &page in &pages {
-            for &counter in &counters {
-                assert!(
-                    seen_sparse.insert(nonce(page, counter)),
-                    "colision en el barrido disperso: page={page} counter={counter}"
-                );
-            }
-        }
+    /// **El agotamiento del campo de contador de AES renueva el prefijo en
+    /// vez de repetir un nonce.** Es la mitad (b) del razonamiento de
+    /// `NonceStream::next`: con 4 bytes de contador, la escritura 2^32 de
+    /// una misma apertura volvería a empezar en cero.
+    ///
+    /// Llegar ahí de verdad son 4 294 967 296 sellados; esta prueba salta
+    /// hasta el borde con `at_issued_for_test`, que es exactamente el mismo
+    /// estado en el que quedaría el flujo tras esas escrituras.
+    #[test]
+    fn exhausting_the_aes_counter_field_renews_the_prefix_instead_of_repeating() {
+        let prefix = [0x11u8; NONCE_PREFIX_LEN];
+        let mut s = NonceStream::at_issued_for_test(prefix, (1u64 << 32) - 1);
+        let last = s.next(Algorithm::Aes256GcmSiv).unwrap();
+        assert_eq!(&last[..AES_PREFIX_LEN], &prefix[..AES_PREFIX_LEN]);
+        assert_eq!(&last[AES_PREFIX_LEN..AES_NONCE_LEN], &u32::MAX.to_le_bytes()[..]);
 
-        // Los cuatro casos concretos de la revisión, explícitos: si algún
-        // día se cambia `nonce` y uno de estos empieza a fallar, el mensaje
-        // señala directamente cuál de los cinco `nonce()` rotos ha vuelto.
-        assert_ne!(nonce(1, 0), nonce(257, 0), "pagina truncada a un byte");
-        assert_ne!(nonce(1, 1), nonce(1, (1u64 << 32) + 1), "contador truncado a u32");
-        assert_ne!(nonce(1, 100), nonce(0, 101), "contador XOR pagina (o solape de campos equivalente)");
+        // La siguiente vuelve a contador 0 — que es justo lo que repetiría
+        // el nonce si el prefijo no cambiara.
+        let wrapped = s.next(Algorithm::Aes256GcmSiv).unwrap();
+        assert_eq!(&wrapped[AES_PREFIX_LEN..AES_NONCE_LEN], &0u32.to_le_bytes()[..]);
+        assert_ne!(
+            &wrapped[..AES_PREFIX_LEN],
+            &prefix[..AES_PREFIX_LEN],
+            "al desbordar el contador de 32 bits el prefijo TIENE que renovarse: sin eso, \
+             este nonce es identico al primero de la apertura"
+        );
+
+        // Y `issued` no rebobina con la renovación: es lo que hace que la
+        // comprobación defensiva de `WriteTxn::write_page` siga siendo
+        // válida a un lado y otro del desbordamiento.
+        assert_eq!(s.issued(), 1u64 << 32 | 1);
     }
 
     #[test]
     fn plaintext_never_appears_in_the_file() {
-        let s = Arc::new(MemStorage::new());
-        let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), opts([2; 32])).unwrap();
-        let mut tx = db.begin_write().unwrap();
-        tx.put(0x01, b"aguja", b"pajar-secreto-inconfundible").unwrap();
-        tx.commit().unwrap();
-        let bytes = s.snapshot();
-        assert!(
-            !bytes.windows(27).any(|w| w == b"pajar-secreto-inconfundible"),
-            "el valor aparece en claro en el fichero"
-        );
+        for &algorithm in ALGORITHMS {
+            let s = Arc::new(MemStorage::new());
+            let db = Db::create(
+                Box::new(ArcStorage(Arc::clone(&s))),
+                opts_with([2; 32], algorithm),
+            )
+            .unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"aguja", b"pajar-secreto-inconfundible").unwrap();
+            tx.commit().unwrap();
+            let bytes = s.snapshot();
+            assert!(
+                !bytes.windows(27).any(|w| w == b"pajar-secreto-inconfundible"),
+                "{algorithm:?}: el valor aparece en claro en el fichero"
+            );
+        }
     }
 
     #[test]
     fn a_wrong_key_fails_to_decrypt_instead_of_returning_garbage() {
-        let s = Arc::new(MemStorage::new());
-        {
-            let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), opts([3; 32])).unwrap();
-            let mut tx = db.begin_write().unwrap();
-            tx.put(0x01, b"k", b"v").unwrap();
-            tx.commit().unwrap();
+        for &algorithm in ALGORITHMS {
+            let s = Arc::new(MemStorage::new());
+            {
+                let db = Db::create(
+                    Box::new(ArcStorage(Arc::clone(&s))),
+                    opts_with([3; 32], algorithm),
+                )
+                .unwrap();
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, b"k", b"v").unwrap();
+                tx.commit().unwrap();
+            }
+            let db =
+                Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts_with([4; 32], algorithm));
+            assert!(matches!(db, Err(Error::Decrypt { .. })), "{algorithm:?}");
         }
-        let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts([4; 32]));
-        assert!(matches!(db, Err(Error::Decrypt { .. })));
     }
 
     #[test]
     fn a_tampered_page_is_rejected() {
-        let s = Arc::new(MemStorage::new());
-        let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), opts([5; 32])).unwrap();
-        let mut tx = db.begin_write().unwrap();
-        tx.put(0x01, b"k", b"v").unwrap();
-        tx.commit().unwrap();
-        let root = db.begin_read().root();
-        drop(db);
-        // Voltea un byte del texto cifrado de la página raíz.
-        let mut bytes = s.snapshot();
-        bytes[root as usize * 512 + 100] ^= 0xff;
-        s.restore(bytes);
-        let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts([5; 32])).unwrap();
-        assert!(matches!(db.begin_read().get(0x01, b"k"), Err(Error::Decrypt { .. })));
+        for &algorithm in ALGORITHMS {
+            let s = Arc::new(MemStorage::new());
+            let db = Db::create(
+                Box::new(ArcStorage(Arc::clone(&s))),
+                opts_with([5; 32], algorithm),
+            )
+            .unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"k", b"v").unwrap();
+            tx.commit().unwrap();
+            let root = db.begin_read().root();
+            drop(db);
+            // Voltea un byte del texto cifrado de la página raíz.
+            let mut bytes = s.snapshot();
+            bytes[root as usize * 512 + CIPHER_PREFIX + 20] ^= 0xff;
+            s.restore(bytes);
+            let db =
+                Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts_with([5; 32], algorithm))
+                    .unwrap();
+            assert!(
+                matches!(db.begin_read().get(0x01, b"k"), Err(Error::Decrypt { .. })),
+                "{algorithm:?}"
+            );
+        }
     }
 
-    /// **La prueba central de la tarea.** Reescrita tras la ronda de
-    /// revisión posterior a la primera entrega (hallazgo BLOCKER): la
-    /// versión original hacía UNA `put` por transacción, 200 veces — la
-    /// única forma de cargar este motor que NUNCA puebla `own_free`
-    /// (`WriteTxn::alloc`, `tx.rs`) lo bastante como para que una página se
-    /// reescriba dentro de la misma transacción, así que pasaba sin
-    /// ejercitar el caso real. Esta versión hace 200 `put`s dentro de UNA
-    /// sola transacción — el patrón de lote normal de este motor (ver el
-    /// comentario de `alloc` en `tx.rs` sobre por qué `own_free` existe: un
-    /// lote de mil registros asigna del orden de cuatro mil páginas y
-    /// libera casi todas dentro de la misma transacción) — que es
-    /// exactamente donde `own_free` recicla páginas y, con el diseño viejo
-    /// (nonce derivado de `page || txn_id`), las reescribía con el nonce
-    /// repetido.
+    /// **Mover una página sellada a otro número de página se detecta.**
+    ///
+    /// Con el nonce derivado de `página || contador`, esto salía gratis: el
+    /// número de página entraba en el nonce, así que descifrar en otro
+    /// offset usaba otro nonce y fallaba. Al pasar a un nonce ALMACENADO
+    /// esa protección habría desaparecido sin más — los bytes traen su
+    /// propio nonce, así que se descifrarían igual de bien en cualquier
+    /// sitio — si no se metiera el número de página en los datos asociados
+    /// a propósito (`crypto::associated_data`). Esta prueba es lo que
+    /// impide que esa decisión se revierta sin que nadie lo note.
     #[test]
-    fn no_nonce_is_ever_reused() {
-        let s = Arc::new(RecordingStorage::new());
-        let db = Db::create(Box::new(ArcRecording(Arc::clone(&s))), opts([6; 32])).unwrap();
+    fn a_sealed_page_moved_to_another_page_number_is_rejected() {
+        for &algorithm in ALGORITHMS {
+            let s = Arc::new(MemStorage::new());
+            let db = Db::create(
+                Box::new(ArcStorage(Arc::clone(&s))),
+                opts_with([13; 32], algorithm),
+            )
+            .unwrap();
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..60u32 {
+                tx.put(0x01, &i.to_be_bytes(), &[7u8; 60]).unwrap();
+            }
+            tx.commit().unwrap();
+            let root = db.begin_read().root();
+            drop(db);
+
+            // Copia la raíz encima de OTRA página de datos, con todos sus
+            // bytes intactos: nonce, tag y texto cifrado. Lo único que
+            // cambia es dónde vive.
+            let mut bytes = s.snapshot();
+            let victim = (root as usize) + 1;
+            let ps = TEST_PAGE_SIZE as usize;
+            let (src, dst) = (root as usize * ps, victim * ps);
+            let copy: Vec<u8> = bytes[src..src + ps].to_vec();
+            bytes[dst..dst + ps].copy_from_slice(&copy);
+            s.restore(bytes);
+
+            let db = Db::open(
+                Box::new(ArcStorage(Arc::clone(&s))),
+                opts_with([13; 32], algorithm),
+            )
+            .unwrap();
+            // Leer esa página tiene que fallar la autenticación, no
+            // devolver el contenido de la raíz bajo otro número.
+            let seen = db.begin_read().read_page(victim as PageNo);
+            assert!(
+                matches!(seen, Err(Error::Decrypt { .. })),
+                "{algorithm:?}: una pagina sellada movida a otro numero se descifro limpia: {seen:?}"
+            );
+        }
+    }
+
+    /// **Ningún byte físico de una página cifrada queda fuera del tag.**
+    ///
+    /// El campo de nonce mide 24 B para los dos algoritmos, pero
+    /// AES-256-GCM-SIV solo usa 12: los otros 12 son relleno. Si el relleno
+    /// no entrara en los datos asociados, sería una región de cada página
+    /// del fichero que cualquiera puede cambiar sin que la autenticación se
+    /// entere — no explotable de forma obvia, pero sí exactamente el tipo
+    /// de hueco que nadie quiere descubrir después. Esta prueba toca
+    /// también un byte del nonce PROPIAMENTE dicho, que fallaría de todas
+    /// formas, para que el caso interesante no dependa de leer bien el
+    /// mensaje de fallo.
+    #[test]
+    fn tampering_with_any_byte_of_the_stored_nonce_is_rejected() {
+        for &algorithm in ALGORITHMS {
+            for at in [0usize, AES_NONCE_LEN, STORED_NONCE_LEN - 1] {
+                let s = Arc::new(MemStorage::new());
+                let db = Db::create(
+                    Box::new(ArcStorage(Arc::clone(&s))),
+                    opts_with([14; 32], algorithm),
+                )
+                .unwrap();
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, b"k", b"v").unwrap();
+                tx.commit().unwrap();
+                let root = db.begin_read().root();
+                drop(db);
+
+                let mut bytes = s.snapshot();
+                bytes[root as usize * TEST_PAGE_SIZE as usize + at] ^= 0xff;
+                s.restore(bytes);
+
+                let db = Db::open(
+                    Box::new(ArcStorage(Arc::clone(&s))),
+                    opts_with([14; 32], algorithm),
+                )
+                .unwrap();
+                assert!(
+                    matches!(db.begin_read().get(0x01, b"k"), Err(Error::Decrypt { .. })),
+                    "{algorithm:?}: cambiar el byte {at} del campo de nonce no se detecto"
+                );
+            }
+        }
+    }
+
+    /// La carga de trabajo que ejerce ESTA prueba, compartida por las dos
+    /// que la usan (la de unicidad de nonces y la de la copia de
+    /// seguridad). Toca, a propósito, todo lo que puede reciclar páginas o
+    /// reescribir la misma varias veces:
+    ///
+    /// - una transacción grande (el patrón de lote de este motor, donde
+    ///   `own_free` recicla páginas DENTRO de la transacción y una misma
+    ///   página puede reescribirse decenas de veces);
+    /// - cadenas de overflow, creadas y liberadas;
+    /// - borrados intercalados y reinserción sobre las mismas claves;
+    /// - una transacción abortada (que no debe devolver contadores al
+    ///   circuito);
+    /// - `delete_range`, que libera subárboles enteros;
+    /// - muchas transacciones pequeñas.
+    fn demanding_workload(db: &Db, salt: u32) {
+        // 1. Transacción grande, con overflow y borrados dentro.
         let mut tx = db.begin_write().unwrap();
-        for i in 0..200u32 {
-            tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+        for i in 0..500u32 {
+            tx.put(0x01, &(i + salt).to_be_bytes(), &[(i % 251) as u8; 24]).unwrap();
+        }
+        for i in (0..500u32).step_by(7) {
+            tx.put(0x02, &(i + salt).to_be_bytes(), &alloc::vec![0xcd; 400]).unwrap();
+        }
+        for i in (0..500u32).step_by(3) {
+            tx.delete(0x01, &(i + salt).to_be_bytes()).unwrap();
+        }
+        // Reinserción sobre claves recién borradas: reconstruye hojas que
+        // esta misma transacción ya había reescrito.
+        for i in (0..500u32).step_by(3) {
+            tx.put(0x01, &(i + salt).to_be_bytes(), b"reinsertado").unwrap();
         }
         tx.commit().unwrap();
-        let nonces = s.encrypted_page_nonces();
-        let mut sorted = nonces.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), nonces.len(), "nonce repetido");
 
-        // Y el mismo veredicto por la otra vía, la estadística (tercera
-        // ronda de revisión): `sealed > 0` no es decoración — sin él, un
-        // cambio que dejara de registrar escrituras haría pasar
-        // "cero nonces repetidos" sin haber mirado ni una sola página.
-        let audit = audit_nonces(&s.raw_writes());
-        assert!(audit.sealed > 0, "el auditor no vio ninguna pagina sellada: {audit:?}");
-        assert_eq!(audit.reused_nonces, 0, "{audit:?}");
+        // 2. Transacción abortada.
+        {
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..40u32 {
+                tx.put(0x03, &(i + salt).to_be_bytes(), b"abortado").unwrap();
+            }
+            // Se descarta sin commit.
+        }
+
+        // 3. `delete_range` sobre un tramo, y sobre el espacio de overflow.
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(0x01, &salt.to_be_bytes(), &(salt + 200).to_be_bytes()).unwrap();
+        tx.delete_range(0x02, &salt.to_be_bytes(), &(salt + 250).to_be_bytes()).unwrap();
+        tx.commit().unwrap();
+
+        // 4. Muchas transacciones pequeñas.
+        for i in 0..60u32 {
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x04, &(i + salt).to_be_bytes(), b"pequenya").unwrap();
+            tx.commit().unwrap();
+        }
+    }
+
+    /// **La prueba central del cambio.** Cuenta los nonces que
+    /// `crypto::seal` produjo de verdad — no los que se puedan deducir de
+    /// las escrituras físicas, ver `probe` — sobre una carga exigente que
+    /// atraviesa varias sesiones con reaperturas de por medio, y para los
+    /// DOS algoritmos.
+    ///
+    /// La corrida de referencia anterior a este cambio fueron 3 686
+    /// sellados con cero duplicados, todos con ChaCha20-Poly1305. Esta
+    /// exige al menos esa cifra POR ALGORITMO, así que AES-256-GCM-SIV deja
+    /// de tener menos cobertura que ChaCha: es el mismo listón, no uno
+    /// rebajado.
+    #[test]
+    fn no_nonce_is_ever_reused() {
+        /// Suelo heredado de la corrida de referencia previa al cambio.
+        /// Comprobarlo evita el peor modo de fallo de una prueba de
+        /// unicidad: que la carga deje de sellar lo que creía sellar y
+        /// "cero duplicados" pase a no significar nada.
+        const REFERENCE_SEALS: usize = 3_686;
+
+        for &algorithm in ALGORITHMS {
+            let capture = probe::Capture::start();
+            let s = Arc::new(MemStorage::new());
+
+            // Sesión 1: creación.
+            {
+                let db = Db::create(
+                    Box::new(ArcStorage(Arc::clone(&s))),
+                    opts_with([6; 32], algorithm),
+                )
+                .unwrap();
+                demanding_workload(&db, 0);
+            }
+            // Sesión 2 y 3: reaperturas, cada una con su propio prefijo.
+            for salt in [1000u32, 2000] {
+                let db = Db::open(
+                    Box::new(ArcStorage(Arc::clone(&s))),
+                    opts_with([6; 32], algorithm),
+                )
+                .unwrap();
+                demanding_workload(&db, salt);
+            }
+
+            let sealed = capture.take();
+            let a = assert_no_reuse(&sealed, &alloc::format!("{algorithm:?}"));
+            std::eprintln!("{algorithm:?}: {} sellados, {} nonces repetidos", a.sealed, a.reused_nonces);
+            assert!(
+                a.sealed >= REFERENCE_SEALS,
+                "{algorithm:?}: solo {} sellados, por debajo de la corrida de referencia \
+                 ({REFERENCE_SEALS}): la carga dejo de ejercitar lo que creia ejercitar",
+                a.sealed
+            );
+        }
     }
 
     /// Complementa la prueba de arriba con el otro eje: muchas
-    /// transacciones PEQUEÑAS en vez de una grande, atravesando varias
+    /// transacciones PEQUEÑAS en vez de una grande, atravesando muchas
     /// aperturas de transacción (`begin_write`/`commit`) en vez de una
-    /// sola — comprueba que el contador vivo (`WriterState::live_counter`,
-    /// que sobrevive tal cual entre transacciones desde la segunda ronda
-    /// de revisión) se lleva bien de una a otra.
+    /// sola — comprueba que el flujo de nonces (`WriterState::nonce_stream`,
+    /// que sobrevive tal cual entre transacciones) se lleva bien de una a
+    /// otra.
     #[test]
     fn no_nonce_is_ever_reused_across_many_small_transactions() {
-        let s = Arc::new(RecordingStorage::new());
-        let db = Db::create(Box::new(ArcRecording(Arc::clone(&s))), opts([9; 32])).unwrap();
-        for i in 0..200u32 {
-            let mut tx = db.begin_write().unwrap();
-            tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
-            tx.commit().unwrap();
+        for &algorithm in ALGORITHMS {
+            let capture = probe::Capture::start();
+            let db =
+                Db::create(Box::new(MemStorage::new()), opts_with([9; 32], algorithm)).unwrap();
+            for i in 0..200u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+                tx.commit().unwrap();
+            }
+            assert_no_reuse(&capture.take(), &alloc::format!("{algorithm:?}"));
         }
-        let nonces = s.encrypted_page_nonces();
-        let mut sorted = nonces.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), nonces.len(), "nonce repetido");
     }
 
     /// Sonda 1 de la segunda ronda de revisión posterior a la primera
     /// entrega (hallazgo BLOCKER 2): abortar una transacción y luego
-    /// confirmar otra distinta no debe reutilizar ningún contador. Con el
-    /// diseño roto de la primera ronda, el contador se releía de la meta
+    /// confirmar otra distinta no debe reutilizar ningún nonce. Con el
+    /// diseño roto de aquella ronda, el contador se releía de la meta
     /// CONFIRMADA en cada `begin_write` — y como abortar no toca la meta
     /// confirmada, la segunda transacción arrancaba exactamente donde
     /// había arrancado la primera, repartiendo de nuevo los mismos
     /// contadores que la abortada ya había usado para sellar páginas
-    /// reales. El caso concreto que lo demuestra: 5 `put` que se abortan,
-    /// seguidos de 5 `put` DISTINTOS que sí confirman — `alloc()`, en las
-    /// mismas condiciones de partida (mismo root confirmado, misma lista
-    /// de libres), tiende a repartir la MISMA secuencia de páginas, así
-    /// que sin el arreglo esto colisiona en página Y contador a la vez.
+    /// reales.
+    ///
+    /// Sigue valiendo con nonces aleatorios, y por la misma razón de fondo:
+    /// el flujo vive en `WriterState`, que `WriteTxn::Drop` no toca. El
+    /// caso concreto que lo demuestra: 5 `put` que se abortan, seguidos de
+    /// 5 `put` DISTINTOS que sí confirman — `alloc()`, en las mismas
+    /// condiciones de partida, tiende a repartir la MISMA secuencia de
+    /// páginas, así que un flujo que rebobinara al abortar colisionaría
+    /// aquí.
     #[test]
-    fn a_rollback_then_a_commit_reuses_no_counter() {
-        let s = Arc::new(RecordingStorage::new());
-        let db = Db::create(Box::new(ArcRecording(Arc::clone(&s))), opts([31; 32])).unwrap();
-        {
-            let mut tx = db.begin_write().unwrap();
-            for i in 0..5u32 {
-                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+    fn a_rollback_then_a_commit_reuses_no_nonce() {
+        for &algorithm in ALGORITHMS {
+            let capture = probe::Capture::start();
+            let db =
+                Db::create(Box::new(MemStorage::new()), opts_with([31; 32], algorithm)).unwrap();
+            {
+                let mut tx = db.begin_write().unwrap();
+                for i in 0..5u32 {
+                    tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+                }
+                // Se descarta sin commit.
             }
-            // Se descarta sin commit.
-        }
-        {
-            let mut tx = db.begin_write().unwrap();
-            for i in 100..105u32 {
-                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+            {
+                let mut tx = db.begin_write().unwrap();
+                for i in 100..105u32 {
+                    tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+                }
+                tx.commit().unwrap();
             }
-            tx.commit().unwrap();
+            assert_no_reuse(&capture.take(), &alloc::format!("{algorithm:?} tras abortar"));
         }
-        let nonces = s.encrypted_page_nonces();
-        let mut sorted = nonces.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), nonces.len(), "nonce repetido tras abortar y luego confirmar");
     }
 
-    /// Sonda 2 de la segunda ronda de revisión (hallazgo BLOCKER 1): una
-    /// transacción que agota el techo de contador ya reservado, abortada
-    /// a media escritura, no debe corromper NADA de lo que ya estaba
-    /// confirmado al reabrir — ni perder datos, ni cambiar el `root`.
+    /// **Defecto 1 muerto: restaurar una copia de seguridad.**
     ///
-    /// Para ejercitar `Db::extend_counter_ceiling` de verdad sin necesitar
-    /// más de un millón de escrituras reales (`COUNTER_RESERVE`), esta
-    /// prueba manipula a mano el `write_counter` ya persistido (bytes
-    /// 100..108 de cada ranura de meta, recalculando el CRC) para dejarlo
-    /// artificialmente bajo — el mismo tipo de manipulación de bytes crudos
-    /// que ya usa `a_tampered_page_is_rejected`, sobre un campo distinto.
-    /// Con el diseño roto de la primera ronda, esto fallaba porque
-    /// `advance_counter` pasaba la meta DE LA TRANSACCIÓN EN CURSO — con
-    /// su `root` ya cambiado a medio hacer — a la extensión, y esa mitad
-    /// de transacción se recuperaba como si fuera un commit real.
+    /// El procedimiento es el más corriente que existe en operaciones:
+    /// copiar el fichero, seguir escribiendo en el original, y más tarde
+    /// abrir la copia y seguir escribiendo también en ella. Son dos líneas
+    /// temporales que arrancan del mismo estado y comparten la MISMA clave
+    /// de datos, porque la clave envuelta viaja en la copia.
+    ///
+    /// **Lo que producía el código anterior a este cambio.** El contador de
+    /// nonce y su techo se persistían en la meta, junto a la clave
+    /// envuelta, así que los dos retrocedían juntos: la copia restaurada
+    /// arrancaba su contador exactamente donde lo había dejado el original
+    /// en el instante de la copia, y volvía a repartir los mismos valores
+    /// bajo la misma clave. Medido por la revisión que motivó este cambio:
+    /// **296 de 296 nonces compartidos entre las dos líneas, 164 de ellos
+    /// con texto plano distinto, y hasta un 96,52 % de bytes cero en el XOR
+    /// de los textos cifrados que compartían nonce** — recuperación del
+    /// texto plano, no un riesgo teórico.
+    ///
+    /// Ahora la copia sortea su propio prefijo de 16 bytes al abrirse, así
+    /// que las dos líneas viven en espacios de nonces separados por 128
+    /// bits aleatorios. Esta prueba comprueba justo eso: intersección
+    /// vacía entre los dos conjuntos de nonces.
     #[test]
-    fn a_transaction_that_exceeds_the_ceiling_extends_it_without_losing_committed_data() {
-        let s = Arc::new(MemStorage::new());
-        let master = [41u8; 32];
-        let committed_root;
-        {
-            let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), opts(master)).unwrap();
-            let mut tx = db.begin_write().unwrap();
-            tx.put(0x01, b"antes", b"confirmado").unwrap();
-            tx.commit().unwrap();
-            committed_root = db.begin_read().root();
-        }
+    fn a_restored_backup_shares_no_nonce_with_the_timeline_it_was_copied_from() {
+        for &algorithm in ALGORITHMS {
+            let capture = probe::Capture::start();
+            let original = Arc::new(MemStorage::new());
 
-        // Manipula `write_counter` de las DOS ranuras de meta a un valor
-        // artificialmente bajo, recalculando el CRC, para que la próxima
-        // transacción agote el techo enseguida.
-        let mut bytes = s.snapshot();
-        // 2, no 8 (tarea 18): la meta B vive en la página 2 desde la
-        // creación, y ninguna de estas dos pruebas hace crecer el fichero
-        // lo bastante como para que se haya reubicado a la 8 todavía.
-        for meta_page in [1usize, 2usize] {
-            let base = meta_page * 512;
-            bytes[base + 100..base + 108].copy_from_slice(&3u64.to_le_bytes());
-            let crc = crate::crc32::checksum(&bytes[base..base + crate::meta::META_SIZE - 4]);
-            bytes[base + crate::meta::META_SIZE - 4..base + crate::meta::META_SIZE]
-                .copy_from_slice(&crc.to_le_bytes());
-        }
-        s.restore(bytes);
-
-        {
-            let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts(master)).unwrap();
+            // Estado común, y la copia.
+            let db = Db::create(
+                Box::new(ArcStorage(Arc::clone(&original))),
+                opts_with([77; 32], algorithm),
+            )
+            .unwrap();
             let mut tx = db.begin_write().unwrap();
-            // Más de 3 escrituras: agota el techo manipulado y fuerza una
-            // extensión real (con su propia sincronización incondicional)
-            // dentro de esta misma transacción.
-            for i in 0..20u32 {
-                tx.put(0x02, &i.to_be_bytes(), b"a medias").unwrap();
+            for i in 0..120u32 {
+                tx.put(0x01, &i.to_be_bytes(), &[3u8; 32]).unwrap();
             }
-            // Se descarta sin commit.
-        }
+            tx.commit().unwrap();
+            let backup_bytes = original.snapshot();
+            // Lo sellado hasta aquí es común a las dos líneas: se descarta
+            // para que la comparación sea entre lo que cada una escribió
+            // DESPUÉS de separarse, que es donde estaba el defecto.
+            let _common = capture.take();
 
-        let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts(master)).unwrap();
-        let r = db.begin_read();
-        assert_eq!(r.root(), committed_root, "el root confirmado no debe cambiar tras abortar");
-        assert_eq!(r.get(0x01, b"antes").unwrap().as_deref(), Some(b"confirmado".as_slice()));
+            // Línea A: el original sigue escribiendo.
+            for i in 0..80u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), b"linea-a").unwrap();
+                tx.commit().unwrap();
+            }
+            drop(db);
+            let timeline_a = nonce_set(&capture.take());
+
+            // Línea B: la copia se abre y escribe lo MISMO, que es el peor
+            // caso — con nonces compartidos, textos planos iguales bajo el
+            // mismo nonce dan el XOR más revelador posible.
+            let restored = Arc::new(MemStorage::new());
+            restored.restore(backup_bytes);
+            let db = Db::open(
+                Box::new(ArcStorage(Arc::clone(&restored))),
+                opts_with([77; 32], algorithm),
+            )
+            .unwrap();
+            for i in 0..80u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), b"linea-a").unwrap();
+                tx.commit().unwrap();
+            }
+            drop(db);
+            let timeline_b = nonce_set(&capture.take());
+
+            assert!(!timeline_a.is_empty() && !timeline_b.is_empty(), "{algorithm:?}: sin sellados que comparar");
+            let shared: Vec<_> = timeline_a.intersection(&timeline_b).collect();
+            assert!(
+                shared.is_empty(),
+                "{algorithm:?}: la copia restaurada comparte {} de {} nonces con el original \
+                 — es el defecto que este cambio cierra",
+                shared.len(),
+                timeline_b.len()
+            );
+        }
+    }
+
+    /// **Defecto 2 muerto: dos asas sobre el mismo fichero.**
+    ///
+    /// `Error::AlreadyOpen` (`storage.rs`) ya impide construir la segunda
+    /// asa dentro del mismo proceso, así que el caso no se puede montar tal
+    /// cual. Lo que esta prueba demuestra es la propiedad de fondo, la que
+    /// hace que ese rechazo deje de ser lo ÚNICO que separa las dos asas
+    /// de compartir nonces: dos aperturas del mismo fichero, una tras otra,
+    /// sortean prefijos distintos, así que no podrían colisionar ni aunque
+    /// el guardián no existiera — que es exactamente la situación de dos
+    /// PROCESOS, donde no hay guardián posible (sección 3.4 de la
+    /// especificación).
+    ///
+    /// Antes de este cambio la propiedad era la contraria: las dos
+    /// aperturas arrancaban su contador desde el mismo `write_counter` de
+    /// la meta y repartían los mismos nonces.
+    #[test]
+    fn two_opens_of_the_same_file_draw_different_prefixes() {
+        for &algorithm in ALGORITHMS {
+            let capture = probe::Capture::start();
+            let s = Arc::new(MemStorage::new());
+            {
+                let db = Db::create(
+                    Box::new(ArcStorage(Arc::clone(&s))),
+                    opts_with([88; 32], algorithm),
+                )
+                .unwrap();
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, b"k", b"v").unwrap();
+                tx.commit().unwrap();
+            }
+            let first = nonce_set(&capture.take());
+
+            // Dos reaperturas más, cada una escribiendo exactamente lo
+            // mismo: mismo estado de partida, misma secuencia de páginas,
+            // mismo contador dentro de cada apertura. Lo único que las
+            // separa es el prefijo.
+            let mut sets = alloc::vec![first];
+            for _ in 0..2 {
+                let db = Db::open(
+                    Box::new(ArcStorage(Arc::clone(&s))),
+                    opts_with([88; 32], algorithm),
+                )
+                .unwrap();
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, b"k", b"v").unwrap();
+                tx.commit().unwrap();
+                drop(db);
+                sets.push(nonce_set(&capture.take()));
+            }
+
+            for (i, a) in sets.iter().enumerate() {
+                assert!(!a.is_empty(), "{algorithm:?}: la apertura {i} no sello nada");
+                for (j, b) in sets.iter().enumerate().skip(i + 1) {
+                    assert!(
+                        a.intersection(b).next().is_none(),
+                        "{algorithm:?}: las aperturas {i} y {j} comparten un nonce"
+                    );
+                }
+            }
+        }
+    }
+
+    /// El contador arranca en cero en CADA apertura — es lo que hace
+    /// innecesario persistirlo, y por tanto lo que justifica haber borrado
+    /// `Meta::write_counter` y su protocolo de extensión.
+    ///
+    /// Comprobarlo explícitamente importa: si alguna apertura futura
+    /// volviera a arrastrar el contador de la sesión anterior, esta prueba
+    /// no fallaría por sí sola (arrastrarlo también es seguro), pero su
+    /// PAREJA —`two_opens_of_the_same_file_draw_different_prefixes`— y esta
+    /// juntas fijan las dos mitades del contrato: prefijo nuevo, contador
+    /// desde cero.
+    #[test]
+    fn the_nonce_counter_restarts_at_zero_on_every_open() {
+        let capture = probe::Capture::start();
+        let s = Arc::new(MemStorage::new());
+        {
+            let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), opts([99; 32])).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..30u32 {
+                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let first = capture.take();
+        {
+            let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts([99; 32])).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"otra", b"v").unwrap();
+            tx.commit().unwrap();
+        }
+        let second = capture.take();
+
+        // Los 8 últimos bytes del nonce de XChaCha20 son el contador.
+        let counter_of = |s: &probe::Sealed| u64::from_le_bytes(s.nonce[NONCE_PREFIX_LEN..].try_into().unwrap());
+        assert_eq!(counter_of(&first[0]), 0, "la primera apertura arranca en cero");
         assert_eq!(
-            r.get(0x02, &0u32.to_be_bytes()).unwrap(),
-            None,
-            "nada de la transaccion abortada debe verse"
+            counter_of(&second[0]),
+            0,
+            "la SEGUNDA apertura tambien arranca en cero: no queda ningun contador persistido"
+        );
+        assert!(
+            first.len() > 1 && counter_of(&first[1]) == 1,
+            "y avanza de uno en uno dentro de la apertura"
         );
     }
+
+    /// Una transacción abortada no debe corromper NADA de lo confirmado al
+    /// reabrir — ni perder datos, ni cambiar el `root`.
+    ///
+    /// **Antes de este cambio esta prueba necesitaba montar un andamio.**
+    /// Era la sonda 2 de la segunda ronda de revisión de la tarea 17, y el
+    /// caso que perseguía era "una transacción que agota el techo de
+    /// contador reservado y se aborta a media escritura": para llegar ahí
+    /// sin hacer un millón de escrituras reales (`COUNTER_RESERVE`) había
+    /// que manipular a mano el `write_counter` persistido en las dos
+    /// ranuras de meta, recalculando sus CRC. Sin techo que agotar, ni
+    /// contador que persistir, ni extensión que pueda publicar una
+    /// transacción a medias, el andamio entero sobra y lo que queda es la
+    /// propiedad de fondo, que sigue importando: abortar no cambia nada de
+    /// lo confirmado.
+    #[test]
+    fn an_aborted_transaction_leaves_the_committed_state_untouched() {
+        for &algorithm in ALGORITHMS {
+            let s = Arc::new(MemStorage::new());
+            let mk = || opts_with([41; 32], algorithm);
+            let committed_root;
+            {
+                let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), mk()).unwrap();
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, b"antes", b"confirmado").unwrap();
+                tx.commit().unwrap();
+                committed_root = db.begin_read().root();
+            }
+
+            {
+                let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), mk()).unwrap();
+                let mut tx = db.begin_write().unwrap();
+                for i in 0..20u32 {
+                    tx.put(0x02, &i.to_be_bytes(), b"a medias").unwrap();
+                }
+                // Se descarta sin commit.
+            }
+
+            let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), mk()).unwrap();
+            let r = db.begin_read();
+            assert_eq!(
+                r.root(),
+                committed_root,
+                "{algorithm:?}: el root confirmado no debe cambiar tras abortar"
+            );
+            assert_eq!(r.get(0x01, b"antes").unwrap().as_deref(), Some(b"confirmado".as_slice()));
+            assert_eq!(
+                r.get(0x02, &0u32.to_be_bytes()).unwrap(),
+                None,
+                "{algorithm:?}: nada de la transaccion abortada debe verse"
+            );
+        }
+    }
+
 
     /// Envuelve `MemStorage` y simula un corte de corriente: las DOS
     /// ranuras de meta solo sobreviven hasta el último `sync()` real; todo
     /// lo demás (páginas de árbol, de lista de libres, la cabecera) se
     /// trata como si llegara al medio sin condición — que es exactamente
     /// lo que hace este motor: `Pager::write`/`write_encrypted` nunca
-    /// miran la política de `Sync`, solo `Db::maybe_sync` (y
-    /// `Db::extend_counter_ceiling`, que sincroniza sin condición) deciden
-    /// si un `fsync` de verdad ocurre. También lleva el mismo registro de
-    /// `(offset, primeros 8 bytes)` que `RecordingStorage`, para poder
-    /// comprobar directamente que nada se reutiliza tras el "corte".
+    /// miran la política de `Sync`, y desde la eliminación del techo de
+    /// contador de nonce solo `Db::maybe_sync` decide si un `fsync` de
+    /// verdad ocurre — antes había además una sincronización incondicional
+    /// por sesión, la de `Db::extend_counter_ceiling`, que este arnés tenía
+    /// que tener en cuenta.
+    ///
+    /// **Ya no registra escrituras físicas.** Lo hacía para que las
+    /// pruebas pudieran deducir de ellas los nonces usados; eso lo da
+    /// ahora `probe`, capturando en el propio `seal` (ver su comentario).
+    /// Lo que queda aquí es solo el modelo de corte de corriente.
     ///
     /// Asume `Options::default()` (`page_size` 512, `meta_a_page` 1,
     /// `meta_b_page` 2, salvo que la prueba cruce los 4 KB y dispare
@@ -1070,7 +1756,6 @@ mod tests {
     /// es un corte, no importa cuál de las dos escrituras lo dispara.
     struct PowerLossStorage {
         inner: MemStorage,
-        writes: Mutex<Vec<PhysWrite>>,
         last_synced_meta: Mutex<[[u8; 512]; 3]>,
         last_synced_header: Mutex<[[u8; crate::header::HEADER_SIZE]; 2]>,
         /// Desgarro de meta armado: ver `arm_meta_tear`.
@@ -1102,13 +1787,17 @@ mod tests {
     const HEADER_OFFSETS: [u64; 2] = [0, crate::header::HEADER_MIRROR_OFFSET];
 
     /// Cuántos bytes de una escritura de meta desgarrada llegan al plato.
-    /// 104 no es arbitrario: cae DENTRO de `write_counter` (bytes 100..108)
-    /// y por debajo del CRC (108..112), así que la ranura queda siempre con
-    /// un contenido mezclado y un CRC viejo — ilegible, pase lo que pase.
-    /// Un prefijo más corto solo desgarra de verdad las escrituras cuyos
-    /// primeros bytes cambian (las de un commit, que trae `txn_id` y `root`
-    /// nuevos), y deja intacta la de una extensión, que solo toca
-    /// `write_counter` y el CRC. `write_at` lo comprueba en cada desgarro
+    /// 104 no es arbitrario: cae por debajo del CRC (108..112) y por encima
+    /// de todos los campos que un commit cambia (`txn_id` los primeros
+    /// ocho, y de ahí a `n_pages`), así que la ranura queda siempre con un
+    /// contenido mezclado y un CRC viejo — ilegible, pase lo que pase.
+    ///
+    /// Se eligió originalmente por caer DENTRO de `write_counter` (bytes
+    /// 100..108), que era lo único que cambiaba una escritura de extensión
+    /// de techo: con ese campo y su protocolo eliminados, ya no hay
+    /// escrituras de meta que no vengan de un commit, y cualquier prefijo
+    /// que cubra el `txn_id` desgarra de verdad. `write_at` lo comprueba en
+    /// cada desgarro
     /// en vez de confiar en que quien escribe la prueba lo tenga presente.
     const TORN_PREFIX: usize = 104;
 
@@ -1116,7 +1805,6 @@ mod tests {
         fn new() -> Self {
             Self {
                 inner: MemStorage::new(),
-                writes: Mutex::new(Vec::new()),
                 last_synced_meta: Mutex::new([[0u8; 512]; 3]),
                 last_synced_header: Mutex::new([[0u8; crate::header::HEADER_SIZE]; 2]),
                 meta_tear: Mutex::new(None),
@@ -1190,25 +1878,6 @@ mod tests {
             }
         }
 
-        fn raw_writes(&self) -> Vec<PhysWrite> {
-            self.writes.lock().unwrap().clone()
-        }
-
-        fn encrypted_page_nonces(&self) -> Vec<(u64, [u8; 8])> {
-            let writes = self.writes.lock().unwrap();
-            let relocated_at = relocation_completed_at(&writes);
-            writes
-                .iter()
-                .enumerate()
-                .filter(|(idx, (o, _))| *o > 0 && !is_meta_offset_at(*o, *idx, relocated_at))
-                .map(|(_, (o, b))| {
-                    let mut first8 = [0u8; 8];
-                    first8.copy_from_slice(&b[..8]);
-                    (*o, first8)
-                })
-                .collect()
-        }
-
         /// Toma el desgarro de meta armado si esta escritura (offset, 512 B
         /// exactos) es una de las tres posiciones posibles Y le toca a
         /// esta escritura en concreto (el contador `skip` ya llegó a cero).
@@ -1268,7 +1937,6 @@ mod tests {
             }
 
             if let Some((i, prefix)) = self.take_meta_tear(o, b.len()) {
-                self.writes.lock().unwrap().push((o, b[..prefix].to_vec()));
                 self.inner.write_at(o, &b[..prefix])?;
                 // Lo que sí llegó al plato es DURADERO: sobrevive al
                 // `simulate_power_loss` posterior, a diferencia de una
@@ -1278,11 +1946,12 @@ mod tests {
                 // El arnés comprueba SU PROPIA premisa: si el prefijo
                 // elegido deja la ranura todavía legible, esta prueba no
                 // está modelando ningún desgarro y pasaría por la razón
-                // equivocada. Ocurre de verdad: la meta de una extensión
-                // solo difiere de la anterior en `write_counter`
-                // (100..108) y el CRC (108..112), así que un prefijo de
-                // 56 bytes la deja byte a byte idéntica a lo que ya
-                // había — un desgarro que no desgarra nada. Ver
+                // equivocada. Ocurría de verdad mientras existieron las
+                // escrituras de extensión de techo, que solo diferían de
+                // la meta anterior en `write_counter` (100..108) y el CRC:
+                // un prefijo de 56 bytes las dejaba byte a byte idénticas
+                // a lo que ya había — un desgarro que no desgarra nada. La
+                // comprobación se queda como guardia del arnés. Ver
                 // `TORN_PREFIX`.
                 assert!(
                     crate::meta::Meta::decode(&landed).is_err(),
@@ -1295,7 +1964,6 @@ mod tests {
             }
 
             if let Some((i, prefix)) = self.take_header_tear(o, b.len()) {
-                self.writes.lock().unwrap().push((o, b[..prefix].to_vec()));
                 self.inner.write_at(o, &b[..prefix])?;
                 let mut landed = [0u8; crate::header::HEADER_SIZE];
                 self.inner.read_at(o, &mut landed)?;
@@ -1315,9 +1983,6 @@ mod tests {
                 return Ok(());
             }
 
-            if b.len() >= 8 {
-                self.writes.lock().unwrap().push((o, b.to_vec()));
-            }
             self.inner.write_at(o, b)
         }
 
@@ -1361,117 +2026,57 @@ mod tests {
     /// `Sync::Never` o un `Sync::Interval` largo — donde los commits
     /// normales de este motor nunca fuerzan un `fsync` — muchas
     /// transacciones pequeñas seguidas de un corte de corriente simulado
-    /// no deben reutilizar ningún contador, aunque se pierdan sus efectos
+    /// no deben reutilizar ningún nonce, aunque se pierdan sus efectos
     /// lógicos (esa pérdida SÍ la acepta `Sync::Never`/`Interval`
     /// explícitamente; lo que no acepta es que rompa la confidencialidad
     /// de páginas que sobrevivieron).
+    ///
+    /// **Con nonces aleatorios esto pasa por una razón mucho más simple, y
+    /// esa simplificación es el objetivo del cambio.** Antes hacía falta
+    /// que la reserva de contadores llegara a disco de forma duradera
+    /// ANTES de sellar con ellos —de ahí un `fsync` incondicional que ni
+    /// `Sync::Never` podía evitar— porque la sesión de después del corte
+    /// releía el techo del fichero. Ahora la sesión de después del corte
+    /// sortea un prefijo nuevo, así que no hay nada que hacer durable: da
+    /// igual cuánto se pierda en el corte, la sesión siguiente no puede
+    /// pisar nonces de la anterior.
     #[test]
-    fn sync_never_or_long_interval_survives_simulated_power_loss_without_reusing_a_counter() {
-        for policy in [Sync::Never, Sync::Interval(Duration::from_secs(3600))] {
-            let s = Arc::new(PowerLossStorage::new());
-            let mk_opts = || Options { sync: policy, ..opts([51; 32]) };
-            let db = Db::create(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
-            // Bajo ninguna de las dos políticas se sincroniza en cada
-            // commit: 20 transacciones pequeñas seguidas sin que la meta
-            // llegue a ser duradera entre ellas (más allá del `sync()`
-            // incondicional de `Db::create`).
-            for i in 0..20u32 {
-                let mut tx = db.begin_write().unwrap();
-                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
-                tx.commit().unwrap();
+    fn sync_never_or_long_interval_survives_simulated_power_loss_without_reusing_a_nonce() {
+        for &algorithm in ALGORITHMS {
+            for policy in [Sync::Never, Sync::Interval(Duration::from_secs(3600))] {
+                let capture = probe::Capture::start();
+                let s = Arc::new(PowerLossStorage::new());
+                let mk_opts = || Options { sync: policy, ..opts_with([51; 32], algorithm) };
+                let db = Db::create(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
+                // Bajo ninguna de las dos políticas se sincroniza en cada
+                // commit: 20 transacciones pequeñas seguidas sin que la meta
+                // llegue a ser duradera entre ellas (más allá del `sync()`
+                // incondicional de `Db::create`).
+                for i in 0..20u32 {
+                    let mut tx = db.begin_write().unwrap();
+                    tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+                    tx.commit().unwrap();
+                }
+                drop(db);
+
+                s.simulate_power_loss();
+
+                let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
+                for i in 100..120u32 {
+                    let mut tx = db.begin_write().unwrap();
+                    tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+                    tx.commit().unwrap();
+                }
+                drop(db);
+
+                assert_no_reuse(
+                    &capture.take(),
+                    &alloc::format!("{algorithm:?} / {policy:?} tras corte simulado"),
+                );
             }
-            drop(db);
-
-            s.simulate_power_loss();
-
-            let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
-            for i in 100..120u32 {
-                let mut tx = db.begin_write().unwrap();
-                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
-                tx.commit().unwrap();
-            }
-
-            let nonces = s.encrypted_page_nonces();
-            let mut sorted = nonces.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            assert_eq!(
-                sorted.len(),
-                nonces.len(),
-                "nonce repetido tras corte simulado bajo {policy:?}"
-            );
         }
     }
 
-    /// Sonda 3, variante combinada: fuerza una extensión real (igual que
-    /// `a_transaction_that_exceeds_the_ceiling_...`, mismo truco de
-    /// manipular `write_counter`) bajo `Sync::Never` específicamente, y
-    /// simula un corte justo después. Si la sincronización de la extensión
-    /// respetara la política de `Sync` en vez de ser incondicional (el
-    /// punto 5 del diseño corregido), este caso reproduciría el hallazgo
-    /// HIGH directamente: la extensión se perdería en el corte y la
-    /// siguiente sesión repartiría de nuevo los contadores que la
-    /// transacción de 20 escrituras ya había usado.
-    #[test]
-    fn an_extension_under_sync_never_survives_a_simulated_power_loss() {
-        let s = Arc::new(PowerLossStorage::new());
-        let mk_opts = || Options { sync: Sync::Never, ..opts([52; 32]) };
-        {
-            let db = Db::create(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
-            let mut tx = db.begin_write().unwrap();
-            tx.put(0x01, b"antes", b"confirmado").unwrap();
-            tx.commit().unwrap();
-        }
-
-        let mut bytes_snapshot = alloc::vec::Vec::new();
-        {
-            // Lee el contenido actual a través del propio `Storage` (no
-            // hay `snapshot()` en `PowerLossStorage`): basta con leer todo
-            // el fichero conocido hasta ahora.
-            let len = s.len().unwrap() as usize;
-            bytes_snapshot.resize(len, 0);
-            s.read_at(0, &mut bytes_snapshot).unwrap();
-        }
-        // 2, no 8 (tarea 18): la meta B vive en la página 2 desde la
-        // creación, y ninguna de estas dos pruebas hace crecer el fichero
-        // lo bastante como para que se haya reubicado a la 8 todavía.
-        for meta_page in [1usize, 2usize] {
-            let base = meta_page * 512;
-            bytes_snapshot[base + 100..base + 108].copy_from_slice(&3u64.to_le_bytes());
-            let crc = crate::crc32::checksum(&bytes_snapshot[base..base + crate::meta::META_SIZE - 4]);
-            bytes_snapshot[base + crate::meta::META_SIZE - 4..base + crate::meta::META_SIZE]
-                .copy_from_slice(&crc.to_le_bytes());
-        }
-        s.write_at(0, &bytes_snapshot).unwrap();
-        // Este `sync()` de la propia prueba, fuera de cualquier `Db`,
-        // fotografía la manipulación de arriba como "la última duradera" —
-        // equivalente a que esa manipulación llevara ahí desde siempre.
-        s.sync().unwrap();
-
-        {
-            let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
-            let mut tx = db.begin_write().unwrap();
-            for i in 0..20u32 {
-                tx.put(0x02, &i.to_be_bytes(), b"extendido").unwrap();
-            }
-            tx.commit().unwrap();
-        }
-
-        s.simulate_power_loss();
-
-        let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
-        for i in 200..205u32 {
-            let mut tx = db.begin_write().unwrap();
-            tx.put(0x03, &i.to_be_bytes(), b"tras el corte").unwrap();
-            tx.commit().unwrap();
-        }
-
-        let nonces = s.encrypted_page_nonces();
-        let mut sorted = nonces.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), nonces.len(), "nonce repetido: la extension no sobrevivio al corte bajo Sync::Never");
-    }
 
     /// Cuenta cuántas veces `sync()` llega de verdad al medio. Envuelve
     /// `MemStorage` como los demás ayudantes de este módulo.
@@ -1559,22 +2164,24 @@ mod tests {
         assert_eq!(enc_per_tx, 2.0, "el cifrado no debe anadir sincronizaciones por transaccion en el caso comun");
     }
 
-    /// El coste que la sonda 4 NO medía (tercera ronda de revisión): esa
-    /// mide transacciones sobre una base recién CREADA, donde `Db::create`
-    /// ya siembra el techo y ninguna transacción extiende. Sobre una base
-    /// REABIERTA la historia es distinta: `live_counter == counter_ceiling`
-    /// al abrir (no hay forma de saber cuánto del margen llegó a usar la
-    /// sesión anterior antes de morir, así que se asume el peor caso), de
-    /// modo que la primera escritura cifrada de CADA sesión extiende el
-    /// techo — dos escrituras de meta y dos `fsync` incondicionales.
+    /// **El coste que la sonda 4 no medía, y la prueba directa de que el
+    /// aparato de techo de contador ya no existe.**
     ///
-    /// Eso es inherente, no un descuido: antes de sellar una página con el
-    /// contador C tiene que existir en disco un registro que ponga el suelo
-    /// por encima de C, o una caída dejaría a la sesión siguiente
-    /// repartiendo C otra vez. Lo que esta prueba fija es que el coste sea
-    /// CONSTANTE POR SESIÓN y no por transacción: la diferencia contra la
-    /// base sin cifrar tiene que ser la misma con 100 transacciones que con
-    /// 500.
+    /// La sonda 4 mide transacciones sobre una base recién CREADA. Sobre
+    /// una base REABIERTA la historia era distinta: `live_counter ==
+    /// counter_ceiling` al abrir (no había forma de saber cuánto del margen
+    /// llegó a usar la sesión anterior antes de morir, así que se asumía el
+    /// peor caso), de modo que la primera escritura cifrada de CADA sesión
+    /// extendía el techo — **dos escrituras de meta y dos `fsync`
+    /// incondicionales por sesión**, que ni `Sync::Never` podía evitar.
+    /// Esta prueba fijaba esa cifra en `+2` y la declaraba inherente.
+    ///
+    /// **Ya no lo es, y ese es justo el punto.** Con un prefijo aleatorio
+    /// nuevo por apertura no hay nada que reservar ni que hacer durable
+    /// antes de sellar, así que el sobrecoste de sincronización del cifrado
+    /// sobre una base reabierta es exactamente **cero**. La prueba se
+    /// conserva con el mismo nombre invertido: mide lo mismo y ahora exige
+    /// `+0` donde antes exigía `+2`.
     ///
     /// `page_size: 4096` (tarea 18, autorrevisión, mismo motivo que la sonda
     /// 4 de aquí arriba): con 512 B, tanto la corrida de 100 como la de 500
@@ -1584,7 +2191,7 @@ mod tests {
     /// de 4 KB la meta B ya nace en su posición definitiva y la reubicación
     /// nunca se dispara.
     #[test]
-    fn a_reopened_encrypted_database_pays_its_extension_once_per_session() {
+    fn a_reopened_encrypted_database_pays_no_extra_sync_at_all() {
         fn syncs_after_reopen(n: u64, encrypted: bool) -> u64 {
             let s = Arc::new(SyncCountingStorage::new());
             let mk_opts = || {
@@ -1619,11 +2226,68 @@ mod tests {
         assert_eq!(a_plain, 200, "dos sincronizaciones por transaccion, como siempre");
         assert_eq!(b_plain, 1000);
         assert_eq!(
-            a_enc - a_plain,
-            b_enc - b_plain,
-            "el sobrecoste del cifrado tiene que ser por SESION, no por transaccion"
+            a_enc, a_plain,
+            "una base cifrada reabierta ya no paga NINGUNA sincronizacion de mas: si esto \
+             vuelve a ser +2, ha vuelto la reserva duradera de contadores de nonce"
         );
-        assert_eq!(a_enc - a_plain, 2, "una extension por sesion: dos escrituras, dos fsync");
+        assert_eq!(b_enc, b_plain);
+    }
+
+
+    /// **El coste en espacio del cambio, medido.** El prefijo de cifrado
+    /// pasó de 24 bytes (8 de contador + 16 de tag) a 40 (24 de nonce
+    /// almacenado + 16 de tag), así que la página LÓGICA encoge 16 bytes y
+    /// hacen falta más páginas para los mismos datos.
+    ///
+    /// Se mide con una carga acotada (600 registros), no con el banco de
+    /// `tests/size.rs`: lo que hay que fijar es la relación entre tamaño
+    /// físico y lógico y su efecto, no el rendimiento absoluto.
+    ///
+    /// Los dos tamaños que este motor usa de verdad: 512 B por defecto y
+    /// 4096 B en los perfiles grandes.
+    #[test]
+    fn the_space_cost_of_the_forty_byte_cipher_prefix() {
+        fn file_len(page_size: u32, encrypted: bool) -> u64 {
+            let s = Arc::new(MemStorage::new());
+            let base = if encrypted { opts([64; 32]) } else { Options::default() };
+            let o = Options { page_size, ..base };
+            let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), o).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..600u32 {
+                tx.put(0x01, &i.to_be_bytes(), &[0xa5u8; 48]).unwrap();
+            }
+            tx.commit().unwrap();
+            s.len().unwrap()
+        }
+
+        assert_eq!(CIPHER_PREFIX, 40, "24 de nonce almacenado mas 16 de tag");
+        for page_size in [512u32, 4096] {
+            let logical = page_size - CIPHER_PREFIX as u32;
+            let (plain, enc) = (file_len(page_size, false), file_len(page_size, true));
+            let overhead = 100.0 * (enc as f64 - plain as f64) / plain as f64;
+            std::eprintln!(
+                "pagina de {page_size} B: logica {logical} B ({:.1} % del fisico); \
+                 fichero sin cifrar {plain} B, cifrado {enc} B (+{:.1} %)",
+                100.0 * logical as f64 / page_size as f64,
+                overhead
+            );
+            // El prefijo por página es fijo: lo que cambia con el tamaño de
+            // página es qué FRACCIÓN representa. Con 512 B son 40 de cada
+            // 512 (7,8 %); con 4096 B, 40 de cada 4096 (1,0 %).
+            assert_eq!(logical, page_size - 40);
+            assert!(
+                enc >= plain,
+                "una base cifrada no puede ocupar menos que la misma sin cifrar"
+            );
+            // Cota de cordura, no una cifra clavada: el crecimiento real
+            // depende de cuántas claves caben por hoja a cada tamaño, que
+            // no es lineal en el prefijo. Lo que esta cota descarta es un
+            // cambio que multiplicara el fichero.
+            assert!(
+                overhead < 25.0,
+                "pagina de {page_size} B: el cifrado infla el fichero un {overhead:.1} %"
+            );
+        }
     }
 
     /// Meta CONFIRMADA tal como está en el fichero ahora mismo, sin pasar
@@ -1634,92 +2298,98 @@ mod tests {
         crate::meta::Meta::load(s, &g).unwrap().0
     }
 
-    /// **BLOCKER de la tercera ronda de revisión.** El registro duradero
-    /// del techo de contador tiene que sobrevivir a CUALQUIER escritura
-    /// desgarrada, y antes de esta ronda no lo hacía: la extensión
-    /// (`Db::extend_counter_ceiling`) escribía en `committed_slot.other()`
-    /// y el commit siguiente escribe ESA MISMA ranura, así que el registro
-    /// del techo sobrevivía exactamente una escritura de meta. Y como
-    /// `live_counter == counter_ceiling` al abrir, TODA reapertura extiende
-    /// en su primera escritura cifrada: la ventana se abría en cada sesión.
+    /// **BLOCKER de la tercera ronda de revisión de la tarea 17, hoy sin
+    /// mecanismo que pueda reproducirlo.** El registro duradero del techo
+    /// de contador tenía que sobrevivir a CUALQUIER escritura desgarrada, y
+    /// no lo hacía: la extensión escribía en `committed_slot.other()` y el
+    /// commit siguiente escribe ESA MISMA ranura, así que el registro del
+    /// techo sobrevivía exactamente una escritura de meta. Si esa escritura
+    /// se desgarraba, `Meta::load` caía en la otra ranura, que conservaba
+    /// el `write_counter` VIEJO, y la sesión siguiente volvía a repartir
+    /// los contadores que la sesión muerta ya había usado. Medido
+    /// entonces: cinco pares repetidos, 95,90 % de bytes cero en el XOR
+    /// contra un 0,33 % de línea base.
     ///
-    /// La reproducción: crear y confirmar; reabrir (extiende); desgarrar la
-    /// escritura de meta del commit; reabrir otra vez y volver a escribir.
-    /// Con el defecto, la sesión 3 arranca del `write_counter` VIEJO que
-    /// quedó en la otra ranura y vuelve a repartir los contadores que la
-    /// sesión 2 ya quemó sellando páginas que SÍ están en el fichero.
-    ///
-    /// El desgarro se arma justo antes de `commit()`, no por un índice fijo
-    /// de escritura de meta: así la prueba apunta a "la escritura de meta
-    /// del commit" sin depender de cuántas escrituras haga la extensión.
+    /// Sin techo, sin extensión y sin contador persistido, ese camino no
+    /// existe. La prueba se conserva porque el ESCENARIO sigue siendo
+    /// válido y es de los más duros que hay — una escritura de meta
+    /// desgarrada entre dos sesiones que siguen escribiendo — y porque su
+    /// veredicto sigue siendo el que importa: ningún nonce repetido, y
+    /// ningún commit ya duradero perdido.
     #[test]
-    fn a_torn_commit_meta_write_after_an_extension_reuses_no_counter() {
-        let s = Arc::new(PowerLossStorage::new());
-        let master = [71u8; 32];
+    fn a_torn_commit_meta_write_reuses_no_nonce() {
+        for &algorithm in ALGORITHMS {
+            let capture = probe::Capture::start();
+            let s = Arc::new(PowerLossStorage::new());
+            let mk = || opts_with([71; 32], algorithm);
 
-        {
-            let db = Db::create(Box::new(ArcPowerLoss(Arc::clone(&s))), opts(master)).unwrap();
-            let mut tx = db.begin_write().unwrap();
-            tx.put(0x01, b"antes", b"confirmado").unwrap();
-            tx.commit().unwrap();
-        }
-
-        {
-            let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), opts(master)).unwrap();
-            let mut tx = db.begin_write().unwrap();
-            for i in 0..5u32 {
-                tx.put(0x02, &i.to_be_bytes(), b"sesion dos").unwrap();
+            {
+                let db = Db::create(Box::new(ArcPowerLoss(Arc::clone(&s))), mk()).unwrap();
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, b"antes", b"confirmado").unwrap();
+                tx.commit().unwrap();
             }
-            // 56 de 512 bytes: el CRC de `Meta::decode` cubre 0..108, así
-            // que una ranura con 56 bytes nuevos y el resto viejos falla la
-            // comprobación y queda ilegible.
-            s.arm_meta_tear(0, 56);
-            tx.commit().unwrap();
-        }
 
-        s.simulate_power_loss();
+            {
+                let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk()).unwrap();
+                let mut tx = db.begin_write().unwrap();
+                for i in 0..5u32 {
+                    tx.put(0x02, &i.to_be_bytes(), b"sesion dos").unwrap();
+                }
+                // 56 de 512 bytes: el CRC de `Meta::decode` cubre 0..108, así
+                // que una ranura con 56 bytes nuevos y el resto viejos falla la
+                // comprobación y queda ilegible.
+                s.arm_meta_tear(0, 56);
+                tx.commit().unwrap();
+            }
 
-        {
-            let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), opts(master)).unwrap();
-            assert_eq!(
-                db.begin_read().get(0x01, b"antes").unwrap().as_deref(),
-                Some(b"confirmado".as_slice()),
-                "el commit desgarrado no debe llevarse por delante lo ya confirmado"
+            s.simulate_power_loss();
+
+            {
+                let db = Db::open(Box::new(ArcPowerLoss(Arc::clone(&s))), mk()).unwrap();
+                assert_eq!(
+                    db.begin_read().get(0x01, b"antes").unwrap().as_deref(),
+                    Some(b"confirmado".as_slice()),
+                    "{algorithm:?}: el commit desgarrado no debe llevarse por delante lo ya confirmado"
+                );
+                let mut tx = db.begin_write().unwrap();
+                for i in 0..5u32 {
+                    tx.put(0x02, &i.to_be_bytes(), b"sesion tres").unwrap();
+                }
+                tx.commit().unwrap();
+            }
+
+            assert_no_reuse(
+                &capture.take(),
+                &alloc::format!("{algorithm:?} tras un commit de meta desgarrado"),
             );
-            let mut tx = db.begin_write().unwrap();
-            for i in 0..5u32 {
-                tx.put(0x02, &i.to_be_bytes(), b"sesion tres").unwrap();
-            }
-            tx.commit().unwrap();
         }
-
-        let audit = audit_nonces(&s.raw_writes());
-        std::eprintln!("{audit:?}");
-        assert!(audit.sealed > 0, "el auditor no vio ninguna pagina sellada: {audit:?}");
-        assert_eq!(
-            audit.reused_nonces, 0,
-            "nonce reutilizado tras un commit desgarrado: {audit:?} \
-             (XOR de textos cifrados con el mismo nonce: {:.2} % de bytes cero, \
-              linea base con nonces distintos: {:.2} %)",
-            audit.worst_xor_zero_pct, audit.baseline_xor_zero_pct
-        );
     }
 
     /// **MEDIUM de la tercera ronda de revisión: fuga de páginas sin cota.**
     /// `Db::open` subía `meta.n_pages` hasta la extensión real del fichero y
     /// guardaba ESO en `self.committed`, así que `committed` describía un
     /// estado que nunca se confirmó: las páginas recuperadas vivían solo en
-    /// la lista de libres EN MEMORIA. Como `extend_counter_ceiling` copia
-    /// `self.committed`, una transacción abortada dejaba en disco un
-    /// `n_pages` por encima del último commit con una lista de libres que no
-    /// posee la diferencia — y esas páginas se perdían para siempre, ciclo
-    /// tras ciclo, sin cota.
+    /// la lista de libres EN MEMORIA. Como la extensión del techo de
+    /// contador de nonce copiaba `self.committed` y la escribía a mitad de
+    /// transacción, una transacción abortada dejaba en disco un `n_pages`
+    /// por encima del último commit con una lista de libres que no posee la
+    /// diferencia — y esas páginas se perdían para siempre, ciclo tras
+    /// ciclo, sin cota.
     ///
-    /// Doce ciclos abrir-extender-abortar. El control sin cifrar no escribe
-    /// ninguna meta durante una transacción abortada, así que es el patrón
+    /// **El vehículo concreto de aquella fuga ya no existe**: sin extensión
+    /// no hay ninguna escritura de meta a mitad de transacción, así que hoy
+    /// una transacción abortada de una base cifrada escribe exactamente lo
+    /// mismo que una sin cifrar: nada. La prueba se conserva porque lo que
+    /// fija es la propiedad, no el vehículo — abortar no publica `n_pages`
+    /// — y porque es la que detectaría que un camino nuevo vuelva a
+    /// escribir meta fuera de un commit.
+    ///
+    /// Doce ciclos abrir-escribir-abortar. El control sin cifrar es el
+    /// patrón
     /// exacto contra el que comparar.
     #[test]
-    fn open_extend_abort_cycles_leak_no_pages() {
+    fn open_write_abort_cycles_leak_no_pages() {
         for encrypted in [false, true] {
             let s = Arc::new(MemStorage::new());
             let mk_opts = || if encrypted { opts([81; 32]) } else { Options::default() };
@@ -1752,8 +2422,7 @@ mod tests {
             assert_eq!(
                 (after.txn_id, after.root, after.freelist_head, after.freelist_tail),
                 (before.txn_id, before.root, before.freelist_head, before.freelist_tail),
-                "cifrado={encrypted}: abortar no debe cambiar nada de la meta confirmada \
-                 salvo el techo de contador"
+                "cifrado={encrypted}: abortar no debe cambiar NADA de la meta confirmada"
             );
             // Y lo confirmado sigue legible.
             let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), mk_opts()).unwrap();
@@ -1764,14 +2433,20 @@ mod tests {
         }
     }
 
-    /// La matriz completa: cada política de `Sync` contra un desgarro en
-    /// CADA una de las escrituras de meta que hace una sesión que extiende
-    /// el techo, más el caso sin desgarro. Es la prueba que el arnés
+    /// La matriz completa: cada política de `Sync`, para cada algoritmo,
+    /// contra un desgarro en CADA una de las escrituras de meta que hace
+    /// una sesión, más el caso sin desgarro. Es la prueba que el arnés
     /// anterior no podía hacer (solo sabía descartar una ranura entera, ver
     /// `arm_meta_tear`).
     ///
+    /// **Recorre los dos algoritmos desde este cambio.** Antes la matriz de
+    /// durabilidad entera era solo de ChaCha; AES tenía tres pruebas
+    /// sueltas. Como el cambio de nonce toca a los dos por igual, dejar la
+    /// matriz con uno solo habría significado no comprobar en AES ni el
+    /// desgarro de meta ni la supervivencia entre sesiones.
+    ///
     /// Dos propiedades por caso, no una:
-    /// - **ningún contador se reutiliza** — el objetivo de la tarea;
+    /// - **ningún nonce se reutiliza** — el objetivo de la tarea;
     /// - **bajo `Sync::Commit`, lo ya confirmado sigue ahí** — sin esto, un
     ///   diseño que escriba las dos ranuras "de una tacada" con una sola
     ///   sincronización al final pasaría la primera comprobación y perdería
@@ -1780,11 +2455,12 @@ mod tests {
     ///   ranura con el último estado confirmado.
     #[test]
     fn every_sync_policy_survives_a_torn_meta_write_at_every_point() {
+        for &algorithm in ALGORITHMS {
         for policy in [Sync::Commit, Sync::Interval(Duration::from_secs(3600)), Sync::Never] {
             for tear_at in [None, Some(0), Some(1), Some(2)] {
+                let capture = probe::Capture::start();
                 let s = Arc::new(PowerLossStorage::new());
-                let master = [91u8; 32];
-                let mk_opts = || Options { sync: policy, ..opts(master) };
+                let mk_opts = || Options { sync: policy, ..opts_with([91; 32], algorithm) };
 
                 {
                     let db =
@@ -1829,17 +2505,12 @@ mod tests {
                 }
                 drop(db);
 
-                let audit = audit_nonces(&s.raw_writes());
-                assert!(
-                    audit.sealed > 0,
-                    "{policy:?} / desgarro en {tear_at:?}: el auditor no vio ninguna pagina \
-                     sellada, asi que 'cero nonces repetidos' no dice nada: {audit:?}"
-                );
-                assert_eq!(
-                    audit.reused_nonces, 0,
-                    "{policy:?} / desgarro en {tear_at:?}: {audit:?}"
+                assert_no_reuse(
+                    &capture.take(),
+                    &alloc::format!("{algorithm:?} / {policy:?} / desgarro en {tear_at:?}"),
                 );
             }
+        }
         }
     }
 
@@ -1895,9 +2566,9 @@ mod tests {
         enum Cut {
             /// La copia de la meta confirmada en la posición nueva (offset
             /// 4096): la primera escritura de meta que hace la transacción
-            /// que reubica, siempre que no haya extensión de techo de por
-            /// medio (una sesión recién creada nunca la dispara: el
-            /// contador vivo arranca muy por debajo de `COUNTER_RESERVE`).
+            /// que reubica — y, desde que no existe la extensión de techo
+            /// de contador, la primera escritura de meta a secas de esa
+            /// transacción, sin condiciones.
             MetaAtNewPosition,
             /// El espejo de cabecera (offset 64): la primera escritura de
             /// CABECERA de la transacción.
@@ -1918,12 +2589,13 @@ mod tests {
             Cut::HeaderPrimary(63),
         ];
 
+        for &algorithm in ALGORITHMS {
         for policy in [Sync::Commit, Sync::Interval(Duration::from_secs(3600)), Sync::Never] {
             for active_slot_b in [false, true] {
                 for &cut in &cuts {
+                    let capture = probe::Capture::start();
                     let s = Arc::new(PowerLossStorage::new());
-                    let master = [93u8; 32];
-                    let mk_opts = || Options { sync: policy, ..opts(master) };
+                    let mk_opts = || Options { sync: policy, ..opts_with([93; 32], algorithm) };
 
                     let db = Db::create(Box::new(ArcPowerLoss(Arc::clone(&s))), mk_opts()).unwrap();
                     let mut tx = db.begin_write().unwrap();
@@ -2020,78 +2692,43 @@ mod tests {
                     }
                     drop(db);
 
-                    let audit = audit_nonces(&s.raw_writes());
-                    assert!(
-                        audit.sealed > 0,
-                        "{policy:?} / activa={} / corte={cut:?}: el auditor no vio ninguna \
-                         pagina sellada: {audit:?}",
-                        if active_slot_b { "B" } else { "A" }
-                    );
-                    assert_eq!(
-                        audit.reused_nonces, 0,
-                        "{policy:?} / activa={} / corte={cut:?}: {audit:?}",
-                        if active_slot_b { "B" } else { "A" }
+                    assert_no_reuse(
+                        &capture.take(),
+                        &alloc::format!(
+                            "{algorithm:?} / {policy:?} / activa={} / corte={cut:?}",
+                            if active_slot_b { "B" } else { "A" }
+                        ),
                     );
                 }
             }
         }
-    }
-
-    /// Cobertura de ejecución real para AES-256-GCM (ronda de revisión
-    /// posterior a la primera entrega, hallazgo MEDIUM): sin estas tres
-    /// pruebas, `--features aes` compilaba `Algorithm::Aes256Gcm` pero
-    /// nunca lo instanciaba — cobertura de compilación, no de ejecución.
-    #[cfg(feature = "aes")]
-    mod aes_tests {
-        use super::*;
-
-        #[test]
-        fn data_roundtrips_through_encryption() {
-            let db =
-                Db::create(Box::new(MemStorage::new()), opts_with([21; 32], Algorithm::Aes256Gcm))
-                    .unwrap();
-            let mut tx = db.begin_write().unwrap();
-            tx.put(0x01, b"secreto", b"valor").unwrap();
-            tx.commit().unwrap();
-            assert_eq!(
-                db.begin_read().get(0x01, b"secreto").unwrap().as_deref(),
-                Some(b"valor".as_slice())
-            );
-        }
-
-        #[test]
-        fn a_tampered_page_is_rejected() {
-            let s = Arc::new(MemStorage::new());
-            let opts = opts_with([22; 32], Algorithm::Aes256Gcm);
-            let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), opts).unwrap();
-            let mut tx = db.begin_write().unwrap();
-            tx.put(0x01, b"k", b"v").unwrap();
-            tx.commit().unwrap();
-            let root = db.begin_read().root();
-            drop(db);
-            let mut bytes = s.snapshot();
-            bytes[root as usize * 512 + 100] ^= 0xff;
-            s.restore(bytes);
-            let opts = opts_with([22; 32], Algorithm::Aes256Gcm);
-            let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts).unwrap();
-            assert!(matches!(db.begin_read().get(0x01, b"k"), Err(Error::Decrypt { .. })));
-        }
-
-        #[test]
-        fn no_nonce_is_ever_reused() {
-            let s = Arc::new(RecordingStorage::new());
-            let opts = opts_with([23; 32], Algorithm::Aes256Gcm);
-            let db = Db::create(Box::new(ArcRecording(Arc::clone(&s))), opts).unwrap();
-            let mut tx = db.begin_write().unwrap();
-            for i in 0..200u32 {
-                tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
-            }
-            tx.commit().unwrap();
-            let nonces = s.encrypted_page_nonces();
-            let mut sorted = nonces.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            assert_eq!(sorted.len(), nonces.len(), "nonce repetido (AES-GCM)");
         }
     }
+
+    /// Aquí vivía `mod aes_tests`: tres pruebas sueltas (roundtrip, página
+    /// manipulada, unicidad de nonces) que existían porque `--features aes`
+    /// compilaba el backend pero ninguna prueba lo instanciaba de verdad —
+    /// cobertura de compilación, no de ejecución.
+    ///
+    /// **Se ha disuelto en el resto del módulo, y eso es una mejora, no una
+    /// pérdida.** Tres pruebas propias frente a la suite entera de ChaCha
+    /// dejaban a AES sin matriz de durabilidad, sin corte de corriente, sin
+    /// reubicación de meta B y sin ninguna de las pruebas nuevas de este
+    /// cambio. Ahora todas las pruebas de cifrado de este fichero recorren
+    /// `ALGORITHMS` (ver su comentario), así que AES-256-GCM-SIV pasa
+    /// exactamente por los mismos casos que XChaCha20-Poly1305 — incluidos
+    /// los dos defectos que este cambio entierra, la copia de seguridad
+    /// restaurada y las dos aperturas.
+    ///
+    /// Las únicas pruebas que no recorren la lista son las que no dependen
+    /// del algoritmo (`the_nonce_counter_restarts_at_zero_on_every_open`,
+    /// que lee el contador en la posición que ocupa en el nonce de
+    /// XChaCha20, y las de coste de sincronización, que miden `fsync` y no
+    /// criptografía) y las que lo fijan a mano porque comprueban el reparto
+    /// de bytes de CADA algoritmo por separado
+    /// (`the_nonce_is_exactly_prefix_then_counter`,
+    /// `exhausting_the_aes_counter_field_...`), que se compilan y ejecutan
+    /// sin necesitar la feature `aes` porque solo tocan `NonceStream`, no
+    /// el cifrador.
+    const _: () = ();
 }

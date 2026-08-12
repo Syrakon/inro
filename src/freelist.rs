@@ -300,13 +300,14 @@ impl Freelist {
     /// — esa página solo se volvió basura ahora, al leerla esta
     /// transacción, no cuando se liberaron las páginas que describía.
     ///
-    /// `next_nonce` (tarea 17) da el contador de nonce para CADA página que
-    /// este `flush` escribe — deliberadamente NO `txn`: el mismo defecto
-    /// que motivó separar el contador del `txn_id` en
-    /// `WriteTxn::write_page` (`tx.rs`) aplica aquí igual, así que `flush`
-    /// recibe la misma fuente de contadores que usa el resto de la
-    /// transacción (`WriterState::live_counter`, `tx.rs`), en vez de
-    /// reinventar la suya.
+    /// `nonce_stream` (tarea 17; `NonceStream` desde el cambio a nonces
+    /// aleatorios) da el nonce de CADA página que este `flush` escribe —
+    /// deliberadamente NO `txn`: el mismo defecto que motivó separar el
+    /// nonce del `txn_id` en `WriteTxn::write_page` (`tx.rs`) aplica aquí
+    /// igual, así que `flush` recibe el MISMO flujo que usa el resto de la
+    /// apertura (`WriterState::nonce_stream`, `tx.rs`) en vez de reinventar
+    /// el suyo — dos flujos con el mismo prefijo repartirían los mismos
+    /// nonces. `None` en una base sin cifrar, donde no se sella nada.
     ///
     /// **Recicla dentro de la misma sesión la cadena física que el `flush`
     /// ANTERIOR escribió** (tarea 19, hallazgo de las pruebas basadas en
@@ -344,7 +345,7 @@ impl Freelist {
         alloc: &mut dyn FnMut() -> Result<PageNo>,
         txn: TxnId,
         oldest_reader: Option<TxnId>,
-        next_nonce: &mut dyn FnMut() -> Result<u64>,
+        mut nonce_stream: Option<&mut crate::crypto::NonceStream>,
     ) -> Result<(PageNo, PageNo)> {
         // Antes de serializar hay que absorber TODO lo que `load` dejó sin
         // traer (el tramo intermedio entre `head` y `tail`): si no, esas
@@ -576,10 +577,15 @@ impl Freelist {
                 // releerla más tarde — ver el comentario de `Db::open` en
                 // `tx.rs` sobre por qué el `Pager` provisional también
                 // necesita la clave antes de leer la lista de libres. El
-                // contador de nonce sale de `next_nonce`, no de `txn`: ver
-                // el comentario de este método.
-                let counter = next_nonce()?;
-                pager.write_encrypted(page_no, counter, &b)?;
+                // nonce sale del flujo de la apertura, no de `txn`: ver el
+                // comentario de este método.
+                //
+                // `as_deref_mut` en cada vuelta, no un `&mut` sacado una
+                // vez fuera del bucle: `Option<&mut _>` no es `Copy`, así
+                // que represtarlo aquí es lo que deja usar el mismo flujo
+                // en todas las páginas de este `flush` sin moverlo en la
+                // primera.
+                pager.write_encrypted(page_no, nonce_stream.as_deref_mut(), &b)?;
 
                 if tail == 0 {
                     tail = page_no;
@@ -773,7 +779,6 @@ mod tests {
             f.push(n, 5);
         }
         let mut next = 1000u32;
-        let mut counter = 0u64;
         let (head, tail) = f
             .flush(
                 &p,
@@ -793,10 +798,10 @@ mod tests {
                 // `WriteTxn::commit` deja fuera siempre las páginas que
                 // libera esta misma transacción.
                 Some(0),
-                &mut || {
-                    counter += 1;
-                    Ok(counter)
-                },
+                // `None`: este `Pager` de prueba no tiene cifrado activo,
+                // así que `write_encrypted` no sella nada y no hay ningún
+                // flujo de nonces que pasar.
+                None,
             )
             .unwrap();
 
@@ -816,7 +821,7 @@ mod tests {
         let p = pager();
         let mut f = Freelist::empty();
         let (head, tail) = f
-            .flush(&p, &mut || panic!("no debe asignar"), 5, None, &mut || panic!("no debe pedir contador"))
+            .flush(&p, &mut || panic!("no debe asignar"), 5, None, None)
             .unwrap();
         assert_eq!((head, tail), (0, 0));
     }
@@ -829,7 +834,6 @@ mod tests {
             f.push(n, 5);
         }
         let mut next = 1000u32;
-        let mut counter = 0u64;
         let (head, tail) = f
             .flush(
                 &p,
@@ -839,10 +843,7 @@ mod tests {
                 },
                 5,
                 Some(0), // ver el comentario en `survives_a_flush_and_load_roundtrip`
-                &mut || {
-                    counter += 1;
-                    Ok(counter)
-                },
+                None,
             )
             .unwrap();
 

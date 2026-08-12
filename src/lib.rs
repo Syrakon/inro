@@ -105,8 +105,23 @@ pub use tree::Cursor;
 // rechazar en tiempo de ejecución (`Error::BadFormat`, ver `tx.rs`) en vez
 // de en tiempo de compilación. Gatearlo aquí convierte ese error en "no
 // existe el tipo `Encryption`" al compilar, que es antes y más claro.
+//
+// **`NonceStream` y `seal`/`open` son el API de cifrado para `no_std`**, y
+// por eso se reexportan aquí y no solo dentro del crate: bajo `no_std` no
+// existe `Db` (pide `std`), así que quien integre su propio almacenamiento
+// necesita poder sellar y descifrar páginas por su cuenta. Ese llamante
+// aporta los 16 bytes de prefijo aleatorio de la sesión
+// (`NonceStream::from_prefix`) igual que ya aporta la clave de datos, por
+// la misma razón: sin sistema operativo no hay fuente de entropía portable.
+// Bajo `std` no hace falta — `Db::create`/`Db::open` sortean el prefijo
+// ellos mismos de `/dev/urandom`, una vez por apertura — pero el tipo se
+// exporta igual en los dos builds: es el mismo contrato, y no hay forma de
+// sellar sin él (`seal` toma `&mut NonceStream`, ver `crypto.rs`).
 #[cfg(feature = "encryption")]
-pub use crypto::{Algorithm, Encryption};
+pub use crypto::{
+    open as open_page, seal as seal_page, Algorithm, Encryption, NonceStream, CIPHER_PREFIX,
+    NONCE_PREFIX_LEN,
+};
 
 /// Número de página. El fichero direcciona 2^32 páginas: 2 TB con páginas de
 /// 512 bytes, 16 TB con páginas de 4 KB.

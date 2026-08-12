@@ -2,7 +2,28 @@ use crate::{crc32, CorruptKind, Error, Result, Storage};
 
 pub const HEADER_SIZE: usize = 64;
 pub const MAGIC: &[u8; 8] = b"INRO\0DB\x01";
-pub const FORMAT_MAJOR: u16 = 1;
+/// Versión de formato que este binario ESCRIBE.
+///
+/// **2 desde el cambio de diseño a nonces aleatorios**, que rompe el formato
+/// en dos sitios a la vez: la disposición de una página cifrada pasó de
+/// `contador (8) || tag (16) || texto cifrado` a `nonce (24) || tag (16) ||
+/// texto cifrado` (`crypto::CIPHER_PREFIX`, 24 → 40 bytes, con el tamaño de
+/// página lógica bajando otros 16), y la meta dejó de llevar el techo de
+/// contador de nonce en los bytes 100..108 (`Meta::write_counter`,
+/// eliminado). Ninguno de los dos cambios es detectable por CRC —los dos
+/// producen ficheros perfectamente bien formados— así que el número de
+/// versión es la única señal que distingue un formato del otro.
+pub const FORMAT_MAJOR: u16 = 2;
+
+/// Versión de formato más antigua que este binario sabe LEER. Igual a
+/// `FORMAT_MAJOR`: ruptura limpia, sin compatibilidad hacia atrás. El crate
+/// está en 0.1.0 y sin publicar, así que no hay ningún fichero del formato 1
+/// en el mundo que merezca cargar con una vía de lectura aparte — y
+/// mantenerla habría significado conservar en `crypto.rs`/`meta.rs` el
+/// esquema entero de contador persistido que este cambio existe para
+/// borrar. Ver `Error::VersionTooOld` para por qué se rechaza en vez de
+/// intentar leerlo.
+pub const FORMAT_MIN_SUPPORTED: u16 = 2;
 
 pub const MIN_PAGE_SIZE: u32 = 512;
 /// 32 KB, no 64 KB. El campo `cell_start` de la cabecera de página es `u16` y no
@@ -78,6 +99,15 @@ impl Geometry {
         let format_major = u16::from_le_bytes(b[8..10].try_into().unwrap());
         if format_major > FORMAT_MAJOR {
             return Err(Error::VersionTooNew { found: format_major, supported: FORMAT_MAJOR });
+        }
+        // Y el extremo contrario, nuevo con el formato 2: sin esto, un
+        // fichero del formato 1 pasaría este filtro (`1 > 2` es falso) y se
+        // leería con la disposición equivocada — ver `Error::VersionTooOld`.
+        if format_major < FORMAT_MIN_SUPPORTED {
+            return Err(Error::VersionTooOld {
+                found: format_major,
+                supported: FORMAT_MIN_SUPPORTED,
+            });
         }
         let log2 = b[12] as u32;
         if !(9..=15).contains(&log2) {
@@ -230,6 +260,38 @@ mod tests {
             Geometry::decode(&g.encode()),
             Err(Error::VersionTooNew { found: FORMAT_MAJOR + 1, supported: FORMAT_MAJOR })
         );
+    }
+
+    /// El extremo contrario, nuevo con el formato 2 (nonces aleatorios).
+    /// **Sin este rechazo, un fichero del formato 1 se leería con la
+    /// disposición equivocada en vez de rechazarse**: `1 > 2` es falso, así
+    /// que pasaba el filtro de "demasiado nuevo" sin más, y sus páginas
+    /// cifradas — donde los primeros 8 bytes eran un contador y ahora se
+    /// leen como el principio de un nonce de 24 — fallarían al descifrar
+    /// como si la clave fuera incorrecta o el fichero estuviera manipulado.
+    /// Ver `Error::VersionTooOld`.
+    #[test]
+    fn rejects_an_older_format() {
+        let mut g = sample();
+        g.format_major = FORMAT_MIN_SUPPORTED - 1;
+        assert_eq!(
+            Geometry::decode(&g.encode()),
+            Err(Error::VersionTooOld {
+                found: FORMAT_MIN_SUPPORTED - 1,
+                supported: FORMAT_MIN_SUPPORTED
+            })
+        );
+    }
+
+    /// Y el propio formato que este binario escribe se acepta, claro: sin
+    /// esto, un rango mal puesto (p. ej. `<=` en vez de `<`) rechazaría
+    /// todos los ficheros que el motor acaba de crear y solo lo destaparía
+    /// una prueba de integración.
+    #[test]
+    fn accepts_the_format_it_writes() {
+        let g = sample();
+        assert_eq!(g.format_major, FORMAT_MAJOR);
+        assert_eq!(Geometry::decode(&g.encode()).unwrap(), g);
     }
 
     #[test]

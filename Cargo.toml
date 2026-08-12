@@ -26,15 +26,43 @@ unsafe_code = "forbid"
 # primitivas criptográficas propias: el ahorro no compensa el riesgo. Ambas son
 # de RustCrypto, Rust puro y compatibles con no_std, y solo se compilan si la
 # feature está activa.
-# `aes-gcm` necesita su PROPIA feature `aes` (no la de este crate, aunque
+#
+# `chacha20poly1305` se usa para DOS cosas distintas, y por eso no cambia de
+# versión ni de features al pasar a nonces aleatorios: expone tanto
+# `ChaCha20Poly1305` (nonce de 12 B, que sigue envolviendo la clave de datos
+# en la meta — un solo sellado por base, con nonce aleatorio de un solo uso)
+# como `XChaCha20Poly1305` (nonce de 24 B), que es el que cifra las páginas
+# desde el cambio a `prefijo aleatorio || contador`. `XChaCha20Poly1305` NO
+# necesita ninguna feature propia: es un alias de tipo incondicional en
+# `chacha20poly1305` 0.10.1 (`pub type XChaCha20Poly1305 = ChaChaPoly1305<XChaCha20, U24>`,
+# verificado contra el fuente publicado), así que el árbol de dependencias
+# resuelto no gana ni un crate por usarlo.
+#
+# `aes-gcm-siv`, NO `aes-gcm` (cambio de esta ronda, sustitución y no
+# adición: `aes-gcm` desaparece del manifiesto). El motivo es de diseño, no
+# de gusto: el nonce nuevo es `prefijo aleatorio || contador` y AES-256-GCM
+# solo admite 12 bytes de nonce, así que el prefijo aleatorio que le cabe es
+# mucho más corto que los 16 B de XChaCha20 y una colisión de prefijos entre
+# dos aperturas deja de ser despreciable. Con AES-256-GCM esa colisión sería
+# catastrófica (mismo flujo de clave: los textos cifrados se anulan al XOR);
+# con AES-256-GCM-SIV, resistente a la reutilización de nonce POR
+# CONSTRUCCIÓN (RFC 8452), degrada a "un observador aprende que dos textos
+# planos eran iguales" — ver el razonamiento completo y la aritmética en
+# `crypto::NonceStream`. Mismo proveedor (RustCrypto), mismo estilo de API
+# (`AeadInPlace`/`KeyInit`), mismo Rust puro compatible con `no_std`, y las
+# mismas variables de backend portable (`aes_force_soft`/`polyval_force_soft`,
+# ver la tabla de `crypto.rs`) — `aes-gcm-siv` construye sobre `aes`, `ctr` y
+# `polyval`, donde `aes-gcm` usaba `aes` y `ghash`.
+# `aes-gcm-siv` necesita su PROPIA feature `aes` (no la de este crate, aunque
 # se llamen igual: son espacios de nombres distintos, uno por crate) para
-# exponer el tipo `Aes256Gcm` en sí — sin ella, `default-features = false`
+# exponer el tipo `Aes256GcmSiv` en sí — sin ella, `default-features = false`
 # deja fuera tanto ese alias como su dependencia opcional `aes`, y
 # `crypto.rs` no compila bajo la feature `aes` de este crate. Verificado
-# contra el `Cargo.toml` publicado de `aes-gcm` 0.10.3: sus features por
-# defecto son `["aes", "alloc", "getrandom"]`; aquí se activa solo `aes` +
-# `alloc`, sin `getrandom` (no hace falta: este crate no genera nonces con
-# esa dependencia, ver `crypto::generate_nonce`).
+# contra el `Cargo.toml` publicado de `aes-gcm-siv` 0.11.1, exactamente el
+# mismo patrón que tenía `aes-gcm` 0.10.3: sus features por defecto son
+# `["aes", "alloc", "getrandom"]`; aquí se activa solo `aes` + `alloc`, sin
+# `getrandom` (no hace falta: este crate no genera nonces con esa
+# dependencia, ver `crypto::read_random`).
 #
 # `rusqlite` (tarea 21) es la comparativa de la sección 17.1 de la
 # especificación: SQLite real, no una reimplementación de su formato. El
@@ -61,7 +89,7 @@ unsafe_code = "forbid"
 # distintos para la misma prueba.
 [dependencies]
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
-aes-gcm = { version = "0.10", default-features = false, features = ["alloc", "aes"], optional = true }
+aes-gcm-siv = { version = "0.11", default-features = false, features = ["alloc", "aes"], optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 # Solo para pruebas (tarea 19): las dependencias de desarrollo no cuentan
@@ -76,7 +104,7 @@ proptest = "1"
 default = ["std", "audit"]
 std = []
 encryption = ["dep:chacha20poly1305"]
-aes = ["encryption", "dep:aes-gcm"]
+aes = ["encryption", "dep:aes-gcm-siv"]
 # Comparativa de la tarea 21 contra SQLite (`tests/size.rs`,
 # `compare_against_sqlite_on_the_same_workload`). Ver el comentario de
 # `rusqlite`, arriba en `[dependencies]`, sobre por qué vive ahí y no en

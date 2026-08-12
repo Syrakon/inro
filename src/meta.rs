@@ -54,25 +54,24 @@ pub struct Meta {
     /// `decode` quien impone esa correspondencia (ver más abajo), no un
     /// invariante que este `struct` pueda hacer cumplir por construcción.
     pub wrapped_key: Option<[u8; crate::crypto::WRAPPED_KEY_LEN]>,
-    /// Techo del contador de nonce de página ya reservado de forma duradera
-    /// (tarea 17, ronda de revisión posterior a la primera entrega), bytes
-    /// 100..108 — el hueco que ya dejaba `encode` como "reservado". NO es
-    /// "el último contador usado": es "ningún contador por debajo de este
-    /// valor se ofrece jamás a una transacción futura", incluso si el
-    /// contador real usado por la última transacción fue mucho menor — ver
-    /// `Db::extend_counter_ceiling` en `tx.rs`, que es quien mantiene esa
-    /// propiedad. Sin significado en una base sin cifrar (queda en 0, sin
-    /// que nada lo lea).
-    ///
-    /// **Las DOS ranuras lo llevan siempre** (tarea 17, tercera ronda de
-    /// revisión): una extensión escribe este campo en ambas, con una
-    /// sincronización tras cada una. Si viviera en una sola, el commit
-    /// siguiente — que escribe justo esa — dejaría el registro del techo a
-    /// merced de una única escritura desgarrada, y la ranura superviviente
-    /// devolvería un contador VIEJO que la sesión siguiente volvería a
-    /// repartir.
-    pub write_counter: u64,
 }
+
+// Los bytes 100..108 de cada ranura llevaban `write_counter`, el techo del
+// contador de nonce de página reservado de forma duradera. **Eliminado con
+// el cambio a nonces aleatorios** (formato 2): el nonce ya no es
+// `página || contador` con un contador que tenga que sobrevivir a las
+// caídas, sino `prefijo aleatorio por apertura || contador dentro de la
+// apertura`, así que reiniciar el contador en cero al abrir es seguro por
+// construcción y no queda nada que persistir. Con el campo se fueron su
+// protocolo de extensión (`Db::extend_counter_ceiling`, dos escrituras de
+// meta con dos sincronizaciones incondicionales), `COUNTER_RESERVE`,
+// `WriterState::counter_ceiling` y el desempate por contador que `load`
+// necesitaba (ver más abajo).
+//
+// La región vuelve a quedar reservada a cero, como antes de la tarea 17.
+// No se reaprovecha para nada en este cambio: `META_SIZE` no se mueve, así
+// que el CRC sigue cubriendo exactamente los mismos 108 bytes y la
+// disposición del resto de campos no se toca.
 
 impl Meta {
     pub fn encode(&self, page_size: u32) -> Vec<u8> {
@@ -87,13 +86,11 @@ impl Meta {
         b[29] = self.flags;
         b[30..32].copy_from_slice(&self.format_major.to_le_bytes());
         // 40..100 clave de datos envuelta (tarea 17): nonce de 12, texto
-        // cifrado de 32 y tag de 16. 100..108 techo del contador de nonce
-        // de página (tarea 17, ronda de revisión posterior a la primera
-        // entrega — ver el comentario de `write_counter`).
+        // cifrado de 32 y tag de 16. 100..108 reservado (ver el comentario
+        // tras la struct: ahí vivía `write_counter`, ya eliminado).
         if let Some(wrapped) = &self.wrapped_key {
             b[40..40 + crate::crypto::WRAPPED_KEY_LEN].copy_from_slice(wrapped);
         }
-        b[100..108].copy_from_slice(&self.write_counter.to_le_bytes());
         let crc = crc32::checksum(&b[..META_SIZE - 4]);
         b[META_SIZE - 4..META_SIZE].copy_from_slice(&crc.to_le_bytes());
         b
@@ -133,7 +130,6 @@ impl Meta {
             flags,
             format_major: u16::from_le_bytes(b[30..32].try_into().unwrap()),
             wrapped_key,
-            write_counter: u64::from_le_bytes(b[100..108].try_into().unwrap()),
         })
     }
 
@@ -153,31 +149,17 @@ impl Meta {
     /// `txn_id`. Es todo el procedimiento de recuperación que existe: sin WAL,
     /// sin recorrido de cola, coste constante.
     ///
-    /// **Desempate por `write_counter` a igualdad de `txn_id`** (tarea 17,
-    /// segunda ronda de revisión posterior a la primera entrega):
-    /// `Db::extend_counter_ceiling` deja las dos ranuras con el MISMO
-    /// `txn_id` — cada una una copia exacta de la última meta confirmada,
-    /// solo con `write_counter` avanzado — y las escribe una detrás de otra
-    /// mientras una transacción está en curso (ver su comentario en
-    /// `tx.rs`). Entre las dos escrituras hay una ventana en la que las
-    /// ranuras comparten `txn_id` y difieren en `write_counter`. Sin este
-    /// desempate, `meta.txn_id > b.txn_id` es estrictamente falso a
-    /// igualdad y la ranura A (procesada primero) gana siempre — que
-    /// podría ser precisamente la que tiene el `write_counter` más VIEJO,
-    /// dejando que una futura transacción reparta de nuevo contadores que
-    /// la extensión ya había dejado fuera de circulación.
-    ///
-    /// Es seguro preferir el `write_counter` mayor en este caso, y solo en
-    /// este caso, porque a igualdad de `txn_id` las dos ranuras describen
-    /// el MISMO estado confirmado: `root`, lista de libres y `n_pages`
-    /// coinciden byte a byte, porque las dos salen de copiar la misma meta
-    /// confirmada. Y esa premisa es hoy exacta (tarea 17, TERCERA ronda de
-    /// revisión): hasta esa ronda, `Db::open` subía el `n_pages` de la meta
-    /// que guardaba en memoria hasta la extensión real del fichero, así que
-    /// la copia que escribía una extensión podía diferir de la ranura
-    /// hermana en un campo que NO era el contador — el único camino vivo
-    /// por el que este desempate llegaba a elegir entre dos estados
-    /// distintos. Ver el comentario del campo `Db::committed` en `tx.rs`.
+    /// **Sin desempate a igualdad de `txn_id`, y ya no hace falta ninguno**
+    /// (cambio de diseño a nonces aleatorios). Lo hubo: mientras existió
+    /// `write_counter`, `Db::extend_counter_ceiling` escribía las dos
+    /// ranuras con el MISMO `txn_id` y distinto contador, una detrás de
+    /// otra, a mitad de una transacción — una ventana en la que las dos
+    /// ranuras empataban en `txn_id`, y en la que quedarse con la primera
+    /// podía perder el techo recién reservado. Ese protocolo desapareció
+    /// con el campo, y con él la única forma de que dos ranuras compartan
+    /// `txn_id` con contenido distinto: hoy la única escritura de meta que
+    /// no viene de un commit es la de `Db::create`, que deja las dos
+    /// ranuras byte a byte idénticas. `>` estricto vuelve a bastar.
     pub fn load(storage: &dyn Storage, g: &Geometry) -> Result<(Meta, MetaSlot)> {
         let mut best: Option<(Meta, MetaSlot)> = None;
         for slot in [MetaSlot::A, MetaSlot::B] {
@@ -195,10 +177,7 @@ impl Meta {
             }
             let better = match best {
                 None => true,
-                Some((b, _)) => {
-                    meta.txn_id > b.txn_id
-                        || (meta.txn_id == b.txn_id && meta.write_counter > b.write_counter)
-                }
+                Some((b, _)) => meta.txn_id > b.txn_id,
             };
             if better {
                 best = Some((meta, slot));
@@ -226,15 +205,20 @@ mod tests {
         Meta {
             txn_id, root: 9, catalog_root: 0, freelist_head: 0, freelist_tail: 0,
             n_pages: 10, page_size_log2: 9, format_major: FORMAT_MAJOR, flags: 0,
-            wrapped_key: None, write_counter: 0,
+            wrapped_key: None,
         }
     }
 
+    /// Los bytes donde vivía `write_counter` tienen que quedar a cero, no
+    /// con basura: es lo que hace que un fichero nuevo sea reproducible y
+    /// que la región siga disponible si algún día se reaprovecha. Sin esta
+    /// prueba, un `encode` que dejara ahí lo que hubiera en el búfer
+    /// pasaría inadvertido — el CRC se calcula DESPUÉS, así que cubriría la
+    /// basura tan felizmente como los ceros.
     #[test]
-    fn write_counter_roundtrips() {
-        let mut m = meta(1);
-        m.write_counter = 0x0102_0304_0506_0708;
-        assert_eq!(Meta::decode(&m.encode(512)).unwrap().write_counter, m.write_counter);
+    fn the_bytes_that_held_the_nonce_counter_ceiling_are_reserved_zero() {
+        let encoded = meta(1).encode(512);
+        assert_eq!(&encoded[100..108], &[0u8; 8][..]);
     }
 
     #[test]
@@ -283,40 +267,28 @@ mod tests {
         assert_eq!(slot, MetaSlot::B);
     }
 
-    /// Tarea 17, segunda ronda de revisión posterior a la primera entrega:
-    /// a igualdad de `txn_id` (el escenario que deja
-    /// `Db::extend_counter_ceiling` cuando extiende el techo de nonce a
-    /// mitad de una transacción, escribiendo una copia de la última meta
-    /// confirmada en la ranura inactiva), `load` debe preferir la ranura
-    /// con el `write_counter` más alto — es la única forma de que una
-    /// extensión sobreviva a una caída justo después: sin este desempate,
-    /// la ranura A (procesada primero en el bucle) gana siempre, aunque su
-    /// `write_counter` sea el más viejo de las dos.
+    /// El único escenario que quedaba con dos ranuras empatadas en
+    /// `txn_id` tras eliminar `write_counter` y su protocolo de extensión:
+    /// una base recién creada, donde `Db::create` escribe las DOS ranuras
+    /// con la misma meta. Empatan porque son idénticas, así que da lo mismo
+    /// cuál gane — lo que esta prueba fija es que `load` siga eligiendo una
+    /// de forma determinista (la A, la primera del recorrido) en vez de
+    /// fallar o de depender del orden en que se escribieron.
     #[test]
-    fn load_prefers_the_higher_write_counter_when_txn_id_ties() {
+    fn load_is_deterministic_when_both_slots_are_identical() {
         let (s, g) = (MemStorage::new(), geo());
-        let mut a = meta(5);
-        a.write_counter = 100;
-        a.store(&s, &g, MetaSlot::A).unwrap();
-        let mut b = meta(5); // mismo txn_id que A
-        b.write_counter = 200;
-        b.store(&s, &g, MetaSlot::B).unwrap();
+        meta(5).store(&s, &g, MetaSlot::A).unwrap();
+        meta(5).store(&s, &g, MetaSlot::B).unwrap();
         let (m, slot) = Meta::load(&s, &g).unwrap();
-        assert_eq!(m.write_counter, 200, "debe preferir el contador mas alto a igualdad de txn_id");
-        assert_eq!(slot, MetaSlot::B);
+        assert_eq!(m.txn_id, 5);
+        assert_eq!(slot, MetaSlot::A);
 
-        // Y en el orden inverso (la ranura A tiene el contador mayor), para
-        // confirmar que no es un artefacto del orden de recorrido del bucle.
+        // Y en el orden inverso de escritura, para confirmar que no es un
+        // artefacto de cuál se escribió última.
         let (s2, g2) = (MemStorage::new(), geo());
-        let mut a2 = meta(7);
-        a2.write_counter = 300;
-        a2.store(&s2, &g2, MetaSlot::A).unwrap();
-        let mut b2 = meta(7);
-        b2.write_counter = 250;
-        b2.store(&s2, &g2, MetaSlot::B).unwrap();
-        let (m2, slot2) = Meta::load(&s2, &g2).unwrap();
-        assert_eq!(m2.write_counter, 300);
-        assert_eq!(slot2, MetaSlot::A);
+        meta(7).store(&s2, &g2, MetaSlot::B).unwrap();
+        meta(7).store(&s2, &g2, MetaSlot::A).unwrap();
+        assert_eq!(Meta::load(&s2, &g2).unwrap().1, MetaSlot::A);
     }
 
     #[test]

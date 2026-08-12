@@ -279,17 +279,23 @@ mod imp_std {
     /// canonicalizada.
     ///
     /// Existe porque `Db` no tiene ningún estado compartido entre asas: dos
-    /// `Db` sobre el mismo fichero traen cada uno su `write_lock` (el
-    /// escritor único deja de ser único, y dos escritores copy-on-write
-    /// sobre un mismo fichero es corrupción, con cifrado o sin él) y, con
-    /// cifrado, su propio `WriterState::live_counter` — que arranca en el
-    /// mismo `write_counter` de la meta para los dos, así que ambos reparten
-    /// LOS MISMOS contadores y, con ellos, los mismos nonces `página ||
-    /// contador` bajo la misma clave de datos. Dos textos cifrados con el
-    /// mismo nonce se anulan al XOR: eso no es "un árbol corrupto", es la
-    /// pérdida total de la confidencialidad que la feature existe para dar.
-    /// `NonceReuse` no lo ve: comprueba la unicidad DENTRO de una
-    /// transacción, y aquí cada asa es coherente consigo misma.
+    /// `Db` sobre el mismo fichero traen cada uno su `write_lock`, así que
+    /// el escritor único deja de ser único — y dos escritores
+    /// copy-on-write sobre un mismo fichero es corrupción, con cifrado o
+    /// sin él. Ese daño sigue siendo motivo de sobra para este rechazo.
+    ///
+    /// **Lo que YA NO es (cambio de diseño a nonces aleatorios).** Hasta
+    /// ese cambio había un segundo daño, peor: cada asa traía su propio
+    /// contador de nonce, y los dos arrancaban en el mismo `write_counter`
+    /// de la meta, así que las dos asas repartían LOS MISMOS nonces bajo la
+    /// misma clave de datos y sus textos cifrados se anulaban al XOR —
+    /// pérdida total de la confidencialidad, no un árbol corrupto. Hoy cada
+    /// apertura sortea su propio prefijo aleatorio de 16 bytes
+    /// (`crypto::NonceStream`), así que dos asas no pueden compartir un
+    /// nonce ni aunque este rechazo no existiera. Comprobado en
+    /// `two_opens_of_the_same_file_draw_different_prefixes` (`crypto.rs`),
+    /// que es la misma propiedad sin depender de este guardián — y por eso
+    /// vale también para dos PROCESOS, donde no hay guardián posible.
     ///
     /// **Solo cubre este proceso, y es todo lo que se puede cubrir aquí**
     /// (ver la sección 3.4 de la especificación, corregida en esta misma
@@ -514,7 +520,7 @@ mod tests {
         assert_eq!(
             FileStorage::open(&path).err(),
             Some(Error::AlreadyOpen),
-            "dos asas sobre un fichero son dos `write_lock` y dos `live_counter`"
+            "dos asas sobre un fichero son dos `write_lock`: el escritor unico deja de serlo"
         );
         drop(first);
 
@@ -527,17 +533,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// El mismo rechazo sobre una base CIFRADA: es el caso que de verdad
-    /// duele — dos asas reparten los mismos contadores desde el mismo
-    /// `write_counter` de la meta, así que sellan páginas con los mismos
-    /// nonces `página || contador` bajo la misma clave de datos.
+    /// El mismo rechazo sobre una base CIFRADA. Era el caso que de verdad
+    /// dolía —dos asas repartiendo los mismos nonces bajo la misma clave de
+    /// datos— y desde el cambio a nonces aleatorios ya no lo es: lo que
+    /// esta prueba fija ahora es que el rechazo siga ahí, porque la
+    /// corrupción del árbol por dos escritores concurrentes no depende del
+    /// cifrado y no se ha ido a ninguna parte. Ver el comentario de
+    /// `Error::AlreadyOpen`.
     #[cfg(feature = "encryption")]
     #[test]
     fn an_encrypted_database_refuses_the_second_handle_too() {
         use crate::crypto::{Algorithm, Encryption};
         let path = temp_path("cifrada");
         let opts = Options {
-            encryption: Some(Encryption { key: [7u8; 32], algorithm: Algorithm::ChaCha20Poly1305 }),
+            encryption: Some(Encryption { key: [7u8; 32], algorithm: Algorithm::XChaCha20Poly1305 }),
             ..Options::default()
         };
         let db = Db::create(Box::new(FileStorage::open(&path).unwrap()), opts).unwrap();

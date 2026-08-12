@@ -63,8 +63,14 @@ pub use crate::crypto::Encryption;
 ///   trabajo—, un 23 % más de escrituras físicas y 31 veces menos `fsync`.
 ///   Ver `relaxed_sync_costs_bounded_space_and_far_fewer_fsyncs` en
 ///   `tests/faults.rs`.
-/// - **Para no reutilizar un contador de nonce** en una base cifrada, ver
-///   `Db::extend_counter_ceiling`.
+///
+/// **Ya solo queda ese.** Hasta el cambio de diseño a nonces aleatorios
+/// había un segundo `fsync` incondicional, uno por sesión: la reserva
+/// duradera de contadores de nonce de una base cifrada. Con un prefijo
+/// aleatorio nuevo en cada apertura no hay nada que reservar, así que una
+/// base cifrada paga hoy exactamente las mismas sincronizaciones que una
+/// sin cifrar — ver `a_reopened_encrypted_database_pays_no_extra_sync_at_all`
+/// en `crypto.rs`.
 ///
 /// # El límite que ningún modo relajado puede superar
 ///
@@ -130,18 +136,26 @@ pub struct Db {
     /// en memoria.
     ///
     /// **No es una sutileza de estilo** (tarea 17, tercera ronda de
-    /// revisión, hallazgo MEDIUM): `Db::extend_counter_ceiling` copia esta
-    /// meta y la ESCRIBE en el fichero a mitad de una transacción, sin que
-    /// haya ningún commit de por medio. Cualquier campo que aquí valiera
-    /// más de lo que hay en disco se publicaría como si estuviera
-    /// confirmado. Eso es justo lo que pasaba con `n_pages`: `Db::open` lo
-    /// subía hasta la extensión real del fichero (las páginas recuperadas
-    /// de una transacción interrumpida) y lo guardaba aquí, mientras esas
-    /// páginas vivían solo en la lista de libres EN MEMORIA — así que una
-    /// extensión seguida de un aborto dejaba en disco un `n_pages` alto con
-    /// una lista de libres que no poseía la diferencia, y esas páginas se
-    /// perdían para siempre. Doce ciclos abrir-extender-abortar: `n_pages`
-    /// de 10 a 22, doce páginas fugadas, sin cota. La extensión recuperada
+    /// revisión, hallazgo MEDIUM). Lo era menos aún cuando existía la
+    /// extensión del techo de contador de nonce, que copiaba esta meta y la
+    /// ESCRIBÍA en el fichero a mitad de una transacción, sin ningún commit
+    /// de por medio: cualquier campo que aquí valiera más de lo que hay en
+    /// disco se publicaba como si estuviera confirmado. Eso es justo lo que
+    /// pasaba con `n_pages`: `Db::open` lo subía hasta la extensión real
+    /// del fichero (las páginas recuperadas de una transacción
+    /// interrumpida) y lo guardaba aquí, mientras esas páginas vivían solo
+    /// en la lista de libres EN MEMORIA — así que una extensión seguida de
+    /// un aborto dejaba en disco un `n_pages` alto con una lista de libres
+    /// que no poseía la diferencia, y esas páginas se perdían para siempre.
+    /// Doce ciclos abrir-extender-abortar: `n_pages` de 10 a 22, doce
+    /// páginas fugadas, sin cota.
+    ///
+    /// Esa escritura de meta fuera de un commit ya no existe, así que el
+    /// campo no puede publicar nada por ese camino; la invariante se
+    /// mantiene igual porque sigue siendo la que hace que `Db::committed`
+    /// signifique lo que dice — y porque el siguiente camino que escriba
+    /// meta fuera de un commit volvería a necesitarla. La extensión
+    /// recuperada
     /// vive ahora en `WriterState::n_pages_floor`, que es donde de verdad
     /// pertenece: es el punto de partida de la PRÓXIMA transacción, no algo
     /// que ya esté confirmado.
@@ -167,14 +181,17 @@ pub struct Db {
     /// `a_power_cut_that_keeps_data_pages_but_loses_the_last_metas_leaves_a_whole_snapshot`
     /// (`tests/faults.rs`).
     ///
-    /// **Es exactamente el mismo razonamiento que `counter_ceiling`**
-    /// (`WriterState`, más abajo), un módulo más allá y por el mismo
-    /// motivo: aquel campo se negó a avanzar con la escritura de meta de un
-    /// commit normal porque «bajo `Sync::Interval`/`Never` puede no haberse
-    /// hecho durable todavía», y solo acepta avances ya demostrados en
-    /// disco. Este campo es esa misma regla aplicada a la reutilización de
-    /// páginas: solo avanza tras un `sync()` que devolvió `Ok` (ver
-    /// `Db::sync_upto`, el ÚNICO sitio que lo mueve).
+    /// **Era exactamente el mismo razonamiento que `counter_ceiling`**, el
+    /// techo de contador de nonce que vivía en `WriterState` hasta el
+    /// cambio a nonces aleatorios: aquel campo se negaba a avanzar con la
+    /// escritura de meta de un commit normal porque «bajo
+    /// `Sync::Interval`/`Never` puede no haberse hecho durable todavía», y
+    /// solo aceptaba avances ya demostrados en disco. Este campo es esa
+    /// misma regla aplicada a la reutilización de páginas: solo avanza tras
+    /// un `sync()` que devolvió `Ok` (ver `Db::sync_upto`, el ÚNICO sitio
+    /// que lo mueve). Aquel desapareció con su aparato entero; este sigue,
+    /// porque la corrección del reciclado de páginas no tiene nada que ver
+    /// con el cifrado.
     ///
     /// `n_pages` es la extensión del fichero en el momento de ese avance:
     /// es la base contra la que `reclaim_needs_a_sync` mide cuánto ha
@@ -253,35 +270,33 @@ pub struct Db {
 /// no se relee de disco en cada una.
 struct WriterState {
     freelist: Freelist,
-    /// Contador de nonce VIVO (tarea 17, segunda ronda de revisión posterior
-    /// a la primera entrega). Estado de la BASE, no de una transacción —
-    /// vive aquí, no en `WriteTxn`, precisamente para que sobreviva a un
-    /// aborto sin comprometerse: `WriteTxn::Drop` restaura `freelist` desde
-    /// `pre_freelist`, pero NUNCA toca esto. Es justo esa propiedad —
-    /// nunca retrocede, ni siquiera cuando una transacción se descarta sin
-    /// `commit` — la que cierra el hallazgo BLOCKER de la segunda ronda: un
-    /// aborto no puede volver a repartir un contador que una transacción
-    /// muerta ya usó para sellar páginas reales en disco, porque nada
-    /// rebobina este campo.
-    live_counter: u64,
-    /// Techo hasta el que `live_counter` puede crecer sin que haga falta
-    /// otra escritura DURADERA. Solo avanza en dos momentos, los dos
-    /// demostrablemente duraderos:
-    /// - al abrir la base (`Db::assemble`), desde el `write_counter` de la
-    ///   meta ganadora;
-    /// - al extender la reserva (`Db::extend_counter_ceiling`), que
-    ///   sincroniza de forma INCONDICIONAL, sin importar la política de
-    ///   `Sync` configurada.
+    /// Flujo de nonces de ESTA apertura: el prefijo aleatorio de 16 bytes
+    /// que se sorteó al abrir más el contador de escrituras desde entonces
+    /// (`crypto::NonceStream`). `None` en una base sin cifrar, donde no se
+    /// sella ninguna página.
     ///
-    /// Un commit normal SÍ escribe un `write_counter` más alto en la META
-    /// que ya iba a escribir de todos modos (barato: viaja con una
-    /// escritura que ya iba a pasar) — pero esa escritura NO actualiza este
-    /// campo, porque bajo `Sync::Interval`/`Never` puede no haberse hecho
-    /// durable todavía. Tratarla como si lo fuera sería reabrir exactamente
-    /// el hueco HIGH que encontró la segunda ronda de revisión: el único
-    /// avance de `counter_ceiling` en el que se puede confiar es el que ya
-    /// se demostró en disco.
-    counter_ceiling: u64,
+    /// **Estado de la BASE, no de una transacción** — vive aquí, no en
+    /// `WriteTxn`, precisamente para que sobreviva a un aborto sin
+    /// rebobinar: `WriteTxn::Drop` restaura `freelist` desde
+    /// `pre_freelist`, pero NUNCA toca esto. Es justo esa propiedad — el
+    /// contador no retrocede ni cuando una transacción se descarta sin
+    /// `commit` — la que impide que un aborto vuelva a repartir un nonce
+    /// que una transacción muerta ya usó para sellar páginas que sí
+    /// llegaron al medio.
+    ///
+    /// **Y ya no hace falta nada más que esto.** Hasta el cambio a nonces
+    /// aleatorios, aquí vivían DOS campos: el contador vivo y un
+    /// `counter_ceiling`, el techo hasta el que podía crecer sin otra
+    /// escritura duradera, respaldado por `Meta::write_counter` en disco y
+    /// extendido por `Db::extend_counter_ceiling` con dos escrituras de
+    /// meta y dos `fsync` incondicionales. Todo aquello existía por una
+    /// sola razón: tras una caída no había forma de saber cuántos
+    /// contadores había quemado la sesión muerta, y reiniciar en cero
+    /// habría repetido nonces. Con un prefijo aleatorio nuevo en cada
+    /// apertura, la sesión siguiente vive en otro espacio de nonces por
+    /// completo, así que reiniciar el contador en cero es seguro por
+    /// construcción y no queda nada que persistir, extender ni sincronizar.
+    nonce_stream: Option<crate::crypto::NonceStream>,
     /// Suelo de `n_pages` para la próxima transacción: la extensión REAL
     /// del fichero tal como la vio `Db::open`, incluidas las páginas que
     /// dejó una transacción interrumpida y que la recuperación metió en
@@ -344,19 +359,6 @@ impl Db {
             format_major: FORMAT_MAJOR,
             flags,
             wrapped_key: None,
-            // Techo inicial pre-sembrado a `COUNTER_RESERVE` para una base
-            // cifrada (tarea 17, segunda ronda de revisión posterior a la
-            // primera entrega) — no 0. Esta escritura YA se sincroniza sin
-            // condiciones dos líneas más abajo (`storage.sync()?`, ya
-            // existía antes de esta ronda), así que sembrar el techo aquí
-            // es gratis: cubre de inmediato la primera `COUNTER_RESERVE` de
-            // contadores sin que la primera escritura cifrada de la base
-            // tenga que pagar una extensión aparte. `live_counter` arranca
-            // en 0 por separado, más abajo, al construir `WriterState` — a
-            // diferencia de `Db::open`, aquí no hay ninguna sesión previa
-            // cuyo progreso haya que proteger, así que no hace falta
-            // arrancar el contador vivo en el techo también.
-            write_counter: if opts.encryption.is_some() { COUNTER_RESERVE } else { 0 },
         };
         // Genera la clave de datos y la envuelve con la maestra ANTES de
         // guardar la meta: `meta.wrapped_key` tiene que estar ya poblado
@@ -369,15 +371,14 @@ impl Db {
         meta.store(storage.as_ref(), &geometry, MetaSlot::B)?;
         storage.sync()?;
 
-        // `live_counter` arranca en 0, NO en `meta.write_counter`
-        // (`COUNTER_RESERVE` si está cifrada): a diferencia de `Db::open`,
-        // aquí no hay ninguna sesión previa cuyo progreso proteger, así que
-        // no hace falta arrancar el contador vivo en el techo también —
-        // ver el comentario del campo `write_counter` de `meta`, arriba.
+        // El prefijo de nonce se sortea aquí, una vez, exactamente igual
+        // que en `Db::open`: una base recién creada y una reabierta son la
+        // misma situación desde el punto de vista del cifrado — cada
+        // apertura estrena su propio espacio de nonces y arranca el
+        // contador en cero. Ver `WriterState::nonce_stream`.
         let writer_state = WriterState {
             freelist: Freelist::empty(),
-            live_counter: 0,
-            counter_ceiling: meta.write_counter,
+            nonce_stream: Self::new_nonce_stream(encryption.is_some())?,
             // Fichero recién creado: no hay ninguna página más allá de lo
             // que la meta ya declara, así que el suelo coincide con ella.
             n_pages_floor: meta.n_pages,
@@ -560,26 +561,26 @@ impl Db {
         // Pero ese avance NO va a `meta` (tarea 17, tercera ronda de
         // revisión): la meta que se guarda en `self.committed` tiene que
         // seguir siendo byte a byte la que está en disco, porque
-        // `extend_counter_ceiling` la copia y la escribe sin ningún commit
-        // de por medio — ver los comentarios de `Db::committed` y de
+        // `Db::committed` tiene que seguir siendo byte a byte la meta que
+        // hay en disco — ver su comentario y el de
         // `WriterState::n_pages_floor`. El suelo viaja en `WriterState` y
         // `begin_write` lo aplica.
         let n_pages_floor = core::cmp::max(meta.n_pages, file_pages);
 
-        // El contador VIVO arranca en el TECHO recuperado, no en "lo último
-        // que se usó" (tarea 17, segunda ronda de revisión posterior a la
-        // primera entrega, punto 3 del diseño corregido): no hay forma de
-        // saber, solo con lo que quedó en disco, cuánto del margen bajo ese
-        // techo llegó a usarse de verdad antes de una caída — así que se
-        // asume el peor caso (todo, hasta el techo) y se arranca justo ahí.
-        // Cualquier contador que una sesión anterior quemara cae por
-        // definición por debajo de este valor, así que jamás se vuelve a
-        // repartir. A diferencia de `Db::create`, aquí SÍ hay una sesión
-        // previa cuyo progreso proteger.
+        // Prefijo de nonce nuevo y contador desde cero, sin mirar nada de
+        // lo que quedó en disco. **Es el cambio que hace innecesario todo
+        // el aparato de techo de contador**: antes había que leer un techo
+        // persistido y arrancar justo ahí, asumiendo el peor caso, porque
+        // no había forma de saber cuánto del margen había quemado la sesión
+        // anterior antes de morir. Ahora esta apertura estrena un espacio
+        // de nonces propio —128 bits aleatorios de separación respecto a
+        // CUALQUIER sesión anterior de este fichero, incluida la de una
+        // copia de seguridad restaurada— así que lo que hiciera la sesión
+        // previa no puede colisionar con lo que haga esta. Ver
+        // `WriterState::nonce_stream` y el comentario del módulo `crypto`.
         let writer_state = WriterState {
             freelist,
-            live_counter: meta.write_counter,
-            counter_ceiling: meta.write_counter,
+            nonce_stream: Self::new_nonce_stream(encryption.is_some())?,
             n_pages_floor,
         };
 
@@ -587,13 +588,10 @@ impl Db {
         Ok(Self::assemble(storage, geometry, meta, slot, opts, writer_state, encryption))
     }
 
-    /// Toma `WriterState` ya construido, no `freelist`/`live_counter`
-    /// sueltos (`cargo clippy`, `too_many_arguments`: eran 8 parámetros
-    /// tras añadir `live_counter` en la segunda ronda de revisión posterior
-    /// a la primera entrega de la tarea 17 — juntar los dos que de todos
-    /// modos solo se usan para construir el mismo `WriterState` los deja
-    /// en 7, sin perder nada: cada llamador YA tenía `meta` a mano para
-    /// calcular `counter_ceiling`).
+    /// Toma `WriterState` ya construido, no sus campos sueltos
+    /// (`cargo clippy`, `too_many_arguments`: eran 8 parámetros cuando el
+    /// contador de nonce vivía en dos campos aparte — agruparlos en el
+    /// `WriterState` que de todos modos iban a formar los deja en 7).
     fn assemble(
         storage: Box<dyn Storage>,
         geometry: Geometry,
@@ -638,7 +636,7 @@ impl Db {
     fn init_data_key(opts: &Options, meta: &mut Meta) -> Result<Option<Encryption>> {
         let Some(master) = &opts.encryption else { return Ok(None) };
         let data_key = crate::crypto::generate_data_key()?;
-        let wrap_nonce = crate::crypto::generate_nonce()?;
+        let wrap_nonce = crate::crypto::generate_wrap_nonce()?;
         meta.wrapped_key = Some(crate::crypto::wrap_key(&master.key, &data_key, wrap_nonce)?);
         Ok(Some(Encryption { key: data_key, algorithm: master.algorithm }))
     }
@@ -689,6 +687,30 @@ impl Db {
         if opts.encryption.is_some() || meta.flags & FLAG_ENCRYPTED != 0 {
             return Err(Error::BadFormat);
         }
+        Ok(None)
+    }
+
+    /// Sortea el prefijo de nonce de esta apertura, si la base está
+    /// cifrada. UNA lectura de `/dev/urandom` por apertura — no por
+    /// escritura, que es justo lo que este diseño evita (ver el comentario
+    /// del módulo `crypto`) — y ninguna en una base sin cifrar.
+    ///
+    /// La llaman `Db::create` y `Db::open` por igual: para el cifrado las
+    /// dos son lo mismo, "empieza una sesión nueva".
+    #[cfg(feature = "encryption")]
+    fn new_nonce_stream(encrypted: bool) -> Result<Option<crate::crypto::NonceStream>> {
+        match encrypted {
+            true => Ok(Some(crate::crypto::NonceStream::random()?)),
+            false => Ok(None),
+        }
+    }
+
+    /// Sin la feature, `encrypted` solo puede ser `false`:
+    /// `init_data_key`/`open_data_key` (arriba) ya han fallado alto si
+    /// alguien pidió cifrado o si el fichero dice estarlo. Devolver `None`
+    /// sin más es correcto, no una omisión silenciosa.
+    #[cfg(not(feature = "encryption"))]
+    fn new_nonce_stream(_encrypted: bool) -> Result<Option<crate::crypto::NonceStream>> {
         Ok(None)
     }
 }
@@ -962,56 +984,35 @@ impl Drop for ReadTxn<'_> {
     }
 }
 
-/// Cuánto avanza `Db::extend_counter_ceiling` el techo de contador de nonce
-/// cada vez que lo extiende (tarea 17, SEGUNDA ronda de revisión posterior a
-/// la primera entrega — el diseño de la primera ronda, que reservaba esto
-/// por transacción en `begin_write`, tenía dos defectos BLOCKER propios:
-/// una extensión a mitad de transacción podía publicar el `root` a medio
-/// hacer de esa MISMA transacción como si fuera un commit real, y un aborto
-/// no hacía retroceder nada, así que la siguiente transacción volvía a
-/// repartir los contadores que la abortada ya había usado. Ver el
-/// comentario de `WriterState::live_counter` para el diseño corregido).
-///
-/// Con el diseño corregido, esto YA NO es "cuánto se reserva por
-/// transacción": es cuánto dura cada extensión, un evento raro e
-/// independiente de los límites de transacción — la mayoría de las
-/// transacciones no llegan a disparar ni una. Elegido con la medición real
-/// de esta ronda de revisión: 45 000 `put` en una transacción quemaron
-/// 134 218 contadores (≈3 por `put`, consistente con "un lote de mil
-/// registros asigna del orden de cuatro mil páginas", ya documentado en
-/// `alloc` más abajo) y la carga de referencia de este proyecto son
-/// podas de cientos de miles de entradas por nodo y día (ver el comentario
-/// de `WriteTxn::delete_range`) — un solo `COUNTER_RESERVE` tiene que cubrir
-/// lotes de ESE orden sin extender más que alguna vez, no solo el caso de
-/// prueba de 45 000. Un millón cubre, al ritmo medido, un lote de en torno a
-/// 330 000 `put` antes de necesitar una sola extensión — muy por encima de
-/// lo medido, con margen — y sigue siendo irrelevante frente a `u64`: mil
-/// transacciones por segundo sin parar durante un siglo, si CADA una
-/// disparase una extensión (no es el caso: las extensiones son mucho menos
-/// frecuentes que las transacciones), consumirían del orden de 3×10¹⁸ — un
-/// 17 % de `u64::MAX` (≈1,8×10¹⁹) en el peor caso, exageradamente pesimista.
-const COUNTER_RESERVE: u64 = 1_000_000;
-
 pub struct WriteTxn<'db> {
     db: &'db Db,
     guard: MutexGuard<'db, Option<WriterState>>,
     meta: Meta,
     slot: MetaSlot,
-    /// Pares `(página, contador de nonce)` ya sellados en esta transacción
-    /// (tarea 17). Comprobación defensiva, no la fuente real de la garantía
-    /// de unicidad — esa la da la construcción de `WriterState::live_counter`
-    /// (estrictamente creciente, nunca retrocede — ver su comentario) — pero
-    /// convierte esa construcción de una suposición no comprobada a algo que
-    /// `write_page` verifica en cada escritura: si algún cambio futuro
-    /// rompe el incremento, esto lo detecta con un error en vez de sellar
-    /// dos páginas con el mismo nonce en silencio.
+    /// Números de escritura (`crypto::NonceStream::issued`) ya consumidos
+    /// por esta transacción (tarea 17). Comprobación defensiva, no la
+    /// fuente real de la garantía de unicidad — esa la da la construcción
+    /// de `WriterState::nonce_stream` (contador estrictamente creciente que
+    /// no rebobina nunca, ver su comentario) — pero convierte esa
+    /// construcción de una suposición no comprobada a algo que `write_page`
+    /// verifica en cada escritura: si algún cambio futuro rompe el
+    /// incremento, esto lo detecta con un error en vez de sellar dos
+    /// páginas con el mismo nonce en silencio.
+    ///
+    /// **Sobre el número de escritura, no sobre el par `(página, contador)`
+    /// de antes** (cambio a nonces aleatorios): el nonce ya no lleva el
+    /// número de página, así que dos páginas distintas con el mismo
+    /// contador serían una colisión real y el par no la detectaría. Y el
+    /// número de escritura sigue siendo único aunque el prefijo se renueve
+    /// a media apertura (agotamiento del contador de AES, ver
+    /// `NonceStream::next`), porque `issued` no rebobina en esa renovación.
     ///
     /// **Solo se puebla si la base está cifrada** (segunda ronda de
     /// revisión posterior a la primera entrega, hallazgo sobre coste de
     /// memoria: en una transacción de 45 000 `put` esto llegaba a costar
     /// del orden de 1,6 MB, sin dar ninguna protección real a una base SIN
-    /// cifrar, donde el contador ni siquiera se usa). Ver `write_page`.
-    written: BTreeSet<(PageNo, u64)>,
+    /// cifrar, donde no se sella nada). Ver `write_page`.
+    written: BTreeSet<u64>,
     /// Escrituras físicas (`write_page`) emitidas por esta transacción hasta
     /// ahora — tarea 20. A diferencia de `written`, se lleva SIEMPRE, con o
     /// sin cifrado: es un `u64` que solo se incrementa, sin coste de memoria
@@ -1064,7 +1065,7 @@ pub struct WriteTxn<'db> {
     /// normal, y una sola página puede reciclarse así decenas o cientos de
     /// veces (121 veces sobre 200 `put`, medido). De ahí que el nonce ya no
     /// se derive de `txn_id`, sino del contador vivo de la base — ver
-    /// `WriterState::live_counter`.
+    /// `WriterState::nonce_stream`.
     own_free: Vec<PageNo>,
 }
 
@@ -1105,13 +1106,10 @@ impl Db {
         // `WriterState::n_pages_floor`.
         meta.n_pages = core::cmp::max(meta.n_pages, state.n_pages_floor);
 
-        // Sin nada que hacer con el contador de nonce aquí (segunda ronda
-        // de revisión posterior a la primera entrega): a diferencia de la
-        // primera ronda, `begin_write` ya NO reserva nada — el contador
-        // vivo vive en `WriterState`, sobrevive tal cual entre
-        // transacciones (abortadas o no), y solo se extiende sobre la
-        // marcha si hace falta, dentro de `write_page`/`commit`. Ver
-        // `WriterState::live_counter`.
+        // Sin nada que hacer con los nonces aquí: el flujo vive en
+        // `WriterState`, sobrevive tal cual entre transacciones (abortadas
+        // o no) y no necesita reservar ni extender nada. Ver
+        // `WriterState::nonce_stream`.
         Ok(WriteTxn {
             db: self,
             guard,
@@ -1124,125 +1122,6 @@ impl Db {
             self_allocated: BTreeSet::new(),
             own_free: Vec::new(),
         })
-    }
-
-    /// Extiende el techo de contador de nonce cuando el contador vivo está
-    /// a punto de alcanzarlo (tarea 17, segunda ronda de revisión posterior
-    /// a la primera entrega). Escribe una meta que es una COPIA EXACTA de
-    /// la última meta CONFIRMADA (`self.committed`, leída aquí mismo, en el
-    /// momento de la llamada) — root, lista de libres, `n_pages`, `txn_id`,
-    /// todo sin tocar salvo `write_counter` — en LAS DOS ranuras, con una
-    /// sincronización INCONDICIONAL tras cada una, sin mirar la política de
-    /// `Sync`.
-    ///
-    /// **Por qué las dos ranuras, y no solo la inactiva** (tercera ronda de
-    /// revisión, hallazgo BLOCKER). Escribiendo solo la inactiva, el
-    /// registro duradero del techo vivía en una única ranura — y el commit
-    /// siguiente escribe ESA MISMA ranura (`self.slot.other()`, calculado
-    /// desde la misma meta confirmada). El registro sobrevivía exactamente
-    /// una escritura de meta: si esa escritura se DESGARRABA (llegaron unos
-    /// bytes, no todos: el CRC falla y la ranura queda ilegible),
-    /// `Meta::load` caía en la otra ranura, que conserva el `write_counter`
-    /// VIEJO, y la siguiente sesión volvía a repartir contadores que la
-    /// sesión muerta ya había usado para sellar páginas que SÍ están en el
-    /// fichero. Y como `live_counter == counter_ceiling` al abrir (ver
-    /// `Db::open`), TODA reapertura extiende en su primera escritura
-    /// cifrada: la ventana se abría una vez por sesión, no en un caso raro.
-    /// Reproducido y medido: cinco pares `(página, contador)` repetidos, con
-    /// un 95,90 % de bytes cero en el XOR de los textos cifrados que
-    /// comparten nonce, contra un 0,33 % de línea base — ver
-    /// `a_torn_commit_meta_write_after_an_extension_reuses_no_counter` en
-    /// `crypto.rs`.
-    ///
-    /// Con las dos ranuras portando el techo, cualquier escritura de meta
-    /// posterior — commit o extensión — puede desgarrarse sin que el techo
-    /// retroceda: la ranura que esa escritura no toca sigue llevándolo.
-    ///
-    /// **Por qué DOS sincronizaciones y no una al final.** La primera
-    /// escritura va a la ranura inactiva y la segunda a la ACTIVA — la que
-    /// ahora mismo es el único registro válido del último estado
-    /// confirmado. Sobrescribirla solo es seguro si la inactiva ya lleva un
-    /// registro equivalente Y DURADERO de ese mismo estado: sin la
-    /// sincronización intermedia, un corte con las dos escrituras en vuelo
-    /// puede dejar la activa desgarrada y la inactiva sin materializar, y
-    /// entonces no queda NINGUNA ranura con el último commit — pérdida de
-    /// datos, no solo del techo. Con la sincronización intermedia, en todo
-    /// instante hay al menos una ranura válida que describe el estado
-    /// confirmado: la activa mientras se escribe la inactiva, y la inactiva
-    /// (ya duradera) mientras se escribe la activa. Lo comprueba
-    /// `every_sync_policy_survives_a_torn_meta_write_at_every_point`, que
-    /// desgarra cada una de las escrituras de meta de la sesión, una por
-    /// corrida.
-    ///
-    /// Las dos ranuras quedan con el MISMO `txn_id` y el MISMO
-    /// `write_counter`, byte a byte idénticas. La ventana entre las dos
-    /// escrituras es el único momento en que dos ranuras comparten
-    /// `txn_id` con `write_counter` distinto — para eso está el desempate
-    /// de `Meta::load` — y, al ser copias exactas de la misma meta
-    /// confirmada, el resto de sus campos coincide siempre: ese desempate
-    /// nunca puede elegir entre dos estados distintos.
-    ///
-    /// **Nunca la meta de la transacción en curso.** La primera ronda de
-    /// revisión encontró aquí un hallazgo BLOCKER propio: pasar la meta
-    /// DE LA TRANSACCIÓN EN CURSO (con su `root` ya cambiado a medio hacer)
-    /// hacía que, si el proceso moría antes del commit real, `Meta::load`
-    /// recuperase esa mitad de transacción como si fuera un commit legítimo
-    /// — pérdida de datos sin ni siquiera necesitar una caída, un simple
-    /// `Drop` bastaba para dejarlo en ese estado. Usar SIEMPRE la última
-    /// meta confirmada de verdad, con el `txn_id` intacto, hace que esta
-    /// escritura nunca pueda representar más que "lo que ya estaba
-    /// confirmado, con el contador más alto" — jamás una transacción a
-    /// medias.
-    ///
-    /// **Por qué es seguro que las dos ranuras compartan `txn_id`.** Tras
-    /// esta llamada, la ranura activa (con `Db.committed` sin tocar) y la
-    /// inactiva (recién escrita aquí) tienen el MISMO `txn_id` pero
-    /// `write_counter` distinto — `Meta::load` necesita el desempate de
-    /// "mismo `txn_id`, prefiere el `write_counter` más alto" (ver su
-    /// comentario) precisamente para este caso: las dos describen el MISMO
-    /// árbol confirmado, así que preferir el contador más alto solo avanza
-    /// el techo, nunca adopta trabajo a medias.
-    ///
-    /// **Por qué la sincronización es incondicional.** Es la única garantía
-    /// real de que un nonce nunca se reutiliza tras una caída, sea cual sea
-    /// el modo de `Sync` elegido — `Sync::Never`/`Interval` aceptan PERDER
-    /// las últimas transacciones tras un corte, pero eso no cubre romper la
-    /// confidencialidad de páginas que sí llegaron a sobrevivir en el medio
-    /// (segunda ronda de revisión, hallazgo HIGH). Ocurre aproximadamente
-    /// una vez cada `COUNTER_RESERVE` escrituras (ver su comentario), así
-    /// que el coste es insignificante incluso para IoT.
-    fn extend_counter_ceiling(&self, from: u64) -> Result<u64> {
-        let ceiling = from.checked_add(COUNTER_RESERVE).ok_or(Error::Full)?;
-        let (committed_meta, committed_slot) = *self.committed.read().unwrap();
-        let mut extension = committed_meta;
-        extension.write_counter = ceiling;
-        let geometry = self.pager.geometry();
-
-        // Primero la INACTIVA: mientras se escribe, la activa sigue siendo
-        // el registro válido del último commit.
-        extension.store_via(&self.pager, &geometry, committed_slot.other())?;
-        // `sync_upto`, no `pager.sync()` a secas: estas dos escrituras
-        // llevan el estado confirmado —el mismo `txn_id`— así que una
-        // sincronización que devuelve `Ok` aquí demuestra en disco esa
-        // meta confirmada tanto como lo haría la de un commit bajo
-        // `Sync::Commit`. Avanzar el punto durable con ella es gratis y le
-        // ahorra a `WriteTxn::recycle` un `fsync` propio más adelante.
-        self.sync_upto(committed_meta.txn_id)?;
-        // Y solo entonces la ACTIVA: ahora la inactiva ya lleva, de forma
-        // duradera, ese mismo estado confirmado con el techo nuevo, así que
-        // desgarrar esta segunda escritura no puede dejar el fichero sin
-        // ninguna meta válida. Ver el razonamiento completo arriba.
-        extension.store_via(&self.pager, &geometry, committed_slot)?;
-        self.sync_upto(committed_meta.txn_id)?;
-
-        // `self.committed` debe seguir describiendo, byte a byte, lo que hay
-        // en la ranura confirmada — es la invariante de la que depende que
-        // una extensión no publique nada que no estuviera ya confirmado (ver
-        // el comentario del campo `committed`). La ranura NO cambia: las dos
-        // llevan ahora el mismo contenido, así que el commit siguiente sigue
-        // alternando exactamente igual que antes de esta llamada.
-        self.committed.write().unwrap().0.write_counter = ceiling;
-        Ok(ceiling)
     }
 }
 
@@ -1579,14 +1458,14 @@ impl<'db> WriteTxn<'db> {
     /// «sin `fsync` pase lo que pase» y pasa a significar «sin `fsync` por
     /// commit; solo los que hagan falta para recuperar espacio» — que es
     /// justo el trato que un proceso IoT de larga duración querría. No es
-    /// una excepción nueva en el motor: `Db::extend_counter_ceiling` ya
-    /// sincroniza sin condiciones bajo cualquier política cuando la
-    /// corrección lo exige.
+    /// una excepción sin precedente en el motor: la reserva duradera de
+    /// contadores de nonce sincronizaba también sin condiciones bajo
+    /// cualquier política, mientras existió.
     ///
     /// Sincronizar a mitad de una transacción no publica nada: lo único
     /// que hay escrito y sin confirmar son páginas que ninguna meta
     /// referencia todavía, y la meta de esta transacción aún no se ha
-    /// escrito. Mismo razonamiento que `extend_counter_ceiling`.
+    /// escrito.
     fn recycle(&mut self) -> Result<Option<PageNo>> {
         let pager = &self.db.pager;
         let floor = self.db.reuse_floor();
@@ -1624,33 +1503,36 @@ impl<'db> WriteTxn<'db> {
     }
 
     /// `bytes` debe medir `logical_page_size()`. Sella (si procede) con un
-    /// contador de nonce nuevo por cada llamada — NO con `self.meta.txn_id`
+    /// nonce nuevo por cada llamada, sacado del flujo de la apertura
+    /// (`WriterState::nonce_stream`) — NO derivado de `self.meta.txn_id`
     /// (primera ronda de revisión posterior a la primera entrega, hallazgo
     /// BLOCKER: `txn_id` es el mismo para toda la transacción, y
     /// `WriteTxn::alloc` recicla `own_free` — la MISMA página puede
     /// escribirse muchas veces dentro de una sola transacción, ver el
-    /// comentario de `own_free`) — así que el par `(página, contador)`
-    /// nunca se repite sin importar cuántas veces se reescriba la misma
-    /// página dentro de esta transacción. El contador en sí (`advance_counter`,
-    /// `WriterState::live_counter`) sigue avanzando en cada llamada, con
-    /// cifrado o sin él — barato, sin E/S — pero el guardián `written`, que
-    /// SÍ cuesta memoria real en una transacción grande, solo se puebla si
-    /// la base está cifrada (segunda ronda de revisión, hallazgo sobre
-    /// coste de memoria — ver el comentario de `written`).
+    /// comentario de `own_free`) — así que el nonce nunca se repite sin
+    /// importar cuántas veces se reescriba la misma página.
+    ///
+    /// Sin cifrado no hay flujo, y esta función es una escritura normal:
+    /// desde el cambio a nonces aleatorios, una base sin cifrar ya ni
+    /// siquiera lleva un contador que avanzar.
+    ///
+    /// El guardián `written`, que sí cuesta memoria real en una transacción
+    /// grande, solo se puebla si la base está cifrada (segunda ronda de
+    /// revisión, hallazgo sobre coste de memoria — ver su comentario).
     pub(crate) fn write_page(&mut self, page: PageNo, bytes: &[u8]) -> Result<()> {
-        let encrypted = self.db.pager.is_encrypted();
-        let db = self.db;
-        let counter = {
-            let state = self.state();
-            Self::advance_counter(db, &mut state.live_counter, &mut state.counter_ceiling)?
-        };
-        if encrypted && !self.written.insert((page, counter)) {
-            // Matemáticamente inalcanzable si `advance_counter` incrementa
-            // correctamente (ver su comentario) — comprobación defensiva,
-            // no la fuente de la garantía. Ver el comentario de `written`.
+        let pager = &self.db.pager;
+        let state = self.guard.as_mut().expect("el estado del escritor siempre está presente");
+        // ANTES de sellar, no después: comprobarlo a posteriori llegaría
+        // tarde, con la página ya escrita en el medio bajo el nonce
+        // repetido. Matemáticamente inalcanzable si `NonceStream::next`
+        // incrementa correctamente — comprobación defensiva, no la fuente
+        // de la garantía. Ver el comentario de `written`.
+        if let Some(stream) = state.nonce_stream.as_ref()
+            && !self.written.insert(stream.issued())
+        {
             return Err(Error::NonceReuse { page });
         }
-        self.db.pager.write_encrypted(page, counter, bytes)?;
+        pager.write_encrypted(page, state.nonce_stream.as_mut(), bytes)?;
         self.write_count += 1;
         Ok(())
     }
@@ -1670,33 +1552,6 @@ impl<'db> WriteTxn<'db> {
     /// `Freelist::flush` casi siempre tiene algo que serializar.
     pub fn pending_writes(&self) -> u64 {
         self.write_count
-    }
-
-    /// Núcleo de la asignación de contador de nonce, compartido por
-    /// `write_page` y por el cierre que `commit` le pasa a
-    /// `Freelist::flush`. Recibe referencias sueltas a los dos campos de
-    /// `WriterState` que le hacen falta, no `&mut WriterState` entero ni
-    /// `&mut WriteTxn`: así el compilador ve préstamos disjuntos de
-    /// `state.live_counter`/`state.counter_ceiling` por un lado y
-    /// `state.freelist` por otro en `commit`, que necesita las dos cosas a
-    /// la vez (el cierre que arma para `Freelist::flush` sigue viva
-    /// mientras `state.freelist.flush(...)` está en curso).
-    ///
-    /// Comprueba `db.pager.is_encrypted()` ella misma, no cada llamador por
-    /// separado (segunda ronda de revisión posterior a la primera entrega):
-    /// así que `write_page` Y el cierre de `commit` quedan protegidos por
-    /// igual sin duplicar la comprobación — sin cifrado, `counter_ceiling`
-    /// nace en 0 igual que `live_counter` (`Db::create`), así que sin esta
-    /// comprobación la PRIMERA llamada de cualquiera de los dos dispararía
-    /// una extensión — con su sincronización incondicional — para una base
-    /// que nunca usa el contador para nada.
-    fn advance_counter(db: &Db, live_counter: &mut u64, counter_ceiling: &mut u64) -> Result<u64> {
-        if db.pager.is_encrypted() && *live_counter >= *counter_ceiling {
-            *counter_ceiling = db.extend_counter_ceiling(*counter_ceiling)?;
-        }
-        let c = *live_counter;
-        *live_counter += 1;
-        Ok(c)
     }
 
     /// Ejecuta `f` sobre los pares `(id, ns)` que el CATÁLOGO declara,
@@ -2047,8 +1902,9 @@ impl<'db> WriteTxn<'db> {
     ///
     /// **La copia es la meta CONFIRMADA (`self.db.committed`), nunca
     /// `self.meta`** — la de esta transacción, con su propio `root` todavía
-    /// a medio construir. Mismo razonamiento que `Db::extend_counter_ceiling`
-    /// (ver su comentario): así, si el proceso muere en cualquier punto de
+    /// a medio construir. Mismo razonamiento que seguía la extensión del
+    /// techo de contador de nonce, la otra escritura de meta fuera de un
+    /// commit que llegó a existir: así, si el proceso muere en cualquier punto de
     /// esta función, lo único que puede llegar a verse como confirmado es el
     /// último estado que YA lo estaba antes de que esta transacción
     /// empezara — jamás un commit a medio hacer.
@@ -2075,8 +1931,8 @@ impl<'db> WriteTxn<'db> {
     /// (`relocation_tests`, siete prefijos de corte distintos dentro de la
     /// región que cambia) contra la versión sin espejo.
     ///
-    /// El espejo va PRIMERO — mismo patrón que el resto de esta función y
-    /// que `Db::extend_counter_ceiling`: escribir la copia de respaldo
+    /// El espejo va PRIMERO — mismo patrón que el resto de esta función:
+    /// escribir la copia de respaldo
     /// primero y sincronizarla antes de tocar la que `Geometry::read` prueba
     /// primero. Con las dos sincronizadas por separado, un corte a medio
     /// escribir CUALQUIERA de las dos deja a la otra — ya sincronizada,
@@ -2123,8 +1979,7 @@ impl<'db> WriteTxn<'db> {
         // cabecera, dos líneas más abajo, empieza a apuntar ahí. Con
         // `new_geometry`, `MetaSlot::B.page(&new_geometry)` ya es `target`.
         // Las tres sincronizaciones pasan por `sync_upto` (ver su
-        // comentario) por el mismo motivo que las de
-        // `extend_counter_ceiling`: lo que se está escribiendo es el
+        // comentario): lo que se está escribiendo es el
         // estado CONFIRMADO (`current.0`), así que cada una de ellas
         // demuestra en disco esa meta y el punto durable puede avanzar
         // hasta ella sin pagar ningún `fsync` que no se fuera a pagar de
@@ -2309,45 +2164,36 @@ impl<'db> WriteTxn<'db> {
                 n_pages = p.checked_add(1).ok_or(Error::Full)?;
                 Ok(p)
             };
-            // Mismo contador VIVO que usa `write_page` para el resto de la
-            // transacción (tarea 17): las páginas de lista de libres
-            // necesitan un contador tan único como las del árbol, no uno
-            // propio — ver `advance_counter` y el comentario de
-            // `Freelist::flush` en `freelist.rs`. `state` se obtiene UNA
-            // vez y `live_counter_ref`/`counter_ceiling_ref` reborrows de
-            // sus campos, para que el compilador vea préstamos disjuntos
-            // de `state.live_counter`/`state.counter_ceiling` (para el
-            // cierre) y `state.freelist` (para `flush`) a la vez — el
-            // cierre sigue viva durante toda la llamada a `flush`.
-            let db = self.db;
+            // El MISMO flujo de nonces que usa `write_page` para el resto
+            // de la transacción (tarea 17): las páginas de lista de libres
+            // necesitan nonces tan únicos como las del árbol, y un flujo
+            // propio con el mismo prefijo repartiría exactamente los mismos
+            // — ver el comentario de `Freelist::flush` en `freelist.rs`.
+            //
+            // `state.freelist` y `state.nonce_stream` son campos DISTINTOS
+            // del mismo `WriterState`, así que el préstamo mutable de cada
+            // uno es disjunto y pueden viajar juntos a `flush` sin la
+            // gimnasia de referencias sueltas que hacía falta cuando el
+            // contador tenía dos campos y un cierre de por medio.
             let state = self.guard.as_mut().expect("estado presente");
-            let live_counter_ref = &mut state.live_counter;
-            let counter_ceiling_ref = &mut state.counter_ceiling;
-            let mut next_nonce = || -> Result<u64> {
-                Self::advance_counter(db, live_counter_ref, counter_ceiling_ref)
-            };
-            let (head, tail) =
-                state.freelist.flush(pager, &mut alloc, txn_id, oldest, &mut next_nonce)?;
+            let (head, tail) = state.freelist.flush(
+                pager,
+                &mut alloc,
+                txn_id,
+                oldest,
+                state.nonce_stream.as_mut(),
+            )?;
             self.meta.freelist_head = head;
             self.meta.freelist_tail = tail;
         }
         self.meta.n_pages = n_pages;
-        // Escribe un techo FRESCO — `live_counter` tal como quedó tras
-        // TODA la actividad de esta transacción (árbol y lista de libres)
-        // más `COUNTER_RESERVE` — en la meta que este commit YA iba a
-        // escribir. Es puramente "de balde, para una futura apertura
-        // limpia más precisa": esta escritura NO alimenta
-        // `state.counter_ceiling` (el que de verdad protege contra
-        // reutilización, ver su comentario) porque, bajo `Sync::Interval`/
-        // `Never`, puede no llegar a sincronizarse nunca — tratarla como
-        // si lo hubiera hecho sería reabrir el hallazgo HIGH de la segunda
-        // ronda de revisión. Sin cifrado esto no significa nada
-        // (`live_counter` nunca avanza, ver `advance_counter`), así que no
-        // se escribe.
-        if self.db.pager.is_encrypted() {
-            let live_counter = self.guard.as_ref().expect("estado presente").live_counter;
-            self.meta.write_counter = live_counter.checked_add(COUNTER_RESERVE).ok_or(Error::Full)?;
-        }
+        // Aquí iba la escritura del techo de contador de nonce en la meta
+        // de este commit (`Meta::write_counter`). **Eliminada con el cambio
+        // a nonces aleatorios**: no hay ningún contador que persistir,
+        // porque la apertura siguiente estrenará su propio prefijo y
+        // arrancará de cero — ver `WriterState::nonce_stream`. Un commit de
+        // una base cifrada escribe hoy exactamente los mismos bytes de meta
+        // que uno de una base sin cifrar, salvo la clave envuelta.
 
         // La meta de ESTA transacción todavía no está escrita, así que si
         // esta sincronización ocurre, lo que se demuestra duradero es el
@@ -2402,8 +2248,8 @@ impl Db {
     /// ningún estado que un corte de corriente pueda hacer montar. Si
     /// `sync()` falla, el punto durable se queda donde estaba y el motor
     /// sigue protegiendo el estado anterior: exactamente la misma
-    /// disciplina que `WriterState::counter_ceiling`, que tampoco avanza
-    /// con una escritura que quizá no se hizo durable.
+    /// disciplina que tenía el techo de contador de nonce mientras existió:
+    /// no avanzar con una escritura que quizá no se hizo durable.
     fn sync_upto(&self, upto: TxnId) -> Result<()> {
         self.pager.sync()?;
         self.durable.fetch_max(upto, Ordering::SeqCst);
@@ -3275,83 +3121,19 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    /// Tarea 17, tercera ronda de revisión (hallazgo BLOCKER), en caja
-    /// blanca: una extensión del techo de contador tiene que dejar LAS DOS
-    /// ranuras de meta llevando ese techo, y las dos describiendo el mismo
-    /// estado confirmado. Es la invariante entera del arreglo, comprobada
-    /// directamente sobre los bytes del fichero en vez de a través de un
-    /// escenario de caída — si solo una ranura lo llevara, el commit
-    /// siguiente (que escribe justo esa) dejaría el registro del techo a
-    /// merced de una única escritura desgarrada.
+    /// Aquí vivía `extending_the_counter_ceiling_leaves_both_meta_slots_carrying_it`,
+    /// la comprobación en caja blanca del protocolo de extensión del techo
+    /// de contador de nonce: que una extensión dejara LAS DOS ranuras de
+    /// meta llevando el techo nuevo y describiendo el mismo estado
+    /// confirmado. Se ha ido con el protocolo — ver
+    /// `WriterState::nonce_stream`. Lo que aquella prueba protegía era la
+    /// invariante "el registro duradero del techo sobrevive a una escritura
+    /// de meta desgarrada"; sin techo que registrar, la invariante no tiene
+    /// contenido.
     ///
-    /// No necesita la feature `encryption`: `extend_counter_ceiling`
-    /// escribe metas, que nunca van cifradas. Lo que sí depende del cifrado
-    /// es QUIÉN la llama (`advance_counter`, solo si `is_encrypted`).
-    #[test]
-    fn extending_the_counter_ceiling_leaves_both_meta_slots_carrying_it() {
-        let (s, db) = fresh();
-        // Un commit primero, para que la ranura activa no sea la A y el
-        // caso "se escribe también la ranura activa" quede de verdad
-        // ejercitado en las dos direcciones.
-        let mut tx = db.begin_write().unwrap();
-        let p = tx.alloc().unwrap();
-        tx.write_page(p, &alloc::vec![7u8; 512]).unwrap();
-        tx.set_root(p);
-        tx.commit().unwrap();
-
-        let committed = db.committed.read().unwrap().0;
-        let geometry = db.pager.geometry();
-        let mut ceiling = 500u64;
-        // Dos extensiones seguidas: el camino que una transacción enorme
-        // recorre más de una vez, y en el que la segunda sobrescribe dos
-        // ranuras que ya eran idénticas entre sí.
-        for _ in 0..2 {
-            let previous = ceiling;
-            ceiling = db.extend_counter_ceiling(previous).unwrap();
-            assert_eq!(ceiling, previous + COUNTER_RESERVE);
-
-            for slot in [MetaSlot::A, MetaSlot::B] {
-                let mut buf = alloc::vec![0u8; 512];
-                s.read_at(slot.page(&geometry) as u64 * 512, &mut buf).unwrap();
-                let m = Meta::decode(&buf).expect("las dos ranuras siguen siendo legibles");
-                assert_eq!(
-                    m.write_counter, ceiling,
-                    "la ranura {slot:?} no lleva el techo: una escritura desgarrada la dejaria \
-                     como unico registro superviviente, con un contador viejo"
-                );
-                assert_eq!(
-                    (m.txn_id, m.root, m.n_pages, m.freelist_head, m.freelist_tail),
-                    (
-                        committed.txn_id,
-                        committed.root,
-                        committed.n_pages,
-                        committed.freelist_head,
-                        committed.freelist_tail
-                    ),
-                    "la ranura {slot:?} no describe el ultimo estado confirmado"
-                );
-            }
-
-            // `committed` sigue fiel byte a byte a lo que hay en disco (ver
-            // su comentario): es de lo que depende que la PRÓXIMA extensión
-            // no publique nada sin confirmar.
-            let (meta, slot) = *db.committed.read().unwrap();
-            assert_eq!(meta.write_counter, ceiling);
-            let mut buf = alloc::vec![0u8; 512];
-            s.read_at(slot.page(&geometry) as u64 * 512, &mut buf).unwrap();
-            assert_eq!(Meta::decode(&buf).unwrap(), meta);
-        }
-
-        // Y el commit siguiente sigue alternando como siempre: lo
-        // confirmado antes de la extensión sigue ahí y lo nuevo también.
-        let mut tx = db.begin_write().unwrap();
-        let q = tx.alloc().unwrap();
-        tx.write_page(q, &alloc::vec![8u8; 512]).unwrap();
-        tx.set_root(q);
-        tx.commit().unwrap();
-        assert_eq!(db.begin_read().root(), q);
-    }
-
+    /// La consecuencia observable, y comprobada, es que hoy una base
+    /// cifrada escribe exactamente las mismas metas que una sin cifrar:
+    /// `a_reopened_encrypted_database_pays_no_extra_sync_at_all` (`crypto.rs`).
     #[test]
     fn a_second_writer_is_rejected_while_one_is_open() {
         let (_s, db) = fresh();

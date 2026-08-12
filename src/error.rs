@@ -13,14 +13,41 @@ pub enum Error {
     BadFormat,
     /// El fichero usa una versión de formato que este binario no entiende.
     VersionTooNew { found: u16, supported: u16 },
+    /// El fichero usa una versión de formato ANTERIOR a la mínima que este
+    /// binario sabe leer. Existe desde el cambio de diseño a nonces
+    /// aleatorios, que rompe el formato: la disposición de una página
+    /// cifrada pasó de `contador (8) || tag (16) || texto cifrado` a
+    /// `nonce (24) || tag (16) || texto cifrado`, y la meta dejó de llevar
+    /// el techo de contador en los bytes 100..108.
+    ///
+    /// **Por qué un error y no una lectura "compatible".** Un fichero del
+    /// formato 1 SIN cifrar es, byte a byte, estructuralmente legible por
+    /// este binario (la diferencia vive toda en las páginas cifradas y en
+    /// un campo de la meta que ya no se lee). Aceptarlo dejaría el motor
+    /// con dos reglas — "acepto el formato 1 si además no está cifrado" —
+    /// y con un fichero cifrado del formato 1 que se abriría sin quejarse
+    /// para fallar más tarde y peor: los primeros 8 bytes de cada página
+    /// eran un contador y ahora se leen como el principio de un nonce, así
+    /// que el descifrado falla como si la clave fuera incorrecta o la
+    /// página estuviera manipulada. Rechazar por versión, una sola regla
+    /// para todos, dice exactamente lo que pasa.
+    VersionTooOld { found: u16, supported: u16 },
     /// Este proceso ya tiene abierto ese mismo fichero (`FileStorage::open`,
     /// comparando rutas CANONICALIZADAS: `./base` y `/abs/base` son la
     /// misma). Dos asas independientes sobre un fichero significan dos
-    /// `Db::write_lock` distintos —el escritor único deja de serlo, y el
-    /// copy-on-write de dos escritores concurrentes es corrupción— y, con
-    /// cifrado, dos `live_counter` independientes, es decir los MISMOS
-    /// nonces bajo la misma clave de datos: dos textos cifrados con el
-    /// mismo nonce se anulan al XOR y revelan el texto plano.
+    /// `Db::write_lock` distintos: el escritor único deja de serlo, y el
+    /// copy-on-write de dos escritores concurrentes es corrupción — con
+    /// cifrado o sin él.
+    ///
+    /// **Ya no es además un fallo de confidencialidad** (cambio de diseño a
+    /// nonces aleatorios). Antes lo era, y era lo peor de los dos daños:
+    /// las dos asas arrancaban su contador de nonce desde el mismo
+    /// `write_counter` de la meta, así que repartían LOS MISMOS nonces bajo
+    /// la misma clave de datos. Ahora cada apertura sortea su propio
+    /// prefijo de 16 bytes (`crypto::NonceStream`), así que dos asas no
+    /// pueden colisionar aunque este rechazo no existiera. Lo que queda —
+    /// la corrupción del árbol por dos escritores copy-on-write — sigue
+    /// siendo motivo de sobra para rechazar la segunda asa.
     ///
     /// No cubre un SEGUNDO PROCESO: ver la sección 3.4 de la
     /// especificación. Quien reparta un mismo fichero entre varios procesos
@@ -86,15 +113,25 @@ pub enum Error {
     /// El descifrado falló: clave incorrecta o página manipulada.
     Decrypt { page: PageNo },
     /// Comprobación interna, no un fallo del llamante: `WriteTxn::write_page`
-    /// detectó que iba a sellar `page` con un contador de nonce que ya se
-    /// había usado dentro de esta misma transacción. Con el diseño actual
-    /// (contador monótono por transacción, reservado por adelantado —
-    /// tarea 17, ronda de revisión posterior) esto es matemáticamente
-    /// inalcanzable si el resto del motor es correcto: convierte la
-    /// invariante de unicidad del nonce, de la que depende toda la
-    /// confidencialidad del cifrado por página, de una suposición no
-    /// comprobada a algo que el propio motor verifica en cada escritura.
+    /// detectó que iba a sellar `page` con un número de escritura
+    /// (`NonceStream::issued`) que ya se había usado dentro de esta misma
+    /// transacción. Con el diseño actual (contador monótono por apertura,
+    /// que no rebobina nunca) esto es matemáticamente inalcanzable si el
+    /// resto del motor es correcto: convierte la invariante de unicidad del
+    /// nonce, de la que depende toda la confidencialidad del cifrado por
+    /// página, de una suposición no comprobada a algo que el propio motor
+    /// verifica en cada escritura.
     NonceReuse { page: PageNo },
+    /// El flujo de nonces de esta apertura se agotó y no hay forma de
+    /// renovarlo. Solo alcanzable bajo `no_std` con AES-256-GCM-SIV: su
+    /// nonce de 12 bytes deja un campo de contador de 32 bits, así que a
+    /// las 2^32 escrituras de página de una misma apertura hace falta un
+    /// prefijo aleatorio nuevo — bajo `std` se sortea de `/dev/urandom` y
+    /// esto no llega a ocurrir, pero sin sistema operativo no hay de dónde
+    /// sortearlo y el llamante solo aportó un prefijo. Fallar aquí es lo
+    /// correcto: la alternativa sería repetir un nonce en silencio. Ver
+    /// `crypto::NonceStream::next`.
+    NonceExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
