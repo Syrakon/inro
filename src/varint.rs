@@ -28,6 +28,19 @@ pub fn write(buf: &mut [u8], mut v: u64) -> usize {
 /// consumidos, o `None` si la entrada está truncada o la codificación excede
 /// los 64 bits.
 pub fn read(buf: &[u8]) -> Option<(u64, usize)> {
+    // Camino corto para el byte único. No es una optimización especulativa:
+    // `PageRef::parse` decodifica dos varints por celda —longitud de sufijo
+    // y longitud de valor— y en la carga real del motor casi todos caben en
+    // un byte (sufijos y valores por debajo de 128 bytes). Con el bucle
+    // general, ese caso paga la puesta a cero de dos acumuladores, el
+    // iterador con índice y la comprobación de `shift` antes de mirar
+    // siquiera el primer byte. Mismos resultados: para `byte < 0x80` el
+    // bucle devuelve exactamente esto en su primera vuelta.
+    match buf.first() {
+        None => return None,
+        Some(&byte) if byte < 0x80 => return Some((byte as u64, 1)),
+        Some(_) => {}
+    }
     let mut v: u64 = 0;
     let mut shift = 0u32;
     for (i, &byte) in buf.iter().enumerate() {
