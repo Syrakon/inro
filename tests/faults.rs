@@ -159,27 +159,35 @@ fn assert_seed_is_intact(db: &Db) {
 // Prueba 1: barrido exhaustivo de `Fault::AbortAt` sobre una transacción.
 // ---------------------------------------------------------------------
 
-/// Ejecuta `seed` + 100 `put` (`100..200`) + `commit` contra un medio
-/// fresco, con `fault` ya armado ANTES de empezar la segunda transacción —
-/// simula un corte/desgarro exactamente en la escritura que `fault`
-/// describe. Comprueba que, tras reabrir, el contenido es EXACTAMENTE el
-/// de `seed` (ninguna clave `100..200` sobrevive, sea cual sea el punto de
-/// corte) y devuelve si `audit_pages` fue limpio, para que el llamante
-/// decida si un `false` cae dentro de la ventana ya conocida de
-/// `relocate_meta_b` (ver el comentario de cabecera).
+/// Ejecuta `seed` + `puts` `put` (`100..100+puts`) + `commit` contra un
+/// medio fresco, con `fault` ya armado ANTES de empezar la segunda
+/// transacción — simula un corte/desgarro exactamente en la escritura que
+/// `fault` describe. Comprueba que, tras reabrir, el contenido es
+/// EXACTAMENTE el de `seed` (ninguna clave `100..100+puts` sobrevive, sea
+/// cual sea el punto de corte) y devuelve si `audit_pages` fue limpio, para
+/// que el llamante decida si un `false` cae dentro de la ventana ya
+/// conocida de `relocate_meta_b` (ver el comentario de cabecera).
 ///
 /// Compartida entre el barrido de `AbortAt` y el de `TearAt`: el
 /// mecanismo — cuántas escrituras exitosas preceden al commit — es el
 /// mismo para los dos tipos de fallo, solo cambia CÓMO falla la última.
-fn run_one_hundred_put_transaction_under_fault(fault: Fault) -> bool {
+///
+/// **`opts`/`puts` son parámetros, no constantes** (cobertura de cifrado):
+/// el mismo barrido tiene que poder correrse sobre una base CIFRADA, donde
+/// cada página física lleva 24 bytes de nonce y 16 de tag y la página
+/// lógica encoge 40 bytes (`Pager::logical_page_size`), así que ni el
+/// número de escrituras ni el tamaño de la transacción pueden estar
+/// cocinados en el cuerpo de la función. Ver `mod encrypted`, al final del
+/// fichero.
+fn run_put_transaction_under_fault(opts: Options, puts: u32, fault: Fault) -> bool {
     let s = Arc::new(FaultStorage::new(MemStorage::new(), None));
-    let db = Db::create(Box::new(s.clone()), Options::default()).unwrap();
+    let db = Db::create(Box::new(s.clone()), opts).unwrap();
     seed(&db);
     s.set_fault(Some(fault));
 
     let _ = (|| -> inro::Result<()> {
         let mut tx = db.begin_write()?;
-        for i in 100..200u32 {
+        for i in 100..100 + puts {
             tx.put(0x01, &i.to_be_bytes(), b"nuevo")?;
         }
         tx.commit()
@@ -187,10 +195,10 @@ fn run_one_hundred_put_transaction_under_fault(fault: Fault) -> bool {
     drop(db);
 
     s.set_fault(None);
-    let db = Db::open(Box::new(s.clone()), Options::default()).unwrap();
+    let db = Db::open(Box::new(s.clone()), opts).unwrap();
     assert_is_the_committed_state(&db);
     let r = db.begin_read();
-    for i in 100..200u32 {
+    for i in 100..100 + puts {
         assert_eq!(
             r.get(0x01, &i.to_be_bytes()).unwrap(),
             None,
@@ -200,18 +208,18 @@ fn run_one_hundred_put_transaction_under_fault(fault: Fault) -> bool {
     db.audit_pages().unwrap()
 }
 
-/// Cuántas escrituras físicas hace `seed` + 100 `put` + `commit`, medido
+/// Cuántas escrituras físicas hace `seed` + `puts` `put` + `commit`, medido
 /// sobre un medio de usar y tirar, sin ningún fallo armado. La escritura de
 /// la meta es SIEMPRE la última (`WriteTxn::commit`: tras la lista de
 /// libres solo quedan dos `sync()` y la propia escritura de la meta, sin
 /// nada más después), así que el total apunta exactamente a ella.
-fn measure_hundred_put_reference() -> u64 {
+fn measure_put_reference(opts: Options, puts: u32) -> u64 {
     let s = Arc::new(FaultStorage::new(MemStorage::new(), None));
-    let db = Db::create(Box::new(s.clone()), Options::default()).unwrap();
+    let db = Db::create(Box::new(s.clone()), opts).unwrap();
     seed(&db);
     let before = s.write_count();
     let mut tx = db.begin_write().unwrap();
-    for i in 100..200u32 {
+    for i in 100..100 + puts {
         tx.put(0x01, &i.to_be_bytes(), b"nuevo").unwrap();
     }
     tx.commit().unwrap();
@@ -262,7 +270,7 @@ fn measure_hundred_put_reference() -> u64 {
 /// `relocate_meta_b`), así que localizarla por FORMA (offset `0`, longitud
 /// exacta de una cabecera) no deja ambigüedad posible con ninguna otra
 /// escritura del commit.
-fn measure_header_primary_rewrite_ordinal() -> Option<u64> {
+fn measure_header_primary_rewrite_ordinal(opts: Options, puts: u32) -> Option<u64> {
     struct Recording {
         inner: MemStorage,
         writes: Mutex<Vec<(u64, usize)>>,
@@ -287,11 +295,11 @@ fn measure_header_primary_rewrite_ordinal() -> Option<u64> {
     }
 
     let s = Arc::new(Recording { inner: MemStorage::new(), writes: Mutex::new(Vec::new()) });
-    let db = Db::create(Box::new(s.clone()), Options::default()).unwrap();
+    let db = Db::create(Box::new(s.clone()), opts).unwrap();
     seed(&db);
     s.writes.lock().unwrap().clear();
     let mut tx = db.begin_write().unwrap();
-    for i in 100..200u32 {
+    for i in 100..100 + puts {
         tx.put(0x01, &i.to_be_bytes(), b"nuevo").unwrap();
     }
     tx.commit().unwrap();
@@ -352,25 +360,72 @@ fn assert_all_audit_failures_are_within_the_known_window(
 /// necesita una escritura a medias (`Fault::TearAt`), no un simple aborto.
 #[test]
 fn aborting_at_any_write_of_a_transaction_leaves_the_previous_commit_intact() {
-    let total = measure_hundred_put_reference();
-    assert!(total > 0, "la transaccion de referencia deberia emitir al menos una escritura");
+    sweep_abort_at_every_write(Options::default(), 100, "AbortAt");
+}
 
-    let s0 = Arc::new(FaultStorage::new(MemStorage::new(), None));
-    let db0 = Db::create(Box::new(s0.clone()), Options::default()).unwrap();
-    seed(&db0);
-    let base = s0.write_count();
-    drop(db0);
+/// Cuántas escrituras físicas hay hasta el final de `seed` — el punto a
+/// partir del cual empiezan a contar los ordinales de los dos barridos.
+/// Medido, no supuesto: con cifrado, `Db::create` y `seed` emiten un número
+/// distinto de escrituras que sin él (la página lógica encoge 40 bytes, así
+/// que las mismas diez claves ocupan otra forma de árbol).
+fn writes_up_to_the_end_of_seed(opts: Options) -> u64 {
+    let s = Arc::new(FaultStorage::new(MemStorage::new(), None));
+    let db = Db::create(Box::new(s.clone()), opts).unwrap();
+    seed(&db);
+    let base = s.write_count();
+    drop(db);
+    base
+}
 
-    let header_primary_ordinal = measure_header_primary_rewrite_ordinal();
+/// Cuerpo del barrido de `AbortAt`, compartido entre la base sin cifrar y
+/// las cifradas (ver `mod encrypted`): todo lo que cambia entre las tres es
+/// `opts`, `puts` y la etiqueta que sale en el mensaje de fallo. Ni un solo
+/// ordinal viene de una constante: `total`, `base` y la ventana de
+/// `relocate_meta_b` se MIDEN sobre corridas de referencia con estas mismas
+/// `opts`.
+fn sweep_abort_at_every_write(opts: Options, puts: u32, label: &str) {
+    let total = measure_put_reference(opts, puts);
+    assert!(total > 0, "{label}: la transaccion de referencia deberia emitir al menos una escritura");
+
+    let base = writes_up_to_the_end_of_seed(opts);
+    let header_primary_ordinal = measure_header_primary_rewrite_ordinal(opts, puts);
 
     let mut audit_failures = Vec::new();
     for n in 0..total {
-        let ok = run_one_hundred_put_transaction_under_fault(Fault::AbortAt(base + n + 1));
+        let ok = run_put_transaction_under_fault(opts, puts, Fault::AbortAt(base + n + 1));
         if !ok {
             audit_failures.push(n);
         }
     }
-    assert_all_audit_failures_are_within_the_known_window(&audit_failures, header_primary_ordinal, total, "AbortAt");
+    assert_all_audit_failures_are_within_the_known_window(&audit_failures, header_primary_ordinal, total, label);
+}
+
+/// Cuerpo del barrido de `TearAt`, gemelo del anterior. `prefixes` son las
+/// profundidades de desgarro a probar; el llamante las elige a partir de la
+/// geometría que le toca (ver el comentario de la prueba sin cifrar sobre
+/// por qué 40 y 104, y el de `mod encrypted` sobre por qué una base cifrada
+/// necesita además un prefijo dentro del nonce).
+fn sweep_tear_at_every_write(opts: Options, puts: u32, prefixes: &[usize], label: &str) {
+    let total = measure_put_reference(opts, puts);
+    assert!(total > 0, "{label}: la transaccion de referencia deberia emitir al menos una escritura");
+
+    let base = writes_up_to_the_end_of_seed(opts);
+    let header_primary_ordinal = measure_header_primary_rewrite_ordinal(opts, puts);
+
+    let mut audit_failures = Vec::new();
+    for &prefix in prefixes {
+        for n in 0..total {
+            let ok = run_put_transaction_under_fault(
+                opts,
+                puts,
+                Fault::TearAt { write: base + n + 1, bytes: prefix },
+            );
+            if !ok {
+                audit_failures.push(n);
+            }
+        }
+    }
+    assert_all_audit_failures_are_within_the_known_window(&audit_failures, header_primary_ordinal, total, label);
 }
 
 /// Igual que la prueba anterior, pero con `Fault::TearAt` en vez de
@@ -410,30 +465,7 @@ fn aborting_at_any_write_of_a_transaction_leaves_the_previous_commit_intact() {
 /// `a_torn_write_of_the_meta_page_with_a_prefix_at_or_above_meta_size_lands_a_full_commit_anyway`.
 #[test]
 fn tearing_any_write_of_a_transaction_at_two_depths_never_leaks_partial_effects() {
-    let total = measure_hundred_put_reference();
-    assert!(total > 0);
-
-    let s0 = Arc::new(FaultStorage::new(MemStorage::new(), None));
-    let db0 = Db::create(Box::new(s0.clone()), Options::default()).unwrap();
-    seed(&db0);
-    let base = s0.write_count();
-    drop(db0);
-
-    let header_primary_ordinal = measure_header_primary_rewrite_ordinal();
-
-    let mut audit_failures = Vec::new();
-    for &prefix in &[40usize, 104usize] {
-        for n in 0..total {
-            let ok = run_one_hundred_put_transaction_under_fault(Fault::TearAt {
-                write: base + n + 1,
-                bytes: prefix,
-            });
-            if !ok {
-                audit_failures.push(n);
-            }
-        }
-    }
-    assert_all_audit_failures_are_within_the_known_window(&audit_failures, header_primary_ordinal, total, "TearAt");
+    sweep_tear_at_every_write(Options::default(), 100, &[40, 104], "TearAt");
 }
 
 // ---------------------------------------------------------------------
@@ -1586,5 +1618,848 @@ fn a_power_cut_after_a_reclaim_still_leaves_a_whole_snapshot() {
             &acked,
             &format!("corte aleatorio tras un recorte, semilla {seed}"),
         );
+    }
+}
+
+
+// ---------------------------------------------------------------------
+// Prueba 8: la misma matriz, sobre una base CIFRADA.
+//
+// **El hueco que cierra esta sección.** Hasta aquí, este fichero —el sitio
+// donde la consistencia ante caídas se ejercita contra el API público— no
+// tocaba el cifrado ni una vez: todo corría con `Options::default()`, sin
+// clave. Las matrices equivalentes de corte y desgarro existen dentro de
+// `src/crypto.rs`, y corren para los dos algoritmos, así que la propiedad
+// no estaba sin probar del todo; pero aquellas viven en pruebas unitarias
+// del crate, con un arnés que conoce los offsets de meta y cabecera de
+// memoria, y su pregunta es otra ("¿se reutiliza un nonce?").
+//
+// **Por qué el ciclo caer-y-reabrir es EL caso interesante con cifrado.**
+// El nonce es `prefijo aleatorio (16 B, sorteado una vez por apertura) ||
+// contador (8 B, monótono dentro de la apertura)`, y el contador vuelve a
+// CERO en cada apertura. Que eso sea seguro depende por completo de que la
+// apertura siguiente sortee un prefijo distinto — es decir, de algo que
+// solo se puede comprobar cruzando una caída y un `Db::open` de verdad, que
+// es exactamente lo que este fichero sabe producir y las pruebas internas
+// de `crypto.rs` no: allí no hay `FaultStorage` ni `PowerCutStorage`, y el
+// medio no puede perder una escritura arbitraria de la secuencia.
+//
+// **Qué cambia en la forma de una escritura al cifrar**, y por qué eso
+// obliga a MEDIR otra vez todo lo que la parte sin cifrar ya medía: cada
+// página física lleva 24 bytes de nonce en claro y 16 de tag
+// (`CIPHER_PREFIX` = 40), así que la página lógica encoge 40 bytes y las
+// mismas claves producen un árbol de otra forma, con otro número de
+// escrituras y con la reubicación de la meta B cayendo en otro ordinal.
+// Ninguna cifra de la sección sin cifrar sirve aquí, y por eso todas se
+// vuelven a medir con las `Options` de cada algoritmo (ver
+// `sweep_abort_at_every_write`/`sweep_tear_at_every_write`, compartidos).
+//
+// **Qué NO cambia**: las ranuras de meta y la cabecera siguen en claro con
+// solo un CRC32 (`Meta::store`/`store_via` escriben por `Pager::write`, no
+// por `write_encrypted`), así que los guardianes de esta suite que leen
+// `Meta::decode` sobre los bytes crudos siguen valiendo tal cual sobre una
+// base cifrada — y eso es una afirmación comprobable, no una suposición:
+// `a_torn_meta_write_on_an_encrypted_database_falls_back_and_the_tree_still_decrypts`
+// falla si algún día la meta pasa a sellarse.
+// ---------------------------------------------------------------------
+
+#[cfg(feature = "encryption")]
+mod encrypted {
+    use super::*;
+    use inro::{Algorithm, Encryption, NonceStream, CIPHER_PREFIX, NONCE_PREFIX_LEN};
+
+    /// Clave maestra de todas las pruebas de esta sección. Fija a propósito:
+    /// lo que varía en la matriz es el algoritmo y el punto de corte, no la
+    /// clave — y una clave fija hace que un fallo se reproduzca tal cual.
+    const KEY: [u8; 32] = [0x5c; 32];
+
+    /// Tamaño de la transacción bajo prueba en los dos barridos
+    /// exhaustivos. Es MENOR que las 100 de la sección sin cifrar
+    /// (`aborting_at_any_write_of_a_transaction_leaves_the_previous_commit_intact`)
+    /// y la razón es de coste, no de cobertura: el barrido replica la carga
+    /// entera en cada punto de corte, así que cuesta O(puts²), y aquí se
+    /// paga además un sellado por página escrita y un descifrado por página
+    /// leída, POR CADA algoritmo compilado. Con 40 la matriz completa
+    /// (2 algoritmos × [1 aborto + 2 profundidades de desgarro] × ~57
+    /// puntos) se queda en unos 8 s de CPU; con 100 pasaría de 60 s, que es
+    /// justo lo que este fichero no puede permitirse.
+    ///
+    /// 40 no es un número redondo elegido a ojo: es el más pequeño de los
+    /// probados (24, 30, 40) con el que la transacción bajo prueba llega a
+    /// disparar `relocate_meta_b` — con 24 y con 30 el fichero no cruza los
+    /// 4 KB y el barrido nunca visita la reescritura de cabecera. Y no se
+    /// deja como saber tribal: los dos barridos EXIGEN que la reubicación
+    /// caiga dentro (ver `assert_the_sweep_really_covers_the_relocation`),
+    /// así que si algún cambio del motor la mueve fuera, la prueba lo dice
+    /// en vez de encoger en silencio.
+    const PUTS: u32 = 40;
+
+    /// Las dos profundidades de desgarro del barrido, DERIVADAS de la
+    /// disposición de una página cifrada en vez de copiadas de la sección
+    /// sin cifrar:
+    ///
+    /// - `CIPHER_PREFIX` (40): el nonce y el tag llegan enteros al plato y
+    ///   el texto cifrado es todo el VIEJO. Es el desgarro que un motor
+    ///   ingenuo podría dar por bueno — los 40 bytes que el descifrado
+    ///   necesita para arrancar están ahí, byte a byte válidos — y el que
+    ///   demuestra que el tag autentica el contenido, no solo la cabecera.
+    /// - `CIPHER_PREFIX + 64` (104): el corte cae ya DENTRO del texto
+    ///   cifrado, con nonce y tag nuevos sobre un contenido mitad y mitad.
+    ///
+    /// Los dos siguen por debajo de `meta::META_SIZE` (112) — condición que
+    /// la sección sin cifrar documenta en detalle y que aquí sigue haciendo
+    /// falta por lo mismo: un desgarro más largo depositaría una ranura de
+    /// meta completa y el commit quedaría duradero pese al `Err`, un caso
+    /// correcto pero distinto, que
+    /// `a_torn_write_of_the_meta_page_with_a_prefix_at_or_above_meta_size_lands_a_full_commit_anyway`
+    /// ya cubre por separado.
+    fn tear_depths() -> [usize; 2] {
+        [CIPHER_PREFIX, CIPHER_PREFIX + 64]
+    }
+
+    /// Los algoritmos que este build compila, en el mismo orden siempre.
+    /// `Vec` y no un array constante, porque su longitud depende de la
+    /// feature `aes` — mismo patrón que `tests/props.rs`.
+    fn algorithms() -> Vec<Algorithm> {
+        #[allow(unused_mut)]
+        let mut v = vec![Algorithm::XChaCha20Poly1305];
+        #[cfg(feature = "aes")]
+        v.push(Algorithm::Aes256GcmSiv);
+        v
+    }
+
+    fn opts_for(algorithm: Algorithm) -> Options {
+        Options {
+            encryption: Some(Encryption { key: KEY, algorithm }),
+            ..Options::default()
+        }
+    }
+
+    /// La matriz: un par `(algoritmo, opciones)` por cada vía criptográfica
+    /// que este build compila. TODAS las pruebas de esta sección iteran
+    /// sobre ella, así que un solo guardián
+    /// (`the_encrypted_matrix_only_says_anything_because_the_pages_are_really_encrypted`)
+    /// cubre a la vez que la matriz no se ha quedado sin algoritmos y que
+    /// las opciones que reparte cifran de verdad.
+    fn matrix() -> Vec<(Algorithm, Options)> {
+        algorithms().into_iter().map(|a| (a, opts_for(a))).collect()
+    }
+
+    /// Premisa de los dos barridos: con `PUTS` claves, la transacción bajo
+    /// prueba tiene que llegar a disparar `relocate_meta_b` — si no, el
+    /// barrido no visita nunca la reescritura de cabecera y la mitad
+    /// interesante del recorrido (la ventana conocida de fuga de la tarea
+    /// 18) se queda sin ejercitar sin que nadie se entere.
+    fn assert_the_sweep_really_covers_the_relocation(opts: Options, label: &str) {
+        assert!(
+            measure_header_primary_rewrite_ordinal(opts, PUTS).is_some(),
+            "{label}: con {PUTS} claves la transaccion bajo prueba ya no reubica la meta B, asi \
+             que el barrido no visita la reescritura de cabecera: sube PUTS hasta que vuelva a \
+             hacerlo en vez de dejar el hueco"
+        );
+    }
+
+    /// El barrido exhaustivo de `Fault::AbortAt` de la prueba 1, corrido
+    /// sobre una base cifrada, para cada algoritmo compilado. Mismo cuerpo
+    /// (`sweep_abort_at_every_write`), misma aserción — tras cada corte, el
+    /// contenido al reabrir es EXACTAMENTE el del commit anterior — pero con
+    /// todos los ordinales medidos sobre las `Options` cifradas.
+    ///
+    /// Lo específico del cifrado que esto sí ejercita, y que la versión sin
+    /// cifrar no puede: al reabrir tras cada corte, el motor descifra el
+    /// árbol entero con un prefijo de nonce RECIÉN sorteado y una clave
+    /// desenvuelta de la ranura de meta superviviente. Un fallo de
+    /// autenticación en cualquier página del árbol superviviente sale aquí
+    /// como un `Err` de `get`/`scan`/`audit_pages` — no como un valor
+    /// equivocado — y tumba la prueba.
+    ///
+    /// **Ruptura deliberada que prueba que muerde**: ver el informe de esta
+    /// tarea.
+    #[test]
+    fn aborting_at_any_write_of_an_encrypted_transaction_leaves_the_previous_commit_intact() {
+        for (algorithm, opts) in matrix() {
+            let label = format!("AbortAt/{algorithm:?}");
+            assert_the_sweep_really_covers_the_relocation(opts, &label);
+            sweep_abort_at_every_write(opts, PUTS, &label);
+        }
+    }
+
+    /// El barrido exhaustivo de `Fault::TearAt` de la prueba 1, cifrado, a
+    /// las dos profundidades de `tear_depths()` — las dos derivadas de la
+    /// disposición de una página sellada, no copiadas.
+    #[test]
+    fn tearing_any_write_of_an_encrypted_transaction_never_leaks_partial_effects() {
+        for (algorithm, opts) in matrix() {
+            let label = format!("TearAt/{algorithm:?}");
+            assert_the_sweep_really_covers_the_relocation(opts, &label);
+            sweep_tear_at_every_write(opts, PUTS, &tear_depths(), &label);
+        }
+    }
+
+    /// El desgarro dirigido a la ESCRITURA DE LA META de la prueba 2, sobre
+    /// una base cifrada, y con dos afirmaciones que la versión sin cifrar no
+    /// puede hacer:
+    ///
+    /// 1. **La ranura de meta sigue siendo texto plano con CRC32.** El
+    ///    guardián `assert_meta_tear_left_the_previous_commit_recoverable`
+    ///    lee los bytes crudos del medio y los pasa por `Meta::decode`; si
+    ///    algún día la meta pasara a sellarse, ninguna de las dos ranuras
+    ///    decodificaría y el guardián lo diría en el acto ("deberia dejar
+    ///    EXACTAMENTE una ranura ilegible... no 2"). Es decir: esta prueba
+    ///    FIJA esa decisión de formato en vez de suponerla.
+    /// 2. **El árbol superviviente descifra entero, y la base sigue viva.**
+    ///    Tras reabrir se leen las diez claves, se recorre el espacio con
+    ///    `scan`, se audita cada página —las tres cosas descifran de verdad,
+    ///    con la clave desenvuelta de la ranura que sobrevivió— y luego se
+    ///    ESCRIBE otra transacción, que sella con el prefijo de nonce nuevo
+    ///    de esta apertura. Un motor que tras la recuperación se quedara sin
+    ///    flujo de nonces, o que reutilizara el de la apertura muerta,
+    ///    falla aquí.
+    #[test]
+    fn a_torn_meta_write_on_an_encrypted_database_falls_back_and_the_tree_still_decrypts() {
+        for (algorithm, opts) in matrix() {
+            // La escritura de la meta es SIEMPRE la última de un commit:
+            // basta con medir cuántas escrituras hace un commit de
+            // referencia IDÉNTICO sobre un medio aparte (mismo método que
+            // `a_torn_write_of_the_meta_page_falls_back_to_the_other_slot`,
+            // ver su comentario) — con estas `Options`, no con las de la
+            // sección sin cifrar.
+            let meta_write = {
+                let s = Arc::new(FaultStorage::new(MemStorage::new(), None));
+                let db = Db::create(Box::new(s.clone()), opts).unwrap();
+                seed(&db);
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, b"perdida", b"x").unwrap();
+                tx.commit().unwrap();
+                s.write_count()
+            };
+
+            let s = Arc::new(FaultStorage::new(MemStorage::new(), None));
+            let db = Db::create(Box::new(s.clone()), opts).unwrap();
+            seed(&db);
+            let expected_txn_id = db.begin_read().txn_id();
+            s.set_fault(Some(Fault::TearAt { write: meta_write, bytes: tear_depths()[0] }));
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"perdida", b"x").unwrap();
+            assert!(
+                tx.commit().is_err(),
+                "{algorithm:?}: un commit cuya meta se desgarra debe reportar el fallo"
+            );
+            drop(db);
+            s.set_fault(None);
+
+            // (1) Premisa: exactamente una ranura ilegible y la otra con el
+            // ultimo commit confirmado — leyendo `Meta::decode` sobre los
+            // bytes crudos, que es lo que fija que la meta siga en claro.
+            assert_meta_tear_left_the_previous_commit_recoverable(&s, expected_txn_id);
+
+            // (2) El arbol superviviente descifra entero.
+            let db = Db::open(Box::new(s.clone()), opts).unwrap();
+            assert_is_the_committed_state(&db);
+            assert_eq!(
+                db.begin_read().get(0x01, b"perdida").unwrap(),
+                None,
+                "{algorithm:?}: la clave de la transaccion desgarrada sobrevivio"
+            );
+            assert!(db.audit_pages().unwrap(), "{algorithm:?}: contabilidad de paginas");
+
+            // Y la base sigue siendo escribible con el prefijo de nonce
+            // nuevo de ESTA apertura.
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..20u32 {
+                tx.put(0x03, &i.to_be_bytes(), &[7u8; 60]).unwrap();
+            }
+            tx.commit().unwrap();
+            let r = db.begin_read();
+            for i in 0..20u32 {
+                assert_eq!(
+                    r.get(0x03, &i.to_be_bytes()).unwrap().as_deref(),
+                    Some([7u8; 60].as_slice()),
+                    "{algorithm:?}: clave {i} escrita tras la recuperacion no descifra"
+                );
+            }
+            drop(r);
+            assert!(
+                db.audit_pages().unwrap(),
+                "{algorithm:?}: escribir tras la recuperacion rompe la contabilidad"
+            );
+        }
+    }
+
+    /// El corte de corriente de la prueba 6 (`PowerCutStorage`: `sync()`
+    /// marca el punto durable y el corte tira un subconjunto ARBITRARIO de
+    /// lo emitido desde entonces), sobre una base cifrada.
+    ///
+    /// La afirmación es la misma —lo que sobrevive es un SNAPSHOT ENTERO— y
+    /// se comprueba con el mismo ayudante
+    /// (`assert_the_surviving_state_is_a_whole_snapshot`), que lee TODAS las
+    /// claves reconocidas, recorre el espacio con `scan` y audita las
+    /// páginas: con cifrado, cada una de esas tres cosas es además un
+    /// descifrado real, así que "el snapshot está entero" pasa a significar
+    /// también "cada página que el snapshot referencia AUTENTICA".
+    ///
+    /// Tres semillas por algoritmo, no las diez de la versión sin cifrar:
+    /// el reparto aleatorio es el mismo generador determinista y cada
+    /// semilla cuesta aquí un sellado por página escrita; con dos algoritmos
+    /// compilados, diez semillas multiplicarían por más de seis el coste de
+    /// esta prueba sin cubrir ninguna forma nueva de corte.
+    #[test]
+    fn a_power_cut_on_an_encrypted_database_leaves_a_whole_decryptable_snapshot() {
+        for (algorithm, base) in matrix() {
+            let opts = Options { sync: Sync::Never, ..base };
+            for seed in 1..=3u64 {
+                let s = Arc::new(PowerCutStorage::new());
+                let acked = commit_acknowledged_keys(&s, opts, 40);
+                let metas: std::collections::BTreeSet<u64> =
+                    acked.iter().map(|a| a.last_write).collect();
+
+                let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                s.cut(&mut |ordinal| !metas.contains(&ordinal) && rng.chance(90));
+
+                let survived = assert_the_surviving_state_is_a_whole_snapshot(
+                    &s,
+                    opts,
+                    &acked,
+                    &format!("corte cifrado {algorithm:?}, semilla {seed}"),
+                );
+                assert!(
+                    survived < acked.last().unwrap().txn,
+                    "{algorithm:?}/semilla {seed}: el corte no llegó a perder ningún commit: la \
+                     prueba no está ejercitando nada"
+                );
+            }
+        }
+    }
+
+    /// Recorre la base entera —todas las claves, un `scan` completo y
+    /// `audit_pages`— sobre una imagen del medio con UN byte invertido, y
+    /// devuelve el error con el que el motor se niega, o `None` si la leyó
+    /// sin quejarse. Ni un `unwrap` por el camino: lo que esta prueba mide
+    /// es precisamente CÓMO falla, así que un pánico se llevaría por delante
+    /// la pregunta.
+    fn walk_with_one_damaged_byte(
+        image: &[u8],
+        opts: Options,
+        page: u32,
+        byte: usize,
+        keys: u32,
+    ) -> Option<inro::Error> {
+        let mut bytes = image.to_vec();
+        bytes[page as usize * opts.page_size as usize + byte] ^= 0xFF;
+        let s = MemStorage::new();
+        s.restore(bytes);
+
+        let db = match Db::open(Box::new(s), opts) {
+            Ok(db) => db,
+            Err(e) => return Some(e),
+        };
+        let r = db.begin_read();
+        for i in 0..keys {
+            if let Err(e) = r.get(0x01, &i.to_be_bytes()) {
+                return Some(e);
+            }
+        }
+        match r.scan(0x01, b"", b"\xff\xff\xff\xff") {
+            Err(e) => return Some(e),
+            Ok(mut c) => loop {
+                match c.next() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(e) => return Some(e),
+                }
+            },
+        }
+        drop(r);
+        // `Ok(false)` no es un error: una ranura de meta dañada hace montar
+        // la OTRA, más vieja, y las páginas del commit más reciente quedan
+        // legítimamente sin dueño. Lo que esta prueba pregunta es con qué
+        // ERROR se niega el motor, no cuánto estado conserva.
+        db.audit_pages().err()
+    }
+
+    /// Deja una base cifrada (o no, según `opts`) con `keys` claves
+    /// confirmadas y devuelve la imagen del medio junto con su geometría.
+    fn image_of_a_committed_database(opts: Options, keys: u32) -> (Vec<u8>, Geometry) {
+        let s = Arc::new(MemStorage::new());
+        let db = Db::create(Box::new(Arc::clone(&s)), opts).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..keys {
+            tx.put(0x01, &i.to_be_bytes(), &[0xA5; 40]).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(db);
+        let g = Geometry::read(&*s).unwrap();
+        (s.snapshot(), g)
+    }
+
+    /// **La propiedad que solo existe con cifrado: el fallo es RUIDOSO y
+    /// dice qué página.**
+    ///
+    /// Un byte invertido dentro del cuerpo de una página no puede pasar
+    /// inadvertido en ninguno de los dos formatos —el sin cifrar lleva un
+    /// CRC32 por página (`page::PageRef::parse`)— pero el error que sale es
+    /// distinto, y la diferencia importa: con cifrado es `Error::Decrypt {
+    /// page }`, un fallo de AUTENTICACIÓN que además NOMBRA la página
+    /// dañada (el número de página va en los datos asociados del tag, así
+    /// que mover bytes de una página a otra tampoco pasa), no un
+    /// `Corrupt { kind: Checksum }`. Los caminos de recuperación del motor
+    /// tienen que tratar esa distinción correctamente, y esta prueba fija
+    /// las dos mitades a la vez:
+    ///
+    /// - **Redundancia estructural**: dañar la cabecera (página 0) o
+    ///   CUALQUIERA de las dos ranuras de meta —posiciones derivadas de la
+    ///   cabecera, nunca fijadas a mano— NO puede producir ningún error: el
+    ///   espejo de cabecera y la otra ranura existen justamente para eso, y
+    ///   siguen en claro con CRC aunque la base esté cifrada.
+    /// - **Todo lo demás**: o la página no se llega a leer (base más
+    ///   pequeña que el fichero, páginas libres) y no pasa nada, o el error
+    ///   es EXACTAMENTE `Decrypt` sobre ESA página. Nunca un valor
+    ///   equivocado, nunca un `Corrupt`, nunca un pánico.
+    ///
+    /// **Y el control sin cifrar en la misma prueba** (que es además el
+    /// guardián de que esta sección depende del cifrado, ver
+    /// `the_encrypted_matrix_only_says_anything_because_the_pages_are_really_encrypted`):
+    /// el MISMO barrido sobre `Options::default()` no produce ni un solo
+    /// `Decrypt` —ahí los fallos son `Corrupt { kind: Checksum }`— así que
+    /// si alguien dejara de cifrar de verdad, la mitad cifrada de esta
+    /// prueba se quedaría sin ningún `Decrypt` que encontrar y fallaría.
+    #[test]
+    fn damaging_any_page_of_an_encrypted_database_fails_loudly_as_an_authentication_error() {
+        const KEYS: u32 = 60;
+        // El byte a invertir: el PRIMERO del texto cifrado
+        // (`CIPHER_PREFIX`), derivado de la disposición de una página
+        // sellada. En el formato sin cifrar ese mismo offset cae dentro del
+        // cuerpo de la página, que el CRC32 cubre entero salvo sus propios
+        // cuatro bytes (8..12) — así que el control comprueba lo que dice
+        // comprobar.
+        let byte = CIPHER_PREFIX;
+
+        for (algorithm, opts) in matrix() {
+            let (image, g) = image_of_a_committed_database(opts, KEYS);
+            let pages = (image.len() / g.page_size as usize) as u32;
+            assert!(pages > 3, "{algorithm:?}: la base de la prueba es demasiado pequeña");
+
+            let mut decrypt_failures = 0u32;
+            for page in 0..pages {
+                let plain_slot = page == 0 || page == g.meta_a_page || page == g.meta_b_page;
+                match walk_with_one_damaged_byte(&image, opts, page, byte, KEYS) {
+                    // Sin error: la página no se llegó a leer (libre, o más
+                    // allá de lo que el árbol referencia) o se recuperó sola
+                    // por su copia redundante. Las dos cosas están bien; que
+                    // las ranuras redundantes SIEMPRE se recuperen se exige
+                    // aparte, más abajo.
+                    None => {}
+                    Some(inro::Error::Decrypt { page: named }) => {
+                        assert!(
+                            !plain_slot,
+                            "{algorithm:?}: la pagina {page} es cabecera o ranura de meta —en \
+                             claro con CRC32, nunca sellada— y aun asi el motor reporta un fallo \
+                             de descifrado"
+                        );
+                        assert_eq!(
+                            named, page,
+                            "{algorithm:?}: el fallo de autenticacion nombra la pagina {named}, \
+                             no la {page}, que es la unica dañada"
+                        );
+                        decrypt_failures += 1;
+                    }
+                    Some(other) => panic!(
+                        "{algorithm:?}: dañar la pagina {page} deberia salir como \
+                         Decrypt {{ page: {page} }} o no salir, no como {other:?}"
+                    ),
+                }
+            }
+            assert!(
+                decrypt_failures >= 3,
+                "{algorithm:?}: solo {decrypt_failures} paginas dañadas produjeron un fallo de \
+                 autenticacion: este barrido no esta llegando al arbol"
+            );
+
+            // Y la redundancia estructural: cabecera y ranuras de meta se
+            // recuperan solas.
+            for page in [0, g.meta_a_page, g.meta_b_page] {
+                assert!(
+                    walk_with_one_damaged_byte(&image, opts, page, byte, KEYS).is_none(),
+                    "{algorithm:?}: dañar la pagina {page} (cabecera o ranura de meta) deberia \
+                     recuperarse sola por el espejo o por la otra ranura"
+                );
+            }
+        }
+
+        // Control sin cifrar: el mismo daño, otro error. Es lo que hace que
+        // la mitad de arriba signifique algo.
+        let opts = Options::default();
+        let (image, g) = image_of_a_committed_database(opts, KEYS);
+        let pages = (image.len() / g.page_size as usize) as u32;
+        let mut checksum_failures = 0u32;
+        for page in 0..pages {
+            match walk_with_one_damaged_byte(&image, opts, page, byte, KEYS) {
+                None => {}
+                Some(inro::Error::Decrypt { .. }) => panic!(
+                    "sin cifrado no puede haber ningun fallo de autenticacion (pagina {page}): si \
+                     esto salta, la matriz cifrada de arriba esta corriendo sin cifrar"
+                ),
+                Some(inro::Error::Corrupt { page: named, kind }) => {
+                    assert_eq!(named, page, "el fallo de CRC nombra otra pagina");
+                    assert_eq!(kind, inro::CorruptKind::Checksum, "pagina {page}");
+                    checksum_failures += 1;
+                }
+                Some(other) => panic!("pagina {page}: error inesperado {other:?}"),
+            }
+        }
+        assert!(
+            checksum_failures >= 3,
+            "control sin cifrar: solo {checksum_failures} paginas dañadas fallaron por CRC"
+        );
+    }
+
+    /// Medio que anota, para cada escritura de página, los bytes exactos que
+    /// se emitieron — y deja al llamante decidir después cuáles eran páginas
+    /// SELLADAS, preguntándoselo al propio motor (`inro::open_page`) en vez
+    /// de clasificarlas por offset.
+    ///
+    /// **Por qué no clasifica por posición.** Distinguir "página sellada" de
+    /// "ranura de meta" mirando el offset exige saber dónde viven las metas,
+    /// que es justo el conocimiento que este proyecto ha fijado a mano seis
+    /// veces y seis veces se le ha quedado obsoleto (la meta B se REUBICA en
+    /// caliente, así que ni siquiera hay una respuesta única a lo largo de
+    /// la vida del fichero). Pasar cada escritura por `open_page` con su
+    /// número de página resuelve la clasificación sin conocer ninguna
+    /// posición: si autentica, era una página sellada y sus primeros bytes
+    /// son su nonce; si no, era una meta, una cabecera o cualquier otra
+    /// cosa, y no entra en la cuenta.
+    ///
+    /// Registra la escritura ANTES de delegar, así que también anota las que
+    /// el fallo armado hace fracasar: un nonce consumido por una escritura
+    /// que nunca llegó al plato sigue siendo un nonce consumido, y es
+    /// exactamente el que un motor descuidado podría volver a repartir tras
+    /// la caída.
+    struct NonceRecorder {
+        inner: Arc<FaultStorage>,
+        page_size: u32,
+        writes: Mutex<Vec<(u32, Vec<u8>)>>,
+    }
+
+    impl NonceRecorder {
+        fn new(inner: Arc<FaultStorage>, page_size: u32) -> Self {
+            Self { inner, page_size, writes: Mutex::new(Vec::new()) }
+        }
+
+        fn recorded(&self) -> usize {
+            self.writes.lock().unwrap().len()
+        }
+
+        /// Los nonces de las escrituras a partir de `from`, en orden: de
+        /// cada escritura del tamaño de una página que NO sea una ranura de
+        /// meta se toman sus primeros `nonce_len` bytes, que es donde
+        /// `crypto::seal` deja el nonce en claro.
+        ///
+        /// **La clasificación se la hace el propio formato, no una tabla de
+        /// offsets.** Una escritura de meta es, por construcción, una meta
+        /// codificada válida (`Meta::encode` + CRC32, y sigue en claro
+        /// aunque la base esté cifrada); una página sellada son 512 bytes de
+        /// nonce, tag y texto cifrado. Así que "decodifica como meta" separa
+        /// las dos SIN saber en qué página vive ninguna ranura — que es
+        /// justo el saber que se queda obsoleto en cuanto `relocate_meta_b`
+        /// mueve la meta B en caliente, y el error que este proyecto ya ha
+        /// cometido seis veces. El único falso positivo concebible —una
+        /// página sellada cuyos bytes formen por azar una meta válida, con
+        /// su CRC32 y su geometría coherentes— solo podría hacer que un
+        /// nonce se quede FUERA de la comprobación, nunca que aparezca uno
+        /// inventado: puede debilitar la prueba, no puede hacerla mentir.
+        ///
+        /// La página 0 se excluye aparte: es la cabecera por definición del
+        /// formato (`Geometry::read` la lee del offset 0 sin preguntar a
+        /// nadie), y aunque hoy nadie la escriba del tamaño de una página
+        /// entera, un día que lo hiciera sus bytes no serían un nonce.
+        fn nonces(&self, range: std::ops::Range<usize>, nonce_len: usize) -> Vec<Vec<u8>> {
+            let writes = self.writes.lock().unwrap();
+            writes[range.start..range.end.min(writes.len())]
+                .iter()
+                .filter(|(page, bytes)| {
+                    *page != 0
+                        && bytes.len() == self.page_size as usize
+                        && Meta::decode(bytes).is_err()
+                })
+                .map(|(_, bytes)| bytes[..nonce_len].to_vec())
+                .collect()
+        }
+    }
+
+    impl Storage for NonceRecorder {
+        fn read_at(&self, o: u64, b: &mut [u8]) -> inro::Result<()> {
+            self.inner.read_at(o, b)
+        }
+        fn write_at(&self, o: u64, b: &[u8]) -> inro::Result<()> {
+            self.writes.lock().unwrap().push(((o / self.page_size as u64) as u32, b.to_vec()));
+            self.inner.write_at(o, b)
+        }
+        fn sync(&self) -> inro::Result<()> {
+            self.inner.sync()
+        }
+        fn len(&self) -> inro::Result<u64> {
+            self.inner.len()
+        }
+        fn truncate(&self, len: u64) -> inro::Result<()> {
+            self.inner.truncate(len)
+        }
+    }
+
+    /// Ordinal de la última escritura de cada uno de los `commits` commits
+    /// de la carga de referencia, medido sobre un medio aparte sin ningún
+    /// fallo armado. De aquí sale el punto de caída, que así cae DENTRO de
+    /// una transacción concreta en vez de en un número inventado.
+    fn measure_commit_boundaries(opts: Options, commits: u32) -> Vec<u64> {
+        let s = Arc::new(FaultStorage::new(MemStorage::new(), None));
+        let db = Db::create(Box::new(Arc::clone(&s)), opts).unwrap();
+        let mut ends = Vec::new();
+        for i in 0..commits {
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, &i.to_be_bytes(), &[0x11; 30]).unwrap();
+            tx.commit().unwrap();
+            ends.push(s.write_count());
+        }
+        ends
+    }
+
+    /// **El ciclo caer-y-reabrir, que es la razón de que esta sección exista
+    /// en un fichero de inyección de fallos y no dentro de `crypto.rs`.**
+    ///
+    /// El contador de nonce vuelve a CERO en cada apertura: la apertura de
+    /// después de la caída reparte los mismos contadores que la de antes.
+    /// Lo único que impide que eso sea una reutilización de nonce —el fallo
+    /// más grave que puede tener un cifrado por página— es que cada apertura
+    /// sortee sus propios 16 bytes de prefijo aleatorio. Esta prueba lo
+    /// comprueba de las dos formas a la vez, y las dos derivadas:
+    ///
+    /// 1. **Ningún nonce se repite** en toda la vida del fichero, cruzando
+    ///    la caída: se recogen los de TODAS las escrituras de página
+    ///    emitidas por las dos aperturas —incluidas las de la transacción
+    ///    que murió a medias, que también consumieron contador— y el
+    ///    conjunto no puede tener duplicados. Qué escritura era una página
+    ///    sellada lo decide `inro::open_page`, no una tabla de offsets (ver
+    ///    `NonceRecorder`).
+    /// 2. **El contador SÍ rebobina, y aun así no colisiona.** El primer
+    ///    nonce de cada apertura se compara byte a byte: tienen que diferir
+    ///    SOLO dentro de los primeros `NONCE_PREFIX_LEN` bytes (el prefijo
+    ///    aleatorio) y coincidir en todo lo que viene después (el contador,
+    ///    que arranca igual en las dos). Es la demostración directa de que
+    ///    la seguridad viene del prefijo y no de que el contador recuerde
+    ///    nada — si algún día el prefijo dejara de sortearse por apertura,
+    ///    los dos primeros nonces serían IDÉNTICOS y las dos mitades de esta
+    ///    prueba fallarían a la vez.
+    ///
+    /// El punto de caída se MIDE (`measure_commit_boundaries`): cae dentro
+    /// del último commit de la primera apertura, con escrituras ya emitidas
+    /// que nunca llegan al plato.
+    #[test]
+    fn a_crash_and_reopen_never_reuses_a_nonce_even_though_the_counter_restarts_at_zero() {
+        const COMMITS: u32 = 12;
+
+        for (algorithm, opts) in matrix() {
+            // Longitud del nonce ALMACENADO, preguntada al propio motor en
+            // vez de escrita a mano: es la que devuelve su generador.
+            let nonce_len = NonceStream::from_prefix([0; NONCE_PREFIX_LEN])
+                .next(algorithm)
+                .unwrap()
+                .len();
+            assert!(nonce_len > NONCE_PREFIX_LEN, "{algorithm:?}: nonce sin sitio para el contador");
+
+            let ends = measure_commit_boundaries(opts, COMMITS);
+            let last = *ends.last().unwrap();
+            let previous = ends[ends.len() - 2];
+            // Un punto DENTRO del último commit: ni su primera escritura ni
+            // la que lo confirma.
+            let crash_at = (previous + last) / 2;
+            assert!(
+                crash_at > previous && crash_at < last,
+                "{algorithm:?}: el punto de caida ({crash_at}) no cae dentro del ultimo commit \
+                 ({previous}..{last}]"
+            );
+
+            let fs = Arc::new(FaultStorage::new(MemStorage::new(), None));
+            let rec = Arc::new(NonceRecorder::new(Arc::clone(&fs), opts.page_size));
+
+            // Primera apertura: COMMITS-1 commits limpios y el último
+            // muriendo a mitad.
+            let db = Db::create(Box::new(Arc::clone(&rec)), opts).unwrap();
+            for i in 0..COMMITS {
+                if i + 1 == COMMITS {
+                    fs.set_fault(Some(Fault::AbortAt(crash_at)));
+                }
+                let Ok(mut tx) = db.begin_write() else { break };
+                if tx.put(0x01, &i.to_be_bytes(), &[0x11; 30]).is_err() {
+                    break;
+                }
+                if tx.commit().is_err() {
+                    break;
+                }
+            }
+            drop(db);
+            fs.set_fault(None);
+            let first_session = rec.recorded();
+            assert!(first_session > 0, "{algorithm:?}: la primera apertura no escribio nada");
+
+            // Segunda apertura: la que rebobina el contador a cero.
+            let db = Db::open(Box::new(Arc::clone(&rec)), opts).unwrap();
+            for i in 0..COMMITS {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x02, &i.to_be_bytes(), &[0x22; 30]).unwrap();
+                tx.commit().unwrap();
+            }
+            assert!(db.audit_pages().unwrap(), "{algorithm:?}: contabilidad tras reabrir");
+            drop(db);
+
+            // Los dos tramos de la secuencia, separados por el ordinal
+            // exacto en el que la primera apertura dejó de escribir: la
+            // frontera se MIDE (`recorded()` justo antes de reabrir), no se
+            // adivina por el contenido de las escrituras.
+            let before = rec.nonces(0..first_session, nonce_len);
+            let after = rec.nonces(first_session..rec.recorded(), nonce_len);
+            assert!(before.len() >= 2, "{algorithm:?}: {} nonces antes de la caida", before.len());
+            assert!(after.len() >= 2, "{algorithm:?}: {} nonces despues de la caida", after.len());
+
+            // (1) Ni uno repetido en toda la vida del fichero.
+            let mut seen = std::collections::BTreeSet::new();
+            for nonce in before.iter().chain(after.iter()) {
+                assert!(
+                    seen.insert(nonce.clone()),
+                    "{algorithm:?}: nonce repetido ({nonce:02x?}) entre las {} escrituras selladas \
+                     de las dos aperturas: la caida devolvio a circulacion un contador ya usado",
+                    before.len() + after.len()
+                );
+            }
+
+            // (2) El contador SÍ rebobina —las dos aperturas empiezan por
+            // su nonce de contador cero— y aun así los dos primeros nonces
+            // son distintos: la unicidad la sostiene el prefijo, no la
+            // memoria del contador.
+            //
+            // El nonce de contador cero de cada apertura no se escribe a
+            // mano: se RECONSTRUYE pidiéndoselo a `NonceStream`, el mismo
+            // generador del motor, alimentado con el prefijo que esa
+            // apertura sorteó. Así la comprobación no depende de dónde
+            // ponga cada algoritmo su contador (XChaCha20 lo lleva en los
+            // bytes 16..24; AES-256-GCM-SIV, con 12 bytes de nonce útiles,
+            // en los 8..12), solo de que el contador de la primera
+            // escritura valga lo mismo que el de un flujo recién creado.
+            let counter_zero_of = |first: &[u8]| {
+                let mut prefix = [0u8; NONCE_PREFIX_LEN];
+                prefix.copy_from_slice(&first[..NONCE_PREFIX_LEN]);
+                NonceStream::from_prefix(prefix).next(algorithm).unwrap()[..nonce_len].to_vec()
+            };
+            for (label, first) in [("antes", &before[0]), ("despues", &after[0])] {
+                assert_eq!(
+                    first,
+                    &counter_zero_of(first),
+                    "{algorithm:?}: la primera pagina sellada {label} de la caida no usa el nonce \
+                     de contador CERO de su propio prefijo, asi que el contador no arranca de \
+                     cero en cada apertura y esta prueba no esta comprobando lo que dice"
+                );
+            }
+            assert_ne!(
+                before[0], after[0],
+                "{algorithm:?}: las dos aperturas arrancan con el MISMO nonce — el prefijo \
+                 aleatorio no se esta volviendo a sortear al reabrir, y el contador que rebobina \
+                 pasa a ser una reutilizacion de nonce en toda regla"
+            );
+        }
+    }
+
+    /// **Guardián de la matriz**, del mismo tipo que
+    /// `the_power_cut_harness_only_says_anything_because_sync_is_relaxed`:
+    /// esta sección entera solo prueba algo si las `Options` que reparte
+    /// `matrix()` cifran de verdad y cubren todas las vías que este build
+    /// compila.
+    ///
+    /// La trampa exacta que cierra ya ocurrió en este fichero con otra
+    /// dimensión: `relaxed_sync_loses_commits_but_never_corrupts` pasaba sin
+    /// tocar nada si se le cambiaba `Sync::Never` por `Sync::Commit`, porque
+    /// el arnés no sabía expresar la condición que decía probar. El
+    /// equivalente aquí sería que alguien devolviera `Options::default()`
+    /// desde `opts_for`, o borrara `Aes256GcmSiv` de `algorithms()`: los
+    /// barridos seguirían pasando, más rápido incluso, sin cifrar nada.
+    /// Las cuatro comprobaciones de abajo lo impiden.
+    #[test]
+    fn the_encrypted_matrix_only_says_anything_because_the_pages_are_really_encrypted() {
+        let matrix = matrix();
+
+        // (a) La matriz cubre exactamente los algoritmos que este build
+        // compila — ni menos (alguien borró una vía) ni más (alguien pide
+        // una que no está enlazada).
+        let algorithms: Vec<Algorithm> = matrix.iter().map(|&(a, _)| a).collect();
+        assert!(
+            algorithms.contains(&Algorithm::XChaCha20Poly1305),
+            "la matriz perdió XChaCha20-Poly1305, la vía por defecto"
+        );
+        #[cfg(feature = "aes")]
+        assert!(
+            algorithms.contains(&Algorithm::Aes256GcmSiv),
+            "este build compila la feature `aes` pero la matriz no prueba AES-256-GCM-SIV: es \
+             históricamente la menos probada de las dos, justo la que no puede faltar"
+        );
+        let expected = if cfg!(feature = "aes") { 2 } else { 1 };
+        assert_eq!(
+            algorithms.len(),
+            expected,
+            "la matriz tiene {} algoritmos y este build compila {expected}",
+            algorithms.len()
+        );
+
+        // (b) Toda opción de la matriz pide cifrado.
+        for (algorithm, opts) in &matrix {
+            assert!(
+                opts.encryption.is_some(),
+                "{algorithm:?}: las opciones de la matriz no piden cifrado"
+            );
+        }
+
+        // (c) Y el cifrado se NOTA en el plato: un valor conocido, escrito y
+        // confirmado, no aparece en claro en el medio. El control sin
+        // cifrar, justo debajo, comprueba que esta busqueda sabe encontrar
+        // lo que busca — sin él, un `contains` roto haría pasar (c) sobre
+        // cualquier cosa.
+        const MARCA: &[u8] = b"marca-en-claro-detectable";
+        let has_marker = |image: &[u8]| image.windows(MARCA.len()).any(|w| w == MARCA);
+        for (algorithm, opts) in &matrix {
+            let s = Arc::new(MemStorage::new());
+            let db = Db::create(Box::new(Arc::clone(&s)), *opts).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"clave", MARCA).unwrap();
+            tx.commit().unwrap();
+            drop(db);
+            assert!(
+                !has_marker(&s.snapshot()),
+                "{algorithm:?}: el valor aparece EN CLARO en el medio — esta matriz no está \
+                 cifrando nada"
+            );
+        }
+        let s = Arc::new(MemStorage::new());
+        let db = Db::create(Box::new(Arc::clone(&s)), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        tx.put(0x01, b"clave", MARCA).unwrap();
+        tx.commit().unwrap();
+        drop(db);
+        assert!(
+            has_marker(&s.snapshot()),
+            "sin cifrado el valor TIENE que aparecer en claro: si no, la busqueda de (c) no sabe \
+             encontrar lo que busca y (c) pasaría sobre una base sin cifrar"
+        );
+
+        // (d) Y la clave importa: abrir con otra no puede funcionar.
+        for (algorithm, opts) in &matrix {
+            let s = Arc::new(MemStorage::new());
+            let db = Db::create(Box::new(Arc::clone(&s)), *opts).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"clave", b"valor").unwrap();
+            tx.commit().unwrap();
+            drop(db);
+            let mut wrong = *opts;
+            wrong.encryption = Some(Encryption { key: [0x11; 32], algorithm: *algorithm });
+            assert!(
+                Db::open(Box::new(Arc::clone(&s)), wrong).is_err(),
+                "{algorithm:?}: abrir con una clave equivocada deberia fallar"
+            );
+        }
     }
 }
