@@ -795,6 +795,18 @@ pub struct WriteTxn<'db> {
     /// del orden de 1,6 MB, sin dar ninguna protección real a una base SIN
     /// cifrar, donde el contador ni siquiera se usa). Ver `write_page`.
     written: BTreeSet<(PageNo, u64)>,
+    /// Escrituras físicas (`write_page`) emitidas por esta transacción hasta
+    /// ahora — tarea 20. A diferencia de `written`, se lleva SIEMPRE, con o
+    /// sin cifrado: es un `u64` que solo se incrementa, sin coste de memoria
+    /// alguno, así que no aplica la misma razón que mantiene `written`
+    /// condicional. Nace en cero y solo cuenta lo que pasa por
+    /// `write_page` — ni la lista de libres que `commit` escribe
+    /// directamente contra `self.db.pager` (`Freelist::flush`), ni la
+    /// propia meta del commit, así que `pending_writes()` (más abajo) es
+    /// "escrituras de árbol/lista-de-libres de ESTA transacción hasta el
+    /// instante de la llamada", no "escrituras totales que este commit
+    /// hará" — ver el comentario de `pending_writes`.
+    write_count: u64,
     /// Copia de la lista de libres tal como estaba antes de esta
     /// transacción. `alloc`/`free` mutan `guard`'s `WriterState` en el
     /// sitio, no una copia local — es el mismo objeto que sobrevive entre
@@ -889,6 +901,7 @@ impl Db {
             meta,
             slot,
             written: BTreeSet::new(),
+            write_count: 0,
             pre_freelist,
             committed: false,
             self_allocated: BTreeSet::new(),
@@ -1367,7 +1380,25 @@ impl<'db> WriteTxn<'db> {
             return Err(Error::NonceReuse { page });
         }
         self.db.pager.write_encrypted(page, counter, bytes)?;
+        self.write_count += 1;
         Ok(())
+    }
+
+    /// Páginas escritas por esta transacción hasta ahora. La prueba de
+    /// inyección de fallos la usa para localizar la escritura de la meta, que
+    /// es siempre la última del commit.
+    ///
+    /// Cuenta únicamente lo que pasó por `write_page` — páginas de árbol,
+    /// tarea 20 — no la lista de libres, que `commit` escribe aparte contra
+    /// `self.db.pager` (`Freelist::flush`), ni la propia meta. Por eso
+    /// `tests/faults.rs` no calcula la escritura de la meta como
+    /// `pending_writes() + 1` a ciegas: mide cuántas escrituras físicas
+    /// añade un `commit()` de referencia por encima de este valor y usa esa
+    /// cifra, que en la práctica no siempre es 1 — cualquier `put`/`delete`
+    /// libera al menos la raíz y la hoja antiguas (COW), así que
+    /// `Freelist::flush` casi siempre tiene algo que serializar.
+    pub fn pending_writes(&self) -> u64 {
+        self.write_count
     }
 
     /// Núcleo de la asignación de contador de nonce, compartido por
@@ -2269,6 +2300,37 @@ mod tests {
         tx.commit().unwrap();
 
         assert!(db.audit_pages().unwrap(), "pagina perdida o contada dos veces");
+    }
+
+    /// `pending_writes` (tarea 20): tiene que contar EXACTAMENTE las
+    /// escrituras físicas que `write_page` ha emitido hasta ahora, sea cual
+    /// sea el número — nada que ver con `written` (el guardián de nonces de
+    /// arriba, que solo se puebla bajo cifrado, ver su comentario). Si
+    /// `pending_writes` delegara en `written.len()` sin más — la primera
+    /// tentación, ya que ambos son "cuántas escrituras lleva esta
+    /// transacción" — esta comprobación fallaría en una base SIN cifrar
+    /// como esta: `written` se queda vacío para siempre, y
+    /// `tests/faults.rs` (que SÍ necesita este número para apuntar con
+    /// precisión a la escritura de la meta) apuntaría al sitio equivocado
+    /// sin que ninguna prueba lo notara. Se comprueba contra
+    /// `FaultStorage::write_count`, que cuenta escrituras al MEDIO — la
+    /// única fuente de verdad independiente de `WriteTxn` que existe.
+    #[test]
+    fn pending_writes_counts_every_physical_write_issued_so_far() {
+        let s = Arc::new(crate::storage::FaultStorage::new(MemStorage::new(), None));
+        let db = Db::create(Box::new(Arc::clone(&s)), Options::default()).unwrap();
+        let before = s.write_count();
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..50u32 {
+            tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
+        }
+        let physical = s.write_count() - before;
+        assert!(physical > 0, "la carga de la prueba deberia emitir al menos una escritura fisica");
+        assert_eq!(
+            tx.pending_writes(),
+            physical,
+            "pending_writes debe igualar las escrituras fisicas ya emitidas por esta transaccion"
+        );
     }
 
     /// **Las dos pruebas que pide la tarea 19 (segunda ronda de revisión,
