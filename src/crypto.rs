@@ -558,6 +558,7 @@ pub fn seal(
 pub(crate) mod probe {
     use super::{PageNo, STORED_NONCE_LEN};
     use alloc::vec::Vec;
+    use core::cell::RefCell;
     use std::sync::{Mutex, MutexGuard};
 
     /// Un sellado tal como lo produjo `seal`.
@@ -568,7 +569,18 @@ pub(crate) mod probe {
     }
 
     static SESSION: Mutex<()> = Mutex::new(());
-    static RECORD: Mutex<Option<Vec<Sealed>>> = Mutex::new(None);
+
+    // Por HILO, no global. `seal` llama a `record` desde cualquier prueba
+    // que cifre, y `cargo test` las corre en paralelo: con un registro
+    // global, los sellados de una prueba que NO captura acababan dentro de
+    // la captura de otra que sí, y
+    // `the_nonce_counter_restarts_at_zero_on_every_open` fallaba de forma
+    // intermitente al leer en `first[0]` un sellado ajeno con otro
+    // contador. `SESSION` solo serializa las capturas ENTRE SÍ; nunca aisló
+    // de las no capturadoras, que es de donde venía la contaminación.
+    thread_local! {
+        static RECORD: RefCell<Option<Vec<Sealed>>> = const { RefCell::new(None) };
+    }
 
     /// Sesión de captura viva. Mientras exista, `seal` anota cada nonce que
     /// produce; al soltarla, la captura se apaga.
@@ -582,7 +594,7 @@ pub(crate) mod probe {
             // entra en pánico, el candado queda envenenado y TODAS las
             // demás fallarían por un motivo ajeno al que se está probando.
             let session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
-            *RECORD.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+            RECORD.with(|r| *r.borrow_mut() = Some(Vec::new()));
             Self { _session: session }
         }
 
@@ -591,22 +603,26 @@ pub(crate) mod probe {
         /// que selló el original de una copia de seguridad y lo que selló
         /// la copia restaurada).
         pub fn take(&self) -> Vec<Sealed> {
-            let mut r = RECORD.lock().unwrap_or_else(|e| e.into_inner());
-            r.replace(Vec::new()).unwrap_or_default()
+            RECORD.with(|r| r.borrow_mut().replace(Vec::new()).unwrap_or_default())
         }
     }
 
     impl Drop for Capture {
         fn drop(&mut self) {
-            *RECORD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            RECORD.with(|r| *r.borrow_mut() = None);
         }
     }
 
     pub(super) fn record(page: PageNo, nonce: &[u8; STORED_NONCE_LEN], ciphertext: &[u8]) {
-        let mut r = RECORD.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(v) = r.as_mut() {
-            v.push(Sealed { page, nonce: *nonce, ciphertext: ciphertext.to_vec() });
-        }
+        // `try_with` y no `with`: durante el desmontaje de un hilo la
+        // variable local ya puede estar destruida, y `with` entraría en
+        // pánico dentro de `seal` — un fallo del arnés disfrazado de fallo
+        // del motor.
+        let _ = RECORD.try_with(|r| {
+            if let Some(v) = r.borrow_mut().as_mut() {
+                v.push(Sealed { page, nonce: *nonce, ciphertext: ciphertext.to_vec() });
+            }
+        });
     }
 }
 
@@ -1953,10 +1969,20 @@ mod tests {
                 // a lo que ya había — un desgarro que no desgarra nada. La
                 // comprobación se queda como guardia del arnés. Ver
                 // `TORN_PREFIX`.
+                // Mismo alargado derivado que en la rama de cabecera, más
+                // abajo, y por el mismo motivo: el prefijo pedido es el
+                // punto de partida, no la última palabra.
+                let mut prefix = prefix;
+                while crate::meta::Meta::decode(&landed).is_ok() && prefix < b.len() {
+                    prefix += 1;
+                    self.inner.write_at(o, &b[..prefix])?;
+                    self.inner.read_at(o, &mut landed)?;
+                }
                 assert!(
                     crate::meta::Meta::decode(&landed).is_err(),
-                    "el prefijo de {prefix} bytes deja la ranura de meta en {o} todavia \
-                     legible: esta prueba no esta modelando ningun desgarro"
+                    "ningun prefijo entre {prefix} y {} deja ilegible la ranura de meta en \
+                     {o}: los bytes nuevos no difieren de los que ya habia",
+                    b.len()
                 );
                 self.last_synced_meta.lock().unwrap()[i] = landed;
                 *self.dead.lock().unwrap() = Some(self.inner.snapshot());
@@ -1973,10 +1999,28 @@ mod tests {
                 // `a_torn_header_rewrite_...` en `tx.rs`, los bytes que no
                 // difieren nunca entre la cabecera vieja y la nueva), esta
                 // prueba no está modelando ningún desgarro.
+                // El prefijo pedido es el PUNTO DE PARTIDA, no la última
+                // palabra: se alarga hasta que el desgarro de verdad deja
+                // la cabecera ilegible. Sin esto la prueba parpadeaba una
+                // de cada ~14 corridas, y por la razón de siempre en este
+                // arnés — conocimiento fijado a mano en vez de derivado.
+                // El CRC de la cabecera depende de `db_id`, que se sortea
+                // al crear la base, así que para algunos sorteos los bytes
+                // nuevos por debajo del corte coincidían con los que ya
+                // había y el desgarro no desgarraba nada. La guardia hacía
+                // bien en saltar; lo que estaba mal era el prefijo.
+                let mut prefix = prefix;
+                while crate::header::Geometry::decode(&landed).is_ok() && prefix < b.len() {
+                    prefix += 1;
+                    self.inner.write_at(o, &b[..prefix])?;
+                    self.inner.read_at(o, &mut landed)?;
+                }
                 assert!(
                     crate::header::Geometry::decode(&landed).is_err(),
-                    "el prefijo de {prefix} bytes deja la cabecera en {o} todavia legible: \
-                     esta prueba no esta modelando ningun desgarro"
+                    "ningun prefijo entre {prefix} y {} deja ilegible la cabecera en {o}: \
+                     los bytes nuevos no difieren de los que ya habia, asi que esta \
+                     escritura no cambia nada y desgarrarla no modela nada",
+                    b.len()
                 );
                 self.last_synced_header.lock().unwrap()[i] = landed;
                 *self.dead.lock().unwrap() = Some(self.inner.snapshot());
