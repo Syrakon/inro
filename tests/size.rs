@@ -68,26 +68,32 @@
 //!   la mitad más vieja de las entradas, contra páginas liberadas. No mide
 //!   tiempo de reloj — la tarea 15 ya estableció que contar páginas es más
 //!   estable entre máquinas que medir microsegundos.
-//! - `opening_costs_the_same_at_thirty_kilobytes_and_at_two_gigabytes` mide
-//!   páginas leídas por `Db::open` sola, antes de cualquier `get`/`scan`, a
-//!   través de `Pager::read` (el único camino que `Db::pages_read` cuenta).
-//!   **Precisión importante, encontrada al medir**: la cabecera y las dos
-//!   meta-páginas NO pasan por `Pager::read` — `Db::open` las lee
-//!   directamente del `Storage` (`Geometry::read_reporting_fallback`,
-//!   `Meta::load`), antes incluso de construir el `Pager`, así que no
-//!   suman a este contador. Lo único que sí lo hace es la carga perezosa de
-//!   la lista de libres (`Freelist::load`, como mucho DOS páginas físicas —
-//!   cabeza y cola, si son distintas — ver su comentario en
-//!   `freelist.rs`), y solo si esa lista no está vacía. Con un fichero de
-//!   solo inserciones y poca actividad de reciclado (el caso pequeño de
-//!   este banco), el contador puede legítimamente valer 0 — no significa
-//!   que `Db::open` no haya leído nada del disco, solo que no leyó nada a
-//!   través del camino instrumentado. No mide el coste de recorrer el
-//!   árbol después de abrir.
+//! - `opening_costs_the_same_at_thirty_kilobytes_and_at_two_hundred_thousand_entries`
+//!   mide lecturas físicas hechas por `Db::open` sola, antes de cualquier
+//!   `get`/`scan`, contadas por `CountingStorage` (más abajo) al nivel del
+//!   `Storage` — NO de `Pager::read`/`Db::pages_read()`, como hacía una
+//!   versión anterior de este banco. **Corrección de una ronda de revisión
+//!   posterior**: contar solo `Pager::read` deja invisible la cabecera y
+//!   las dos meta-páginas — `Db::open` las lee directamente del `Storage`
+//!   (`Geometry::read_reporting_fallback`, `Meta::load`), antes incluso de
+//!   construir el `Pager` — así que ese contador certificaba que abrir no
+//!   recorre el árbol, pero no habría atrapado una regresión que hiciera
+//!   depender del tamaño del fichero justo a ESE camino, que ni siquiera
+//!   toca el `Pager`. Contar en el `Storage`, la capa más baja de todas, sí
+//!   lo hace: cualquier byte que `Db::open` lea del medio, por el camino
+//!   que sea, pasa por ahí. Lo único que de verdad varía con el contenido
+//!   del fichero es la carga perezosa de la lista de libres
+//!   (`Freelist::load`, como mucho DOS páginas físicas — cabeza y cola, si
+//!   son distintas — ver su comentario en `freelist.rs`), y solo si esa
+//!   lista no está vacía. No mide el coste de recorrer el árbol después de
+//!   abrir. El caso "grande" es 200.000 entradas, no ~2 GB/50 millones — ver
+//!   el comentario de la propia prueba sobre por qué eso basta.
 #![cfg(feature = "std")]
 
 use inro::storage::FileStorage;
-use inro::{Db, Options, Sync};
+use inro::{Db, Options, Storage, Sync};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Añade `v` a `buf` en LEB128 sin signo — misma forma que `varint::write`
 /// del motor (ver el comentario del módulo), reimplementada porque ese
@@ -181,47 +187,17 @@ fn bytes_per_log_entry_stay_under_the_threshold() {
     assert!(per_entry <= 40.0, "{per_entry:.2} bytes por entrada supera el umbral de 40");
 }
 
-/// Prueba de control: demuestra que la medición de arriba mide de verdad
-/// el llenado de página en disco, no una cifra calculada sobre el tamaño
-/// lógico de los registros — cambiando el ORDEN de inserción, con el mismo
-/// volumen (`N` = 16 384, para que la corrida sea rápida), el mismo tamaño
-/// de lote y los mismos registros que `synthetic_log`.
-///
-/// **La hipótesis inicial de quien escribió este banco era la contraria** —
-/// que la inserción ascendente de `synthetic_log` (con `ts` creciente, la
-/// forma real de una clave de log) sería la PEOR, porque `tree.rs` divide
-/// un nodo siempre por el punto medio (ver su comentario junto a `Split`:
-/// "...deja la mitad izquierda llena y la derecha con...") y con inserción
-/// estrictamente ascendente la mitad izquierda de cada partición queda
-/// congelada para siempre, sin que ningún `put` futuro caiga ya en ese
-/// rango. Medido, ES AL REVÉS: a igual `N`, secuencial da ~69 B/entrada,
-/// barajado ~99 — un 44% peor, no mejor. El mecanismo exacto queda sin
-/// aislar (candidatos: la compresión de prefijo aprovecha mucho mejor un
-/// `ts` que crece por pasos pequeños que una dispersión uniforme sobre
-/// todo el rango, o el patrón de escritura simultánea a hojas muy
-/// separadas del árbol interactúa peor con la política de partición) — lo
-/// que sí está confirmado, y es lo único que esta prueba necesita
-/// establecer, es que el cociente medido REACCIONA al orden de inserción:
-/// si no reaccionara, la prueba de arriba no estaría midiendo el llenado
-/// real de las páginas en absoluto, sino algún artefacto fijo.
-///
-/// El barajado es una permutación multiplicativa sobre una potencia de
-/// dos: con un multiplicador impar, `j ↦ (j·a) mod N` es una biyección de
-/// `0..N` sobre sí mismo — determinista, reproducible entre corridas, y sin
-/// tirar de ninguna dependencia de aleatoriedad.
-#[test]
-#[ignore]
-fn bytes_per_entry_reacts_to_shuffled_insertion_order() {
-    const N: u32 = 16_384; // potencia de dos: la biyección de abajo lo exige
-    let path = std::env::temp_dir().join("inro-bench-size-shuffled.inro");
-    let _ = std::fs::remove_file(&path);
+/// Escribe `order` (una permutación de índices para `synthetic_log`) en
+/// `path`, en lotes de mil, y devuelve el tamaño de fichero resultante en
+/// bytes por entrada — la misma métrica que
+/// `bytes_per_log_entry_stay_under_the_threshold`, parametrizada por orden.
+fn size_per_entry_for_order(path: &std::path::Path, order: &[u32]) -> f64 {
+    let _ = std::fs::remove_file(path);
     let db = Db::create(
-        Box::new(FileStorage::open(&path).unwrap()),
+        Box::new(FileStorage::open(path).unwrap()),
         Options { page_size: 4096, sync: Sync::Never, ..Options::default() },
     )
     .unwrap();
-
-    let order: Vec<u32> = (0..N).map(|j| j.wrapping_mul(2_654_435_761) & (N - 1)).collect();
     for chunk in order.chunks(1000) {
         let mut tx = db.begin_write().unwrap();
         for &i in chunk {
@@ -231,20 +207,77 @@ fn bytes_per_entry_reacts_to_shuffled_insertion_order() {
         tx.commit().unwrap();
     }
     drop(db);
+    let size = std::fs::metadata(path).unwrap().len();
+    let _ = std::fs::remove_file(path);
+    size as f64 / order.len() as f64
+}
 
-    let size = std::fs::metadata(&path).unwrap().len();
-    let per_entry = size as f64 / N as f64;
-    println!("inro (orden barajado, N={N}): {size} bytes, {per_entry:.2} por entrada");
-    let _ = std::fs::remove_file(&path);
-    // El umbral de referencia es el resultado secuencial medido al mismo N
-    // (~69 B/entrada, ver el informe de la tarea 21) más un margen — no un
-    // valor "bueno" en sí, solo evidencia de que el orden de inserción
-    // mueve el cociente de forma sustancial en una dirección u otra.
+/// Prueba de control: demuestra que la medición de arriba mide de verdad
+/// el llenado de página en disco, no una cifra calculada sobre el tamaño
+/// lógico de los registros — cambiando el ORDEN de inserción, con el mismo
+/// volumen (`N` = 16 384, para que la corrida sea rápida), el mismo tamaño
+/// de lote y los mismos registros que `synthetic_log`. **Construye los DOS
+/// órdenes dentro de esta misma prueba** y compara su COCIENTE, en vez de
+/// fijar el resultado secuencial como una constante de otra corrida:
+/// codificar el número secuencial de hoy (~69 B/entrada) como umbral fijo
+/// convertiría un arreglo futuro del llenado de página (que baje ESE
+/// número) en un fallo de esta prueba de control con el mensaje "la
+/// medición no está reaccionando al orden" — exactamente lo contrario de lo
+/// que debe reportar una mejora real. El cociente entre los dos, medidos en
+/// la misma corrida, no tiene ese problema: se mueve con cualquier cambio
+/// real de llenado, en cualquier dirección.
+///
+/// **La hipótesis inicial de quien escribió este banco era la contraria a
+/// lo medido** — que la inserción ascendente de `synthetic_log` (con `ts`
+/// creciente, la forma real de una clave de log) sería la PEOR, porque
+/// `tree.rs` divide un nodo siempre por el punto medio (ver su comentario
+/// junto a `Split`: "...deja la mitad izquierda llena y la derecha
+/// con...") y con inserción estrictamente ascendente la mitad izquierda de
+/// cada partición queda congelada para siempre, sin que ningún `put`
+/// futuro caiga ya en ese rango. Medido, ES AL REVÉS: a igual `N`,
+/// secuencial da ~69 B/entrada, barajado ~99 — un 44% peor, no mejor. El
+/// mecanismo exacto queda sin aislar (candidatos: la compresión de prefijo
+/// aprovecha mucho mejor un `ts` que crece por pasos pequeños que una
+/// dispersión uniforme sobre todo el rango, o el patrón de escritura
+/// simultánea a hojas muy separadas del árbol interactúa peor con la
+/// política de partición) — lo que sí está confirmado, y es lo único que
+/// esta prueba necesita establecer, es que el cociente medido REACCIONA al
+/// orden de inserción: si no reaccionara, la prueba de arriba no estaría
+/// midiendo el llenado real de las páginas en absoluto, sino algún
+/// artefacto fijo.
+///
+/// El barajado es una permutación multiplicativa sobre una potencia de
+/// dos: con un multiplicador impar, `j ↦ (j·a) mod N` es una biyección de
+/// `0..N` sobre sí mismo — determinista, reproducible entre corridas, y sin
+/// tirar de ninguna dependencia de aleatoriedad.
+#[test]
+#[ignore]
+fn bytes_per_entry_reacts_to_shuffled_insertion_order() {
+    const N: u32 = 16_384; // potencia de dos: la biyección de abajo lo exige
+    let sequential: Vec<u32> = (0..N).collect();
+    let shuffled: Vec<u32> = (0..N).map(|j| j.wrapping_mul(2_654_435_761) & (N - 1)).collect();
+
+    let seq_path = std::env::temp_dir().join("inro-bench-size-sequential.inro");
+    let shuf_path = std::env::temp_dir().join("inro-bench-size-shuffled.inro");
+    let seq_per_entry = size_per_entry_for_order(&seq_path, &sequential);
+    let shuf_per_entry = size_per_entry_for_order(&shuf_path, &shuffled);
+    println!("inro (secuencial, N={N}): {seq_per_entry:.2} B/entrada");
+    println!("inro (barajado,   N={N}): {shuf_per_entry:.2} B/entrada");
+
+    // Cociente, no una constante fija: cualquier lado puede moverse en el
+    // futuro (por ejemplo, un `emit` sesgado a anexar que suba el
+    // secuencial hacia ~99% de llenado — ver la sección 12.2 de la
+    // especificación sobre el camino identificado, no implementado). Lo
+    // único que esta prueba necesita es que los dos números difieran de
+    // forma sustancial — un 10% de margen sobre 1.0 en cualquier
+    // dirección — no que el secuencial gane ni que valga ~69.
+    let ratio = shuf_per_entry / seq_per_entry;
     assert!(
-        per_entry > 85.0,
-        "{per_entry:.2} bytes por entrada con orden barajado no se distingue \
-         del secuencial (~69) — la medición no está reaccionando al orden \
-         de inserción"
+        !(0.9..=1.1).contains(&ratio),
+        "cociente barajado/secuencial = {ratio:.3} (secuencial {seq_per_entry:.2} B/entrada, \
+         barajado {shuf_per_entry:.2} B/entrada) — el orden de inserción no está moviendo la \
+         medición de forma sustancial, así que `bytes_per_log_entry_stay_under_the_threshold` \
+         podría no estar midiendo el llenado real de las páginas"
     );
 }
 
@@ -281,20 +314,92 @@ fn pruning_a_days_worth_is_orders_of_magnitude_cheaper_than_a_scan() {
     assert!(read < 500, "se leyeron {read} páginas; las hojas no deben abrirse");
 }
 
-/// Confirma que el coste de `Db::open` (medido en páginas que pasan por
-/// `Pager::read`, ver el comentario del módulo sobre qué SÍ y qué NO cuenta
-/// este contador) no depende del tamaño del fichero: como mucho la carga
-/// perezosa de la lista de libres — cabeza y cola, si son distintas, nunca
-/// el árbol de datos ni el resto de la lista. Marcada `#[ignore]`: el caso
-/// grande construye del orden de 2 GB de fichero — medido en la tarea 21,
-/// del orden de DOS HORAS de reloj, no minutos. La integración continua la
-/// ejecuta aparte, filtrada por nombre (`-- --ignored opening_costs`, ver
-/// `.gitlab-ci.yml`), en su propia orden dentro de la etapa `bench` —
-/// nunca junto a las demás pruebas de este fichero, que terminan en un par
-/// de minutos.
+/// Envoltorio de `Storage` que cuenta llamadas a `read_at` — a diferencia
+/// de `Db::pages_read()`/`Pager::pages_read()`, que solo cuentan lecturas
+/// que pasan por `Pager::read`. `Db::open` lee la cabecera y las dos
+/// meta-páginas directamente del `Storage`, ANTES de construir el `Pager`
+/// (`Geometry::read_reporting_fallback`, `Meta::load`) — esas lecturas son
+/// invisibles para `Db::pages_read()`, así que un contador anclado ahí
+/// certifica que abrir no recorre el árbol, pero no atraparía una
+/// regresión que hiciera depender del tamaño del fichero justo a ese
+/// camino de cabecera/metas. Contar en el `Storage`, la capa más baja de
+/// todas, no deja ningún camino sin cubrir: cualquier lectura física que
+/// `Db::open` haga, por el camino interno que sea, incrementa `reads`.
+///
+/// Envuelto en `Arc` (no solo `Box`) para conservar un asa legible después
+/// de entregar la propiedad a `Db::open`, que exige `Box<dyn Storage>` —
+/// el mismo patrón que usan `FaultStorage`/`Recording` en `tests/faults.rs`,
+/// posible porque `storage.rs` implementa `Storage` para cualquier
+/// `Arc<S: Storage>` (ver su comentario ahí, sobre este caso exacto: un
+/// arnés de pruebas que necesita conservar acceso tras la entrega).
+struct CountingStorage<S> {
+    inner: S,
+    reads: AtomicU64,
+}
+
+impl<S: Storage> CountingStorage<S> {
+    fn new(inner: S) -> Self {
+        Self { inner, reads: AtomicU64::new(0) }
+    }
+
+    fn read_count(&self) -> u64 {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+impl<S: Storage> Storage for CountingStorage<S> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> inro::Result<()> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> inro::Result<()> {
+        self.inner.write_at(offset, buf)
+    }
+
+    fn sync(&self) -> inro::Result<()> {
+        self.inner.sync()
+    }
+
+    fn len(&self) -> inro::Result<u64> {
+        self.inner.len()
+    }
+}
+
+/// Confirma que el coste de `Db::open` (medido en lecturas físicas al
+/// nivel del `Storage`, ver `CountingStorage` arriba) no depende del
+/// tamaño del fichero: como mucho la carga perezosa de la lista de libres
+/// — cabeza y cola, si son distintas — encima de la cabecera y las dos
+/// meta-páginas, que se leen siempre, nunca el árbol de datos ni el resto
+/// de la lista.
+///
+/// **El caso "grande" es 200.000 entradas, no ~2 GB (50 millones)** —
+/// corregido en la ronda de revisión que cerró la tarea 21: la versión
+/// anterior de este banco dejaba la cifra grande sin rellenar en el
+/// informe (`[PENDIENTE]`) porque construir ~2 GB tarda del orden de DOS
+/// HORAS de reloj, y esa corrida nunca llegó a completarse. El mecanismo
+/// que este banco verifica — que `Db::open` no toca el árbol de datos, y
+/// que la lista de libres se carga perezosa con como mucho dos lecturas —
+/// no depende de cuán grande sea el árbol: un fichero de 200.000 entradas
+/// (decenas de MB, con el llenado real medido en la sección 12.2) ya tiene
+/// un árbol de varios niveles y ejercita el mismo camino de apertura que
+/// uno de 2 GB, en segundos en vez de horas. Marcar el criterio de la
+/// especificación como cumplido a 2 GB exactos seguiría siendo una
+/// extrapolación del mecanismo, no una medición a esa escala — la
+/// especificación lo dice así explícitamente (sección 1 y 16).
+///
+/// Marcada `#[ignore]`, igual que sus vecinas de este fichero: no entra en
+/// los cinco comandos de verificación. La integración continua la ejecuta
+/// aparte, filtrada por nombre (`-- --ignored opening_costs`, ver
+/// `.gitlab-ci.yml`) — **antes** del resto de la etapa `bench`, no
+/// después: el primer comando de esa etapa falla a propósito (el umbral de
+/// 40 B/entrada, ver `bytes_per_log_entry_stay_under_the_threshold`), y
+/// una orden de `script` que falla detiene las que le siguen — si la de
+/// apertura fuera la segunda orden, nunca se ejecutaría en una corrida
+/// real de integración continua, solo en local.
 #[test]
 #[ignore]
-fn opening_costs_the_same_at_thirty_kilobytes_and_at_two_gigabytes() {
+fn opening_costs_the_same_at_thirty_kilobytes_and_at_two_hundred_thousand_entries() {
     fn reads_to_open(entries: u32) -> u64 {
         let path = std::env::temp_dir().join(format!("inro-bench-open-{entries}.inro"));
         let _ = std::fs::remove_file(&path);
@@ -306,20 +411,19 @@ fn opening_costs_the_same_at_thirty_kilobytes_and_at_two_gigabytes() {
             .unwrap();
             write_synthetic_log(&db, entries, 1000);
         }
-        let db = Db::open(
-            Box::new(FileStorage::open(&path).unwrap()),
-            Options { page_size: 4096, ..Options::default() },
-        )
-        .unwrap();
-        let reads = db.pages_read();
+        let counting = Arc::new(CountingStorage::new(FileStorage::open(&path).unwrap()));
+        let db =
+            Db::open(Box::new(counting.clone()), Options { page_size: 4096, ..Options::default() })
+                .unwrap();
+        let reads = counting.read_count();
         drop(db);
         let _ = std::fs::remove_file(&path);
         reads
     }
 
     let small = reads_to_open(500); // decenas de KB
-    let large = reads_to_open(50_000_000); // del orden de 2-3 GB, según el llenado real (sección 12.2)
-    println!("apertura: {small} lecturas en pequeño, {large} en grande");
+    let large = reads_to_open(200_000); // decenas de MB — ver el comentario de arriba
+    println!("apertura: {small} lecturas (Storage) en pequeño, {large} en grande");
     assert_eq!(
         small, large,
         "la apertura debe costar lo mismo — si difiere, no es por el TAMAÑO del \
@@ -328,9 +432,9 @@ fn opening_costs_the_same_at_thirty_kilobytes_and_at_two_gigabytes() {
          comentario del módulo"
     );
     assert!(
-        small <= 2,
-        "como mucho cabeza y cola de la lista de libres, nunca más — ver \
-         `Freelist::load` en freelist.rs"
+        small <= 4,
+        "cabecera, dos meta-páginas y como mucho cabeza/cola de la lista de libres — \
+         nunca más; ver `Db::open`, `Meta::load` y `Freelist::load` en freelist.rs"
     );
 }
 
@@ -420,10 +524,27 @@ mod sqlite_comparison {
         }
     }
 
+    /// Lee `VmHWM` de `/proc/self/status` — Linux, texto plano, sin
+    /// dependencia. **Es el pico residente del PROCESO ENTERO desde que
+    /// arrancó, no de ningún motor aislado, y es MONÓTONO: solo puede
+    /// subir, nunca bajar**, incluida memoria que ya se liberó (confirmado
+    /// en una ronda de revisión: liberar 64 MB deliberadamente deja el
+    /// `VmHWM` exactamente igual). Dentro de este mismo proceso de prueba,
+    /// la fase de inro corre primero y la de SQLite después — así que
+    /// `inro_rss` (leído tras la fase de inro) y `sqlite_rss` (leído tras
+    /// la fase de SQLite, que ya incluye todo lo que dejó la de inro) NO
+    /// son comparables como "RSS de cada motor": `sqlite_rss >= inro_rss`
+    /// está GARANTIZADO por construcción, sea SQLite más o menos pesado que
+    /// inro — invertir el orden de las dos fases (confirmado en la misma
+    /// ronda) da el mismo número redondo para las dos lecturas, lo que
+    /// termina de confirmar que lo que se mide es "el proceso hasta este
+    /// punto", no "este motor". Lo único que SÍ es legítimo leer de estos
+    /// dos números es su DIFERENCIA cuando inro corre primero: cuánto pico
+    /// adicional añade la fase de SQLite encima de lo que la fase de inro
+    /// ya había establecido — ver `compare_against_sqlite_on_the_same_workload`,
+    /// donde se imprime así, marcado como lo que es, no como "RSS de
+    /// SQLite" ni "RSS de inro" aislados.
     fn max_rss_kb() -> u64 {
-        // Linux: `/proc/self/status`, campo `VmHWM` (high-water mark
-        // residente) en KB. No hace falta ninguna dependencia para leerlo:
-        // es texto plano.
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("VmHWM:") {
@@ -433,7 +554,21 @@ mod sqlite_comparison {
         0
     }
 
+    /// Marcada `#[ignore]`, mismo motivo medido que las cuatro pruebas del
+    /// módulo padre (`bytes_per_log_entry_stay_under_the_threshold` y
+    /// vecinas): un millón de registros — aquí, además, en LOS DOS motores,
+    /// más la compilación de SQLite si `--features bench-sqlite` no se
+    /// había activado antes — no cabe en el presupuesto de los cinco
+    /// comandos de verificación. **Esta era la prueba que se quedaba sin
+    /// `#[ignore]`**: como solo compila tras `--features bench-sqlite`, no
+    /// aparecía en ninguno de los cinco comandos de verificación de rutina
+    /// (que no activan esa *feature*), pero SÍ en `cargo test
+    /// --all-features`, que la activa junto con todas las demás y la
+    /// ejecuta sin filtrar — en modo `debug`, sin límite de tiempo visible,
+    /// indistinguible de un cuelgue para quien no supiera que ahí dentro
+    /// hay un millón de filas en dos motores a la vez.
     #[test]
+    #[ignore]
     fn compare_against_sqlite_on_the_same_workload() {
         const N: u32 = 1_000_000;
 
@@ -559,20 +694,40 @@ mod sqlite_comparison {
         }
 
         println!(
-            "inro:   {inro_size} bytes ({:.2} B/entrada), poda {:?}, RSS {inro_rss} KB",
+            "inro:   {inro_size} bytes ({:.2} B/entrada), poda {:?}",
             inro_size as f64 / N as f64,
             inro_prune
         );
         println!(
             "sqlite: {sqlite_total} bytes = {sqlite_main} main + {sqlite_wal} wal + \
-             {sqlite_shm} shm ({:.2} B/entrada), poda {:?}, RSS {sqlite_rss} KB",
+             {sqlite_shm} shm ({:.2} B/entrada), poda {:?}",
             sqlite_total as f64 / N as f64,
             sqlite_prune
+        );
+        // NO se imprime "RSS de inro" ni "RSS de SQLite" como si fueran
+        // cifras comparables por separado — ver el comentario de
+        // `max_rss_kb`, arriba: `VmHWM` es del proceso completo y monótono,
+        // así que `sqlite_rss >= inro_rss` está garantizado por
+        // construcción sin importar qué motor pese más. Lo único que se
+        // imprime es la DIFERENCIA entre las dos lecturas — cuánto pico
+        // adicional añade la fase de SQLite encima de lo que ya había
+        // dejado la fase de inro, que corrió primero — etiquetada como lo
+        // que es, no como una comparación de "RSS por motor". La cifra
+        // aislada de cada motor (RAM por base abierta, sección 1 y 17.1 de
+        // la especificación) sigue sin medirse: haría falta un proceso
+        // separado por motor, con su propio `VmHWM`, y esta prueba no lo
+        // hace.
+        let sqlite_phase_delta_kb = sqlite_rss.saturating_sub(inro_rss);
+        println!(
+            "RSS de pico del proceso: {inro_rss} KB tras la fase inro, {sqlite_rss} KB tras la \
+             fase SQLite — +{sqlite_phase_delta_kb} KB de pico ATRIBUIBLE A LA FASE SQLITE \
+             (encima de lo que ya había dejado inro; NO es \"RSS de SQLite\" ni \"RSS de inro\" \
+             aislados, ver el comentario de `max_rss_kb`)"
         );
 
         // Sin umbral: es una medición para la especificación (sección
         // 17.1), no una puerta de integración continua. El propio banco
-        // deja constancia de que corrió hasta el final imprimiendo ambas
+        // deja constancia de que corrió hasta el final imprimiendo las
         // cifras arriba.
     }
 }

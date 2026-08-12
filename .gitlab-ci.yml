@@ -1,5 +1,16 @@
 stages: [check, test, bench]
 
+# Pinnado explícito, no implícito en lo que traiga el runner por defecto
+# (hallazgo de una ronda de revisión posterior a la tarea 21): sin `image:`,
+# cada job depende de que la imagen por defecto del runner que ejecute este
+# pipeline traiga instalada una toolchain de Rust — verdad hoy, accidente
+# mañana si alguien cambia esa imagen por defecto sin tocar este fichero.
+# `rust:1.89` coincide con `rust-version` de `Cargo.toml`: el mínimo que el
+# propio crate declara soportar, ni más nuevo (que podría aceptar código que
+# luego falla para consumidores en el mínimo real) ni más viejo (que podría
+# rechazar código válido).
+image: rust:1.89
+
 variables:
   CARGO_TERM_COLOR: always
 
@@ -44,19 +55,30 @@ check:
     - cargo build --no-default-features
     # Cero dependencias de runtime sin features: el árbol es una sola línea.
     - test "$(cargo tree --edges normal --prefix none | wc -l)" -eq 1
-    # Cero unsafe propio: `--forbid-only` solo comprueba que
-    # `forbid(unsafe_code)` sigue declarado en la entrada del crate, sin
-    # construir nada — rápido a propósito, para no pagar una compilación
-    # completa en cada commit. El informe COMPLETO de `unsafe` transitivo
-    # bajo `encryption` (dependencias de cifrado incluidas) es la línea base
-    # archivada en el informe de la tarea 21, no una comprobación
-    # automática aquí: no existe todavía un número previo con el que
-    # comparar en esta primera ejecución, así que la comparación automática
-    # ("cualquier aumento de `unsafe` transitivo falla", sección 15 de la
-    # especificación) queda para cuando haya una línea base publicada con la
-    # que diferenciar — el informe completo, guardado, es esa línea base.
-    - cargo install cargo-geiger --locked
-    - cargo geiger --output-format Ascii --forbid-only
+    # Cero unsafe propio: NO se comprueba aquí con `cargo geiger
+    # --forbid-only` (lo hacía una versión anterior de este fichero). Dos
+    # motivos, encontrados en una ronda de revisión posterior a la tarea 21:
+    # (1) es un *no-op* de verdad — el informe de la tarea 21 documenta que
+    # `--forbid-only` sale con código 0 SIEMPRE para este proyecto, porque
+    # solo reconoce el atributo LITERAL `#![forbid(unsafe_code)]` en los
+    # ficheros de entrada, y este crate declara la prohibición en
+    # `Cargo.toml` (`[lints.rust] unsafe_code = "forbid"`) para que alcance
+    # también a `tests`/`benches`/ejemplos — así que este paso nunca podía
+    # fallar, en ninguna dirección, y la protección real ya la da el propio
+    # compilador como *lint level* en CADA `cargo build`/`cargo test`, sin
+    # paso aparte. (2) `cargo install cargo-geiger --locked` compila una
+    # herramienta pesada desde código fuente en CADA pipeline, sin caché,
+    # solo para ejecutar un paso que no podía fallar — coste sin beneficio.
+    # El informe COMPLETO de `unsafe` transitivo (`cargo geiger --features
+    # aes --output-format Ascii`, SIN `--forbid-only`, que sí cuenta
+    # `unsafe` real en las dependencias de cifrado) sigue siendo útil, pero
+    # es trabajo de auditoría periódica, no un guardián por commit: la línea
+    # base archivada en el informe de la tarea 21 (`40/72` funciones, `2671/
+    # 3587` expresiones bajo `--features aes`) es el número contra el que
+    # comparar la próxima vez que alguien lo ejecute a mano, o desde un job
+    # `bench`/programado aparte si se decide automatizar esa comparación —
+    # decisión de infraestructura que esta corrección no toma sin que nadie
+    # la pida, igual que la tarea 21 no la tomó para la apertura a 2 GB.
 
 test:
   stage: test
@@ -85,35 +107,26 @@ bench:
     # TODAS las pruebas de `tests/size.rs` van `#[ignore]` (medido en la
     # tarea 21: un millón de registros en modo `debug`, el que usan los
     # cinco comandos de verificación, no llegó a terminar en dos minutos de
-    # reloj — no solo la de apertura a 2 GB, que es la única que el brief
-    # marcaba así). Por eso hace falta `--ignored` aquí; sin él, esta orden
-    # reportaría "4 ignored" y ningún número.
+    # reloj). Por eso hace falta `--ignored` aquí; sin él, esta orden
+    # reportaría "N ignored" y ningún número.
     #
-    # Umbral de la fase 1: como máximo 40 bytes por entrada de log (ver
-    # `bytes_per_log_entry_stay_under_the_threshold`). MEDIDO EN LA TAREA 21:
-    # 67,72 B/entrada — esta orden FALLA a propósito hasta que se cierre ese
-    # hueco (ver la sección 12.2 de la especificación); no se ha subido el
-    # umbral para que pase. La poda (`pruning_...`) y la prueba de control
-    # del orden de inserción (`..._reacts_to_shuffled_insertion_order`)
-    # corren en la misma orden. `--skip opening_costs` deja fuera la única
-    # prueba de verdad larga (ver más abajo). `tee` deja constancia en el
-    # artefacto de lo que de verdad se ejecutó, no solo el resultado.
-    - cargo test --release --test size -- --ignored --skip opening_costs --nocapture 2>&1 | tee target/bench-report.txt
-    # La prueba de apertura a 2 GB va aparte, filtrada por nombre: la
-    # construcción del fichero grande es LENTA de verdad — medido en la
-    # tarea 21, del orden de dos horas de reloj en el hardware de
-    # verificación (no minutos, como asumía una primera estimación; el
-    # fichero resultante ronda los 3,4 GB con el bytes/entrada real medido
-    # en esta misma tarea, no exactamente 2 GB — "del orden de 2 GB", como
-    # dice el brief). No debe bloquear ni mezclarse con la orden de arriba
-    # en cada `bench`, y probablemente no deba correr en cada pipeline de
-    # esta etapa tampoco — considérese moverla a un job manual o programado
-    # aparte si el tiempo de `bench` en CI importa; se deja aquí, en la
-    # misma etapa, porque el brief no especifica esa separación y no es
-    # una decisión de esta tarea imponer una infraestructura de CI que
-    # nadie ha pedido. `tee -a` para que las dos corridas queden en el
-    # mismo artefacto.
-    - cargo test --release --test size -- --ignored opening_costs --nocapture 2>&1 | tee -a target/bench-report.txt
+    # ORDEN DELIBERADO, corregido en una ronda de revisión posterior a la
+    # tarea 21: la prueba de apertura va PRIMERO, la del umbral de
+    # bytes/entrada va SEGUNDA — al revés de como estaban originalmente. El
+    # umbral de 40 B/entrada (`bytes_per_log_entry_stay_under_the_threshold`)
+    # FALLA a propósito (medido: 67,72 B/entrada, ver la sección 12.2 de la
+    # especificación) — no se ha subido el umbral para que pase — y una
+    # orden de `script` de GitLab CI que falla detiene las que le siguen. Con
+    # el umbral primero, la prueba de apertura de más abajo NUNCA llegaría a
+    # ejecutarse en una corrida real de integración continua, solo en local
+    # (donde nadie nota que la segunda orden se saltó). Con la apertura
+    # primero, corre siempre, pase lo que pase con el umbral.
+    - cargo test --release --test size -- --ignored opening_costs --nocapture 2>&1 | tee target/bench-report.txt
+    # Bytes/entrada + poda + control de orden de inserción, en la misma
+    # orden. `--skip opening_costs` deja fuera la prueba de arriba (ya
+    # corrida). `tee -a` para que las dos corridas queden en el mismo
+    # artefacto.
+    - cargo test --release --test size -- --ignored --skip opening_costs --nocapture 2>&1 | tee -a target/bench-report.txt
   artifacts:
     paths: [target/bench-report.txt]
     when: always
