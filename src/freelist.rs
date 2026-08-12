@@ -304,9 +304,13 @@ impl Freelist {
     /// `written_head`.
     ///
     /// **Esto puede reciclar más rápido de lo que una meta vieja aún
-    /// "vigente" tolera.** Bajo `Sync::Never` o un `Sync::Interval` largo,
-    /// la meta que sobrevive a un corte de corriente puede quedarse varias
-    /// transacciones atrás de la última escrita, y esa meta antigua
+    /// "vigente" tolera — y la reutilización de contenedores libres como
+    /// contenedor de `flush` (más abajo, segunda ronda de revisión de la
+    /// tarea 19) lo empeora, no lo mejora: consumir con avidez hace MÁS
+    /// probable, no menos, que la meta que sobrevive a un corte describa
+    /// una cadena ya reasignada.** Bajo `Sync::Never` o un `Sync::Interval`
+    /// largo, la meta que sobrevive a un corte de corriente puede quedarse
+    /// varias transacciones atrás de la última escrita, y esa meta antigua
     /// todavía puede señalar como `freelist_head`/`freelist_tail` una
     /// página cuyo contenedor físico este reciclado ya reasignó como
     /// página de datos en una transacción posterior no sincronizada. Sin
@@ -317,10 +321,14 @@ impl Freelist {
     /// de forma determinista (`--features encryption` o `--features
     /// aes`). La corrección no vive aquí: `Db::open` (`tx.rs`) degrada con
     /// gracia si `Freelist::load` no puede decodificar la cadena heredada
-    /// — trata esa cadena concreta como irrecuperable (una fuga acotada,
-    /// solo en ese corte exacto) en vez de negarse a abrir un fichero por
-    /// lo demás legible, el mismo criterio que ya aplica la reparación de
-    /// cabecera. Ver el comentario de `Db::open` junto a esa llamada.
+    /// — trata esa cadena concreta como irrecuperable en vez de negarse a
+    /// abrir un fichero por lo demás legible, el mismo criterio que ya
+    /// aplica la reparación de cabecera. **No es una pérdida pequeña**: un
+    /// caso real medido en la segunda ronda de revisión perdió el 48 % del
+    /// fichero (27 de 56 páginas) de esta forma. Cerrarlo de verdad es
+    /// trabajo de fase 2 (junto con la reforma de la lista de libres ya
+    /// pendiente), no de esta corrección — ver el comentario de `Db::open`
+    /// junto a esa llamada para el detalle completo.
     pub fn flush(
         &mut self,
         pager: &Pager,

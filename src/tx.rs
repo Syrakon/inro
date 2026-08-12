@@ -309,19 +309,37 @@ impl Db {
         // seguir señalando como `freelist_head`/`freelist_tail` una página
         // cuyo contenedor físico una transacción posterior — nunca
         // sincronizada, así que invisible para esta apertura — ya reasignó
-        // como página de datos. Esa cadena concreta es entonces
-        // irrecuperable: sus páginas quedan perdidas (una fuga acotada,
-        // exclusiva de este corte) en vez de reincorporarse a la lista de
-        // libres, pero el resto del fichero —árbol, meta, cabecera— sigue
-        // intacto y perfectamente legible. Negarse a abrirlo por esto sería
-        // el mismo error que la reparación de cabecera de más arriba existe
-        // para evitar: un fichero legible al que el motor le niega la
-        // entrada porque una pieza SECUNDARIA de contabilidad no cuadra.
-        // Solo `Corrupt` se trata así — un `IoError` del medio subyacente
-        // (lectura fallida de verdad, no una página con el tipo cambiado)
-        // sigue siendo fatal, porque ahí no hay ninguna base razonable para
-        // asumir "esto es solo el reciclado de la tarea 19" en vez de un
-        // fallo real del almacenamiento.
+        // como página de datos.
+        //
+        // **La pérdida NO es pequeña.** Esa cadena concreta es irrecuperable
+        // — sus páginas quedan perdidas en vez de reincorporarse a la lista
+        // de libres — y "esa cadena" puede ser una fracción grande del
+        // fichero, no un puñado de páginas: la ronda de revisión que
+        // encontró esta corrección midió un caso real con 27 de 56 páginas
+        // (48 %) huérfanas para siempre tras degradar. La reutilización de
+        // contenedores de esta misma tarea (ver el comentario de
+        // `Freelist::flush`) empeora esto, no lo mejora: al consumir
+        // contenedores con avidez en vez de dejarlos extender el fichero,
+        // hace MÁS probable —no menos— que la meta que sobrevive a un corte
+        // bajo `Sync::Never`/`Interval` largo describa una cadena ya
+        // reasignada. El resto del fichero —árbol, meta, cabecera— sigue
+        // intacto y perfectamente legible; solo la lista de libres concreta
+        // que esa meta vieja describía se pierde. Cerrarlo de verdad
+        // necesita coordinar la reutilización con la política de `Sync`, no
+        // solo con el número de `flush` transcurridos — ver la reforma de
+        // la lista de libres ya pendiente en la deuda técnica de la fase 2;
+        // esta corrección solo evita que el motor se niegue a abrir, no
+        // evita la pérdida en sí.
+        //
+        // Negarse a abrir por esto, aun así, sería peor: el mismo error que
+        // la reparación de cabecera de más arriba existe para evitar — un
+        // fichero por lo demás legible al que el motor le niega la entrada
+        // porque una pieza de contabilidad no cuadra. Solo `Corrupt` se
+        // trata así — un `IoError` del medio subyacente (lectura fallida de
+        // verdad, no una página con el tipo cambiado) sigue siendo fatal,
+        // porque ahí no hay ninguna base razonable para asumir "esto es
+        // solo el reciclado de la tarea 19" en vez de un fallo real del
+        // almacenamiento.
         let mut freelist = match Freelist::load(&pager, meta.freelist_head, meta.freelist_tail) {
             Ok(f) => f,
             Err(Error::Corrupt { .. }) => {
@@ -343,8 +361,9 @@ impl Db {
                 // libres" — la reconciliación de la sección de abajo (que
                 // ya barre `[meta.n_pages, file_pages)`) no las alcanza
                 // porque siguen por DEBAJO de `n_pages`, así que quedan
-                // perdidas de verdad (la fuga acotada que el comentario de
-                // más arriba ya acepta), no corruptas.
+                // perdidas de verdad — hasta el 48 % del fichero en el caso
+                // medido que documenta el comentario de más arriba, no un
+                // puñado de páginas — pero no corruptas.
                 meta.freelist_head = 0;
                 meta.freelist_tail = 0;
                 Freelist::empty()
@@ -2252,29 +2271,55 @@ mod tests {
         assert!(db.audit_pages().unwrap(), "pagina perdida o contada dos veces");
     }
 
-    /// **La prueba que pide la tarea 19 (segunda ronda de revisión,
-    /// hallazgo CRÍTICO)**: sin esto, nada en la suite habría notado que la
+    /// **Las dos pruebas que pide la tarea 19 (segunda ronda de revisión,
+    /// hallazgo CRÍTICO)**: sin ellas, nada en la suite habría notado que la
     /// corrección de la fuga de la primera ronda (`Freelist::flush` recicla
     /// el contenedor del `flush` anterior, ver `written_head` en
     /// `freelist.rs`) cambiaba una fuga LINEAL (1-2 páginas por `commit`,
     /// acotada) por un crecimiento CUADRÁTICO (300 páginas físicas tras 30
-    /// `commit` de un solo `put`, 374 418 tras 500 — medido con esta misma
-    /// carga antes de la corrección de esta ronda, ver el informe de la
-    /// tarea 19). La causa: `flush` escribía un contenedor por GRUPO, y
-    /// cada `commit` añadía un grupo nuevo sin que nada consumiera los
-    /// viejos — así que el reciclado de `written_head` realimentaba el
-    /// problema en vez de resolverlo.
+    /// `commit` de un solo `put`, 374 418 tras 500 — medido con la carga de
+    /// clave repetida de más abajo, antes de la corrección de esta ronda,
+    /// ver el informe de la tarea 19). La causa: `flush` escribía un
+    /// contenedor por GRUPO, y cada `commit` añadía un grupo nuevo sin que
+    /// nada consumiera los viejos — así que el reciclado de `written_head`
+    /// realimentaba el problema en vez de resolverlo.
     ///
-    /// Umbral: `10 * commits` páginas para 500 `put` de una sola clave (que
-    /// solo debería necesitar un puñado de páginas fijas — cabecera, metas,
-    /// árbol, lista de libres). Con la corrección mide 20; con la fuga
-    /// original (lineal, previa a la tarea 19) mediría bajo 600; el
-    /// crecimiento cuadrático que esto atrapa pasa de 300 a 374 418 en el
-    /// mismo rango — cualquier margen razonable entre "unas pocas decenas"
-    /// y "cientos de miles" sirve para distinguirlos; `10 * commits` dista
-    /// mucho de ambos extremos equivocados.
+    /// Dos cargas DISTINTAS, no una — la revisión posterior a la primera
+    /// versión de este test encontró su comentario prometiendo "una sola
+    /// clave" mientras el código escribía 500 claves DISTINTAS, y las dos
+    /// formas dan números diferentes que vale la pena afirmar por separado
+    /// en vez de mezclar en un único umbral flojo:
+    /// - `..._with_a_single_repeated_key`: la misma clave, 500 veces
+    ///   (COW puro, sin que el árbol crezca). Mide PLANO en 7 páginas en
+    ///   los tres puntos (30/100/500 `commit`) — el número que de verdad
+    ///   demuestra que el crecimiento dejó de ser cuadrático, porque aquí
+    ///   NUNCA debería hacer falta más que un puñado fijo de páginas
+    ///   (cabecera, metas, árbol de una hoja, lista de libres).
+    /// - `..._with_many_distinct_keys`: 500 claves distintas (el árbol sí
+    ///   crece y se divide). Mide 7/11/20 — crece un poco porque el árbol
+    ///   en sí necesita más páginas, pero sigue muy lejos de las 300/3 918/
+    ///   374 418 del crecimiento cuadrático.
     #[test]
-    fn freelist_growth_stays_bounded_over_many_commits() {
+    fn freelist_growth_stays_bounded_with_a_single_repeated_key() {
+        let (s, db) = fresh();
+        for i in 0..500u32 {
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, &[0], b"v").unwrap();
+            tx.commit().unwrap();
+            let commits = i + 1;
+            if matches!(commits, 30 | 100 | 500) {
+                let pages = s.len().unwrap() / 512;
+                assert!(
+                    pages <= 20,
+                    "tras {commits} commits de la MISMA clave el fichero tiene \
+                     {pages} páginas — debería quedarse en un puñado fijo, no crecer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn freelist_growth_stays_bounded_with_many_distinct_keys() {
         let (s, db) = fresh();
         for i in 0..500u32 {
             let mut tx = db.begin_write().unwrap();
@@ -2285,8 +2330,8 @@ mod tests {
                 let pages = s.len().unwrap() / 512;
                 assert!(
                     pages <= u64::from(commits) * 10,
-                    "tras {commits} commits el fichero tiene {pages} páginas — \
-                     crecimiento no acotado (cuadrático o peor)"
+                    "tras {commits} commits de claves distintas el fichero tiene \
+                     {pages} páginas — crecimiento no acotado (cuadrático o peor)"
                 );
             }
         }
@@ -2520,14 +2565,14 @@ mod tests {
         // verdad" (el significado documentado de `Err` en `audit_pages`,
         // ver su comentario) sobre un fichero que `open` ya aceptó como
         // legible. `Ok(_)`, no `Ok(true)`: la cadena abandonada puede
-        // seguir describiendo páginas que ahora nadie reclama — la fuga
-        // acotada que el comentario de `Db::open` ya acepta como el precio
-        // de no negarse a abrir — así que `audit_pages` puede legítimamente
-        // devolver `Ok(false)` (fuga detectada, no corrupción: exactamente
-        // la distinción que su propio comentario documenta) en vez de
-        // `Ok(true)`. Lo que este test prueba es que NO hace panic con
-        // `Err`, no que la contabilidad quede perfecta tras abandonar una
-        // cadena entera.
+        // seguir describiendo páginas que ahora nadie reclama — y esa
+        // pérdida puede ser grande, no un puñado de páginas (un caso real
+        // midió el 48 % del fichero, ver el comentario de `Db::open`) — así
+        // que `audit_pages` puede legítimamente devolver `Ok(false)` (fuga
+        // detectada, no corrupción: exactamente la distinción que su propio
+        // comentario documenta) en vez de `Ok(true)`. Lo que este test
+        // prueba es que NO hace panic con `Err`, no que la contabilidad
+        // quede perfecta tras abandonar una cadena entera.
         assert!(
             db2.audit_pages().is_ok(),
             "audit_pages no debe fallar con Err tras una apertura que ya tuvo éxito"

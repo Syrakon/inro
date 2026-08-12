@@ -597,12 +597,19 @@ fn emit(
     // `emit` solo probaba ESE único punto y, si cualquiera de las dos
     // mitades no cabía, fallaba con `KeyTooLarge` — un `put` legítimo que sí
     // cabía en dos páginas se rechazaba exactamente igual que uno que de
-    // verdad no cabe en ninguna. Reproducido de punta a punta con
-    // `a_leaf_split_that_loses_all_prefix_compression_still_succeeds`, más
-    // abajo: siete `put` sobre un `ns` con un índice secundario definido,
-    // quince entradas de tres espacios de claves distintos conviviendo en
-    // una sola hoja, el punto medio por cuenta deja la mitad izquierda un
-    // solo byte por encima de 512.
+    // verdad no cabe en ninguna. Reproducido de punta a punta en
+    // `src/index.rs`,
+    // `a_leaf_split_that_loses_all_prefix_compression_still_succeeds`:
+    // nueve `put` sobre un `ns` con un índice secundario definido, cuyas
+    // entradas de catálogo, datos e índice conviven en una sola hoja, el
+    // punto medio por cuenta deja una mitad un byte por encima de 512. Esa
+    // prueba se reescribió por completo en la ronda de revisión de la
+    // tarea 19 que encontró este comentario desactualizado (una versión
+    // anterior, de siete `put`, no reproducía el fallo pese a decir que
+    // sí — verificado revirtiendo esta misma corrección con esa versión
+    // todavía en pie: seguía en verde) — el número de `put` y de entradas
+    // por hoja es un detalle de una reproducción concreta, no una cota que
+    // el motor garantice, así que no se repite aquí más que una vez.
     //
     // La búsqueda se expande alternando hacia cada lado del punto medio —
     // `O(n)` candidatos en el peor caso, cada uno `O(n)` para construir las
