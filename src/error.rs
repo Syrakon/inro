@@ -41,6 +41,26 @@ pub enum Error {
     IndexVersionMismatch { id: u8, stored: u32, provided: u32 },
     /// Un índice único ya contiene ese valor indexado.
     DuplicateKey { id: u8 },
+    /// El catálogo EN DISCO declara el índice `id` sobre el espacio de
+    /// claves `ns`, pero este `Db` no lo tiene registrado: nadie ha llamado
+    /// a `define_index` con él desde que se abrió la base. Una escritura
+    /// sobre `ns` en ese estado no puede mantener el índice — el extractor
+    /// es un puntero a función, código del llamante, y no viaja en el
+    /// fichero (ver `IndexDef::encode`, que guarda versión, unicidad, `ns`
+    /// y nombre, pero no puede guardar `extract`) — así que el motor sabe
+    /// lo bastante para NEGARSE aunque no sepa lo bastante para MANTENER.
+    ///
+    /// Sin este error, esa escritura seguía adelante por el camino sin
+    /// índices: la fila se guardaba sin entrada de índice, o se borraba
+    /// dejando la suya huérfana, y la divergencia solo se manifestaba en
+    /// otra apertura, la que sí declara sus índices, como una respuesta
+    /// EQUIVOCADA de `scan_index` — claves primarias de filas ya borradas y
+    /// ausencia de filas recién insertadas. Es un error distinto de
+    /// `DeleteRangeIndexed` a propósito: aquí la acción correctora existe y
+    /// es concreta — declara tus índices con `define_index` y repite la
+    /// operación — mientras que `DeleteRangeIndexed` significa que la
+    /// operación no está disponible sobre ese `ns` por mucho que se declare.
+    IndexNotDeclared { id: u8, ns: u8 },
     /// `delete_range` sobre un `ns` con índices definidos: el borrado por
     /// rango libera subárboles enteros sin visitar cada entrada (ver el
     /// comentario de `WriteTxn::delete_range`), así que no hay forma barata
@@ -49,6 +69,16 @@ pub enum Error {
     /// justifica `delete_range` — justo para el caso de uso, poda diaria por
     /// retención, que más se beneficia de tener también un índice. Fallar
     /// alto y claro es preferible a divergir en silencio.
+    ///
+    /// **"Con índices definidos" se decide contra el CATÁLOGO en disco**, no
+    /// solo contra los `IndexDef` registrados en este `Db` — si no, este
+    /// error no llegaba a dispararse nunca en el único proceso donde de
+    /// verdad importa: un podador de retención no tiene ningún motivo para
+    /// llamar a `define_index` (ni forma de hacerlo: no tiene el extractor),
+    /// así que su lista de índices registrados está vacía y `delete_range`
+    /// se colaba por el camino sin índices, huerfanando de golpe todas las
+    /// entradas del rango. A diferencia de `IndexNotDeclared`, declarar el
+    /// índice no cambia el resultado: la operación sigue rechazada.
     DeleteRangeIndexed { ns: u8 },
     KeyTooLarge { len: u32, max: u32 },
     /// No queda espacio direccionable: el fichero alcanzó 2^32 páginas.

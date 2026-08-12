@@ -91,7 +91,63 @@ pub struct Db {
     /// llamante invoca `define_index`; nunca se relee solo de disco — cada
     /// apertura debe volver a registrar sus índices, porque el extractor es
     /// código del llamante y no vive en el fichero.
+    ///
+    /// Que esté vacío **no** significa que la base no tenga índices, y
+    /// confundir las dos cosas era el defecto que cierra `catalog_indexes`,
+    /// justo debajo.
     indexes: Mutex<Vec<IndexDef>>,
+    /// Pares `(id, ns)` que el catálogo DURABLE declara, leídos del fichero
+    /// —no de `indexes`— la primera vez que alguien escribe. `None` mientras
+    /// no se hayan leído todavía.
+    ///
+    /// **Por qué existe.** `indexes` arranca vacío en CADA apertura y solo
+    /// lo puebla `define_index`, que exige un `extract` que el fichero no
+    /// puede guardar. Un proceso que abre la base sin declarar nada tenía,
+    /// hasta esta corrección, una lista vacía indistinguible de "esta base
+    /// no tiene índices": `put` se iba por `put_raw` y guardaba la fila sin
+    /// entrada de índice, `delete` borraba la fila y dejaba la suya
+    /// huérfana, y `delete_range` huerfanaba el rango entero de una vez —
+    /// su rechazo `DeleteRangeIndexed` (tarea 16) no llegaba a dispararse
+    /// jamás. Nada de eso fallaba ni se notaba en el momento: la divergencia
+    /// aparecía en OTRA apertura, la que sí declara sus índices, como una
+    /// respuesta equivocada de `scan_index` en las dos direcciones — claves
+    /// primarias de filas ya borradas, y ausencia de filas ya insertadas.
+    /// `audit_pages` no lo ve y no puede verlo: cada página sigue teniendo
+    /// exactamente un dueño; lo que está muerto es el SIGNIFICADO de las
+    /// entradas, no su contabilidad de espacio. El caso de uso donde más
+    /// duele es el que este motor prioriza: un podador por retención no
+    /// tiene ningún motivo para declarar índices —no tiene el extractor— y
+    /// es justo el que borra a diario.
+    ///
+    /// El catálogo no basta para MANTENER un índice (falta `extract`), pero
+    /// sí para saber que existe; con eso el motor puede negarse — ver
+    /// `WriteTxn::refuse_undeclared`.
+    ///
+    /// **Perezoso a propósito, no por comodidad.** Leerlo en `Db::open`
+    /// costaría un descenso hasta la hoja más a la izquierda del árbol (el
+    /// catálogo es `ns` 0x00, las claves más pequeñas que existen), y ese
+    /// descenso crece con la PROFUNDIDAD del árbol, es decir con el tamaño
+    /// de la base — exactamente lo que el criterio de salida de la
+    /// especificación prohíbe y lo que fijan
+    /// `open_costs_the_same_on_a_small_and_a_large_file` (aquí abajo,
+    /// `read_count() <= 4`) y `opening_costs_the_same_at_thirty_kilobytes_..`
+    /// (`tests/size.rs`, `assert_eq!(small, large)` con 500 y 200 000
+    /// entradas). Leyéndolo perezosamente, abrir cuesta exactamente lo mismo
+    /// que antes de esta corrección: cero lecturas de más, medido en
+    /// `opening_a_database_never_reads_the_catalog`. Quien solo lee no lo
+    /// paga nunca; quien escribe lo paga UNA vez por apertura.
+    ///
+    /// **Y además resuelve la apertura degradada.** `Db::open` ya degrada
+    /// con gracia una lista de libres ilegible en vez de negarle la entrada
+    /// a un fichero por lo demás legible (ver su comentario). Un catálogo
+    /// ilegible en `open` no admitiría ese trato: degradar a "asumo que no
+    /// hay índices" es literalmente el defecto que esto corrige, y negarse a
+    /// abrir contradiría esa política. Leyéndolo aquí, la disyuntiva
+    /// desaparece — la apertura no lo toca (los lectores siguen abriendo y
+    /// leyendo), y si el catálogo no se deja leer, el error sale por donde
+    /// tiene que salir: la ESCRITURA que necesitaba saberlo falla, y este
+    /// campo se queda en `None` para que la siguiente lo reintente.
+    catalog_indexes: Mutex<Option<Vec<(u8, u8)>>>,
 }
 
 /// Estado que sobrevive entre transacciones de escritura: la lista de libres
@@ -460,6 +516,12 @@ impl Db {
             sync: opts.sync,
             last_sync: Mutex::new(Instant::now()),
             indexes: Mutex::new(Vec::new()),
+            // `None`, no `Some(Vec::new())`: "todavía no lo he leído" y "lo
+            // he leído y no hay ningún índice" son estados distintos, y
+            // confundirlos aquí sería repetir en pequeño el defecto que
+            // `catalog_indexes` corrige — ver su comentario. Ni `create` ni
+            // `open` tocan el catálogo: se lee en la primera escritura.
+            catalog_indexes: Mutex::new(None),
         }
     }
 
@@ -746,6 +808,42 @@ impl PageSource for WriteTxn<'_> {
     fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
         self.db.pager.read(page)
     }
+}
+
+/// Pares `(id, ns)` de todos los índices que el catálogo declara en `root`.
+///
+/// Es lo ÚNICO que se puede saber de un índice sin tener su `IndexDef`
+/// completo: `IndexDef::encode` no guarda —no puede guardar— el puntero a
+/// función `extract`, así que un registro del catálogo dice que un índice
+/// existe y sobre qué espacio de claves, pero no alcanza para mantenerlo.
+/// Ver `Db::catalog_indexes`.
+///
+/// El catálogo vive bajo `CATALOG_NS` en el árbol normal (tarea 16), con el
+/// id como clave de un solo byte — así que esto es UN recorrido del rango
+/// `[0x00, INDEX_NS_BASE)` de ese espacio, no una lectura por índice.
+/// `INDEX_NS_BASE` como límite superior no es un número mágico prestado de
+/// otro sitio: es exactamente el primer id que `define_index` rechaza,
+/// porque el espacio de un índice es `INDEX_NS_BASE | id` y un id mayor
+/// desbordaría sobre el de otro.
+///
+/// **Ignora lo que `define_index` no pudo haber escrito**, en vez de
+/// tratarlo como catálogo corrupto y negar toda escritura: `CATALOG_NS` es
+/// un espacio de claves reservado, pero nada impide que alguien escriba
+/// bytes arbitrarios ahí con `tx.put(CATALOG_NS, ...)` — la misma puerta
+/// que ya está documentada para el espacio de un índice (ver `primary_of`
+/// en `index.rs`). La distinción es demostrable, no una suposición: la
+/// clave que escribe `define_index` es SIEMPRE `&[id]`, un byte, y su
+/// registro SIEMPRE mide 6 bytes o más (`IndexDef::encode`), así que nada
+/// fuera de esa forma describe un índice y saltárselo no puede perderse
+/// ninguno de verdad.
+fn read_catalog_indexes<S: PageSource>(src: &S, root: PageNo) -> Result<Vec<(u8, u8)>> {
+    let mut out = Vec::new();
+    let mut cursor = crate::tree::Cursor::new(src, root, CATALOG_NS, &[], &[INDEX_NS_BASE])?;
+    while let Some((key, record)) = cursor.next()? {
+        let (&[id], Some(ns)) = (&key[..], IndexDef::stored_ns(&record)) else { continue };
+        out.push((id, ns));
+    }
+    Ok(out)
 }
 
 impl Drop for ReadTxn<'_> {
@@ -1447,6 +1545,76 @@ impl<'db> WriteTxn<'db> {
         Ok(c)
     }
 
+    /// Ejecuta `f` sobre los pares `(id, ns)` que el CATÁLOGO declara,
+    /// leyéndolo del fichero si esta apertura todavía no lo había hecho.
+    ///
+    /// Lee como mucho una vez por apertura y guarda el resultado en
+    /// `Db::catalog_indexes` (ver su comentario para por qué aquí y no en
+    /// `Db::open`). Recorre la raíz de ESTA transacción, la misma que va a
+    /// recibir la escritura que hace la pregunta: así el catálogo que decide
+    /// y el árbol que se muta son el mismo estado, sin una instantánea
+    /// intermedia que pudiera diferir — el mismo criterio con el que `put`
+    /// lee el valor anterior y comprueba la unicidad.
+    ///
+    /// Con `f` en vez de devolviendo los ids que le interesan a cada
+    /// llamante: así ninguna de las dos preguntas asigna nada en el camino
+    /// caliente. Todo `put` y todo `delete` pasan por aquí, también sobre
+    /// espacios de claves sin ningún índice, y devolver un `Vec` de ids
+    /// habría metido una asignación por escritura donde no hace ninguna
+    /// falta — el filtro por `ns` se hace sobre el conjunto ya materializado
+    /// y no sobrevive a la llamada.
+    ///
+    /// El `take`/devolver alrededor de la lectura no es un rodeo: deja el
+    /// campo en `None` si la lectura falla, que es justo lo que hace falta
+    /// para que la siguiente escritura vuelva a intentarlo en vez de
+    /// quedarse con una respuesta que nunca llegó a existir. Y sostener el
+    /// candado durante la lectura evita que dos escrituras la hagan a la
+    /// vez; no puede haber bloqueo mutuo, porque nada por debajo (`Pager`,
+    /// `tree`) conoce este campo.
+    fn with_catalog<T>(&self, f: impl FnOnce(&[(u8, u8)]) -> Result<T>) -> Result<T> {
+        let mut slot = self.db.catalog_indexes.lock().unwrap();
+        let catalog = match slot.take() {
+            Some(c) => c,
+            None => read_catalog_indexes(self, self.meta.root)?,
+        };
+        let out = f(&catalog);
+        *slot = Some(catalog);
+        out
+    }
+
+    /// Rechaza la escritura si el catálogo declara sobre `ns` algún índice
+    /// que `declared` —lo que `Db::indexes_for` devolvió para este mismo
+    /// `ns`— no cubre. Es el guardián que convierte el defecto silencioso
+    /// descrito en `Db::catalog_indexes` en un `Err` inmediato.
+    ///
+    /// **Por id, no por espacio de claves.** Bastaría con "hay índices
+    /// declarados sobre `ns`" para el caso del encargo (un proceso que no
+    /// declara NADA), pero deja escapar el intermedio: dos índices sobre el
+    /// mismo `ns` y un llamante que solo registra uno mantendría el suyo y
+    /// dejaría el otro divergiendo, con la lista de definiciones no vacía y
+    /// por tanto sin sospecha ninguna. Comparar id a id cuesta lo mismo y no
+    /// deja ese hueco.
+    ///
+    /// Una base sin índices no paga nada de esto más allá del recorrido
+    /// único: el catálogo está vacío y el bucle no llega a ejecutarse.
+    fn refuse_undeclared(&self, ns: u8, declared: &[IndexDef]) -> Result<()> {
+        self.with_catalog(|catalog| {
+            for (id, indexed_ns) in catalog {
+                if *indexed_ns == ns && !declared.iter().any(|d| d.id == *id) {
+                    return Err(Error::IndexNotDeclared { id: *id, ns });
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// ¿Declara el catálogo algún índice sobre `ns`, lo tenga registrado
+    /// esta apertura o no? Es la pregunta que necesita `delete_range`, que
+    /// rechaza igual en los dos casos — ver su comentario.
+    fn catalog_indexes_namespace(&self, ns: u8) -> Result<bool> {
+        self.with_catalog(|catalog| Ok(catalog.iter().any(|(_, n)| *n == ns)))
+    }
+
     /// Escritura sin mantenimiento de índices. `put` (más abajo) la envuelve
     /// para actualizar también los índices secundarios dentro de la misma
     /// transacción; `define_index` también la usa directamente para escribir
@@ -1501,6 +1669,11 @@ impl<'db> WriteTxn<'db> {
     /// esta ronda.
     pub fn put(&mut self, ns: u8, key: &[u8], value: &[u8]) -> Result<()> {
         let defs = self.db.indexes_for(ns);
+        // Antes de decidir NADA, ni siquiera el atajo de "aquí no hay
+        // índices": esa lista vacía puede significar que esta apertura no
+        // declaró los suyos, y entonces el atajo es justo el que guarda la
+        // fila sin indexar. Ver `Db::catalog_indexes`.
+        self.refuse_undeclared(ns, &defs)?;
         if defs.is_empty() {
             return self.put_raw(ns, key, value);
         }
@@ -1602,6 +1775,11 @@ impl<'db> WriteTxn<'db> {
     /// abandona la transacción si devuelve `Err`.
     pub fn delete(&mut self, ns: u8, key: &[u8]) -> Result<bool> {
         let defs = self.db.indexes_for(ns);
+        // Mismo guardián que en `put`, y por el mismo motivo: sin él, una
+        // apertura que no declara sus índices borra la fila y deja su
+        // entrada de índice apuntando a una clave primaria que ya no
+        // existe. Ver `Db::catalog_indexes`.
+        self.refuse_undeclared(ns, &defs)?;
         if !defs.is_empty()
             && let Some(old) = self.get(ns, key)?
         {
@@ -1664,8 +1842,31 @@ impl<'db> WriteTxn<'db> {
     /// correcto a largo plazo, pero como tarea propia y deliberada, con su
     /// propio ciclo de revisión — no como parte de una ronda de correcciones
     /// sobre otro hallazgo.
+    ///
+    /// **"Con algún índice definido" se decide contra el CATÁLOGO**, no
+    /// contra los `IndexDef` que esta apertura tenga registrados. Escrito
+    /// solo contra los registrados, este rechazo no se disparaba jamás en el
+    /// proceso donde de verdad hacía falta: el podador de retención —el caso
+    /// de uso que motiva esta función entera— no llama a `define_index`
+    /// porque no tiene el extractor que exige, así que su lista está vacía,
+    /// el rechazo no saltaba, y cada poda diaria huerfanaba de golpe todas
+    /// las entradas de índice del rango. Medido sobre la carga de retención
+    /// de 14 días: con el índice registrado, la base se estabiliza en 328
+    /// páginas del día 30 al 59; sin registrarlo, crece sin cota (+4,43
+    /// páginas/día, 1557 al día 299) con 30 000 entradas de índice para 1400
+    /// filas vivas — 95,3 % basura. Y `audit_pages` decía `true` todo el
+    /// rato, con razón: la propiedad de las páginas estaba intacta; lo que
+    /// estaba muerto era el significado de las entradas.
+    ///
+    /// El error sigue siendo `DeleteRangeIndexed` también cuando el índice
+    /// existe pero no está declarado, y no `IndexNotDeclared`: declararlo no
+    /// haría viable esta operación: seguiría rechazada por (2), de arriba.
+    /// Un error que sugiere una acción correctora que no corrige nada es
+    /// peor que ninguna sugerencia. Quien caiga aquí y enrute por `delete`
+    /// clave a clave —el remedio que (1) describe— sí obtendrá entonces
+    /// `IndexNotDeclared`, que es donde declarar el índice sí resuelve.
     pub fn delete_range(&mut self, ns: u8, from: &[u8], to: &[u8]) -> Result<()> {
-        if !self.db.indexes_for(ns).is_empty() {
+        if !self.db.indexes_for(ns).is_empty() || self.catalog_indexes_namespace(ns)? {
             return Err(Error::DeleteRangeIndexed { ns });
         }
         let (a, b) = (scoped(ns, from), scoped(ns, to));
@@ -2028,6 +2229,16 @@ impl Db {
     /// llama reescriba esas filas él mismo (p. ej. un `put` de cada fila
     /// sobre su propio valor) después de `define_index`, antes de confiar
     /// en `scan_index`.
+    ///
+    /// **Es la única forma de habilitar la escritura sobre un `ns` que el
+    /// catálogo declara indexado**: sin esta llamada, `put` y `delete`
+    /// fallan ahí con `Error::IndexNotDeclared` en vez de dejar el índice
+    /// divergiendo (ver `Db::catalog_indexes` y `WriteTxn::refuse_undeclared`).
+    /// Las dos caras leen el MISMO catálogo, bajo `CATALOG_NS`, con el mismo
+    /// decodificador de `index.rs` (`stored_version` aquí para comparar el
+    /// registro entero, `stored_ns` allí para saber a qué espacio de claves
+    /// pertenece): la de aquí pregunta por un id concreto, la de allí
+    /// recorre el rango entero una vez por apertura.
     pub fn define_index(&self, def: IndexDef) -> Result<()> {
         if def.id >= 0x80 {
             return Err(Error::BadFormat);
@@ -2796,6 +3007,104 @@ mod tests {
         s.reset_read_count();
         let _db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), Options::default()).unwrap();
         assert!(s.read_count() <= 4, "apertura de coste constante");
+    }
+
+    /// Extractor de juguete para las dos pruebas de coste de abajo: lo único
+    /// que importa de él es que exista un índice en el catálogo.
+    fn by_value(_key: &[u8], value: &[u8]) -> Vec<Vec<u8>> {
+        alloc::vec![value.to_vec()]
+    }
+
+    fn indexed_def() -> IndexDef {
+        IndexDef { id: 1, name: "por_valor", version: 1, ns: 0x10, unique: false, extract: by_value }
+    }
+
+    /// Fija la decisión de diseño de `Db::catalog_indexes`: el catálogo se
+    /// lee en la primera ESCRITURA, nunca al abrir. Leerlo en `Db::open`
+    /// sería un descenso hasta la hoja más a la izquierda del árbol —el
+    /// catálogo es el `ns` más pequeño— y eso crece con la profundidad, es
+    /// decir con el tamaño de la base: rompería tanto esta cota como el
+    /// `assert_eq!(small, large)` de
+    /// `opening_costs_the_same_at_thirty_kilobytes_and_at_two_hundred_thousand_entries`
+    /// (`tests/size.rs`), que es el criterio de salida de la
+    /// especificación sobre coste de apertura.
+    ///
+    /// Mismo límite que `open_costs_the_same_on_a_small_and_a_large_file`,
+    /// aquí arriba, pero sobre una base CON índice y con datos de verdad:
+    /// esa otra prueba mide un fichero sin catálogo ninguno, así que no
+    /// habría notado una regresión que leyera el catálogo solo cuando lo
+    /// hay.
+    #[test]
+    fn opening_a_database_never_reads_the_catalog() {
+        let s = Arc::new(MemStorage::new());
+        {
+            let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), Options::default()).unwrap();
+            db.define_index(indexed_def()).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..200u32 {
+                tx.put(0x10, alloc::format!("pk{i:04}").as_bytes(), b"madrid").unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        s.reset_read_count();
+        let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), Options::default()).unwrap();
+        assert!(
+            s.read_count() <= 4,
+            "abrir no debe tocar el catálogo: {} lecturas",
+            s.read_count()
+        );
+        // Y un lector tampoco lo paga jamás: el catálogo solo lo consultan
+        // `put`/`delete`/`delete_range`.
+        let before = s.read_count();
+        let r = db.begin_read();
+        assert_eq!(r.get(0x10, b"pk0007").unwrap().unwrap(), b"madrid");
+        drop(r);
+        let cost_of_a_read = s.read_count() - before;
+        assert!(cost_of_a_read <= 3, "una lectura no debe pagar catálogo: {cost_of_a_read}");
+    }
+
+    /// El catálogo se lee UNA vez por apertura, no una por escritura.
+    ///
+    /// `cache_pages: 0` a propósito (ver `Pager`): con la caché por medio,
+    /// un recorrido repetido del catálogo saldría casi gratis y esta prueba
+    /// pasaría igual sin memorización ninguna — no probaría nada. Sin caché,
+    /// cada lectura cuesta una lectura física de verdad y la diferencia
+    /// entre "lo leo siempre" y "lo leí una vez" es visible.
+    ///
+    /// Las tres escrituras son sobre la MISMA clave y el mismo valor, así
+    /// que su coste de árbol es idéntico entre sí; lo único que puede
+    /// distinguir a la primera es el recorrido del catálogo.
+    #[test]
+    fn the_catalog_is_read_once_per_handle_not_once_per_write() {
+        let s = Arc::new(MemStorage::new());
+        let opts = Options { cache_pages: 0, ..Options::default() };
+        {
+            let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), opts).unwrap();
+            db.define_index(indexed_def()).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..50u32 {
+                tx.put(0x10, alloc::format!("pk{i:04}").as_bytes(), b"madrid").unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        // Reabre SIN declarar el índice y escribe en un `ns` que el catálogo
+        // no indexa: el camino que sí consulta el catálogo y sigue adelante.
+        let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        let mut cost = [0u64; 3];
+        for c in &mut cost {
+            s.reset_read_count();
+            tx.put(0x20, b"k", b"v").unwrap();
+            *c = s.read_count();
+        }
+        tx.commit().unwrap();
+
+        assert!(
+            cost[0] > cost[1],
+            "la primera escritura debe pagar el recorrido del catálogo: {cost:?}"
+        );
+        assert_eq!(cost[1], cost[2], "y ninguna posterior debe volver a pagarlo: {cost:?}");
     }
 
     #[test]

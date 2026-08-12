@@ -76,6 +76,27 @@ impl IndexDef {
     pub(crate) fn stored_version(record: &[u8]) -> Option<u32> {
         record.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
     }
+
+    /// Espacio de claves que indexa el registro, tal y como lo grabó
+    /// `encode`: cuarto campo, un solo byte tras versión (4) y unicidad (1).
+    ///
+    /// Es lo único que `tx::read_catalog_indexes` necesita de un registro
+    /// para saber sobre qué `ns` hay un índice sin poder reconstruirlo
+    /// (`extract` no está ahí y no puede estarlo). Vive aquí, junto a
+    /// `encode` y `stored_version`, y no en `tx.rs`, para que el formato del
+    /// registro siga descrito en un solo sitio — el mismo motivo por el que
+    /// `stored_version` no es un `record[..4]` suelto en `define_index`.
+    ///
+    /// `None` para cualquier registro de menos de 6 bytes. Eso NO es "no
+    /// sé": `encode` siempre emite al menos esos 6 (4 + 1 + 1, más el
+    /// nombre), así que un registro más corto no lo escribió `define_index`
+    /// y no describe ningún índice — es basura ajena en el espacio de claves
+    /// reservado al catálogo, que cualquiera puede escribir con
+    /// `tx.put(CATALOG_NS, ...)` igual que puede escribirla en el de un
+    /// índice (ver el comentario de `primary_of`, más abajo).
+    pub(crate) fn stored_ns(record: &[u8]) -> Option<u8> {
+        record.get(5).copied()
+    }
 }
 
 /// Clave de índice.
@@ -850,5 +871,235 @@ mod tests {
                 "clave {k:?} no sobrevivió a la división"
             );
         }
+    }
+
+    // --- Índices entre aperturas ----------------------------------------
+    //
+    // `Db::indexes` nace vacío en CADA apertura y solo lo puebla
+    // `define_index`, que exige un `extract` que el fichero no puede
+    // guardar. Todo lo de arriba prueba el mantenimiento del índice DENTRO
+    // de una apertura que sí lo declaró; el defecto que cierran estas
+    // pruebas solo existe A TRAVÉS de aperturas, que es exactamente donde
+    // vive el caso de uso que este motor prioriza: el podador por retención
+    // no tiene ningún motivo para declarar índices —no tiene el extractor—
+    // y es justo el proceso que borra a diario. Ver `Db::catalog_indexes`
+    // en `tx.rs`.
+
+    /// Abre y declara, cierra, reabre SIN declarar. Toda escritura sobre el
+    /// espacio de claves indexado se rechaza —`delete`, `delete_range` y
+    /// `put`—, y una tercera apertura que vuelve a declarar encuentra el
+    /// índice describiendo exactamente las filas vivas.
+    ///
+    /// Sin la corrección, ninguna de las tres escrituras falla: las dos
+    /// primeras devuelven `Ok` y borran de verdad —las entradas de índice se
+    /// quedan apuntando a filas que ya no existen— y la tercera guarda una
+    /// fila que ningún índice conoce. La divergencia no se ve en la apertura
+    /// que la provoca: aparece aquí, en la tercera, como una respuesta
+    /// EQUIVOCADA de `scan_index` en las dos direcciones a la vez.
+    #[test]
+    fn an_opener_that_did_not_declare_the_index_cannot_write_that_namespace() {
+        let s = alloc::sync::Arc::new(MemStorage::new());
+        let storage = || Box::new(ArcStorage(alloc::sync::Arc::clone(&s)));
+
+        // 1. Quien declara el índice escribe cinco filas indexadas.
+        {
+            let db = Db::create(storage(), Options::default()).unwrap();
+            db.define_index(def()).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..5u32 {
+                tx.put(0x10, alloc::format!("pk{i}").as_bytes(), b"madrid").unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        // 2. Quien NO lo declara no puede tocar ese espacio de claves.
+        {
+            let db = Db::open(storage(), Options::default()).unwrap();
+
+            let mut tx = db.begin_write().unwrap();
+            assert_eq!(
+                tx.delete(0x10, b"pk0").unwrap_err(),
+                Error::IndexNotDeclared { id: 1, ns: 0x10 },
+                "borrar sin declarar dejaría la entrada de índice huérfana"
+            );
+            drop(tx); // se descarta sin commit
+
+            let mut tx = db.begin_write().unwrap();
+            assert_eq!(
+                tx.delete_range(0x10, b"pk0", b"pk3").unwrap_err(),
+                Error::DeleteRangeIndexed { ns: 0x10 },
+                "el rechazo de la tarea 16 tiene que dispararse aunque nadie declare nada"
+            );
+            drop(tx);
+
+            let mut tx = db.begin_write().unwrap();
+            assert_eq!(
+                tx.put(0x10, b"pk9", b"lisboa").unwrap_err(),
+                Error::IndexNotDeclared { id: 1, ns: 0x10 },
+                "insertar sin declarar dejaría la fila sin indexar"
+            );
+            // Ni el dato ni el índice se tocaron ANTES de fallar: se
+            // comprueba dentro de la transacción viva, no tras
+            // descartarla, que es lo único que distingue "se validó antes
+            // de mutar" de "se mutó y el abandono lo deshizo" (mismo
+            // criterio que
+            // `updating_to_an_oversized_index_entry_leaves_the_old_entry_intact`).
+            assert_eq!(tx.get(0x10, b"pk9").unwrap(), None);
+            assert_eq!(tx.get(0x10, b"pk0").unwrap().unwrap(), b"madrid");
+            drop(tx);
+
+            // La apertura no queda inservible: se lee con normalidad y se
+            // escribe en cualquier espacio que el catálogo no indexe.
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x20, b"libre", b"si").unwrap();
+            tx.commit().unwrap();
+            let r = db.begin_read();
+            assert_eq!(r.get(0x10, b"pk0").unwrap().unwrap(), b"madrid", "las lecturas no se tocan");
+            assert_eq!(r.scan(0x10, b"", &SCAN_EVERYTHING).unwrap().next().unwrap().unwrap().0, b"pk0");
+        }
+
+        // 3. Quien vuelve a declararlo encuentra un índice exacto: ni una
+        //    entrada huérfana ni una fila sin la suya.
+        {
+            let db = Db::open(storage(), Options::default()).unwrap();
+            db.define_index(def()).unwrap();
+            let expected: Vec<Vec<u8>> =
+                (0..5u32).map(|i| alloc::format!("pk{i}").into_bytes()).collect();
+            let r = db.begin_read();
+            assert_eq!(r.scan_index(1, b"madrid", &SCAN_EVERYTHING).unwrap(), expected);
+            assert_index_consistent(&r, &def());
+            drop(r);
+
+            // Y declarado, la escritura vuelve a estar permitida y mantiene
+            // el índice: el error de la apertura 2 es accionable, no un
+            // ladrillo.
+            let mut tx = db.begin_write().unwrap();
+            assert!(tx.delete(0x10, b"pk0").unwrap());
+            tx.commit().unwrap();
+            let r = db.begin_read();
+            assert_eq!(r.scan_index(1, b"madrid", &SCAN_EVERYTHING).unwrap(), expected[1..]);
+            assert_index_consistent(&r, &def());
+        }
+    }
+
+    /// La dirección contraria del defecto, aislada: una fila insertada por
+    /// una apertura que no declaró el índice no puede quedarse sin entrada.
+    /// Sin la corrección, `put` devuelve `Ok`, la fila se guarda y
+    /// `scan_index` no la encuentra nunca — el índice miente por omisión, y
+    /// nada en la base delata que falta.
+    #[test]
+    fn a_row_written_without_declaring_the_index_never_lands_unindexed() {
+        let s = alloc::sync::Arc::new(MemStorage::new());
+        let storage = || Box::new(ArcStorage(alloc::sync::Arc::clone(&s)));
+
+        {
+            let db = Db::create(storage(), Options::default()).unwrap();
+            db.define_index(def()).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x10, b"pk1", b"madrid").unwrap();
+            tx.commit().unwrap();
+        }
+
+        {
+            let db = Db::open(storage(), Options::default()).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            assert_eq!(
+                tx.put(0x10, b"pk2", b"madrid").unwrap_err(),
+                Error::IndexNotDeclared { id: 1, ns: 0x10 }
+            );
+            drop(tx);
+        }
+
+        {
+            let db = Db::open(storage(), Options::default()).unwrap();
+            db.define_index(def()).unwrap();
+            let r = db.begin_read();
+            assert_eq!(r.get(0x10, b"pk2").unwrap(), None, "la fila rechazada no debe existir");
+            assert_eq!(
+                r.scan_index(1, b"madrid", &SCAN_EVERYTHING).unwrap(),
+                alloc::vec![b"pk1".to_vec()]
+            );
+            assert_index_consistent(&r, &def());
+        }
+    }
+
+    /// El rechazo es por índice, no por espacio de claves: declarar UNO de
+    /// los dos índices que el catálogo tiene sobre el mismo `ns` deja al
+    /// otro divergiendo, y esta vez con la lista de definiciones NO vacía —
+    /// el caso intermedio que una comprobación de "¿hay algún índice
+    /// declarado sobre este ns?" dejaría escapar sin ninguna sospecha.
+    #[test]
+    fn declaring_only_one_of_two_indexes_on_a_namespace_is_refused() {
+        fn first_byte(_key: &[u8], value: &[u8]) -> Vec<Vec<u8>> {
+            alloc::vec![alloc::vec![value.first().copied().unwrap_or(0)]]
+        }
+        let second =
+            IndexDef { id: 5, name: "inicial", version: 1, ns: 0x10, unique: false, extract: first_byte };
+
+        let s = alloc::sync::Arc::new(MemStorage::new());
+        let storage = || Box::new(ArcStorage(alloc::sync::Arc::clone(&s)));
+        {
+            let db = Db::create(storage(), Options::default()).unwrap();
+            db.define_index(def()).unwrap();
+            db.define_index(second).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x10, b"pk1", b"madrid").unwrap();
+            tx.commit().unwrap();
+        }
+
+        let db = Db::open(storage(), Options::default()).unwrap();
+        db.define_index(def()).unwrap(); // solo el primero
+        let mut tx = db.begin_write().unwrap();
+        assert_eq!(
+            tx.put(0x10, b"pk2", b"madrid").unwrap_err(),
+            Error::IndexNotDeclared { id: 5, ns: 0x10 }
+        );
+        drop(tx);
+
+        // Declarados los dos, la escritura pasa y los dos índices la ven.
+        db.define_index(second).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        tx.put(0x10, b"pk2", b"madrid").unwrap();
+        tx.commit().unwrap();
+        let r = db.begin_read();
+        assert_eq!(
+            r.scan_index(1, b"madrid", &SCAN_EVERYTHING).unwrap(),
+            alloc::vec![b"pk1".to_vec(), b"pk2".to_vec()]
+        );
+        assert_index_consistent(&r, &def());
+        assert_index_consistent(&r, &second);
+    }
+
+    /// El rechazo es por `ns`, no global: una apertura que no declara nada
+    /// sigue escribiendo con normalidad —`put`, `delete` y `delete_range`—
+    /// en cualquier espacio de claves que el catálogo no indexe. Una base
+    /// sin ningún índice no paga nada de esto: el catálogo está vacío y no
+    /// hay ningún id que comprobar.
+    #[test]
+    fn a_namespace_the_catalog_does_not_index_still_writes_after_an_undeclared_reopen() {
+        let s = alloc::sync::Arc::new(MemStorage::new());
+        let storage = || Box::new(ArcStorage(alloc::sync::Arc::clone(&s)));
+        {
+            let db = Db::create(storage(), Options::default()).unwrap();
+            db.define_index(def()).unwrap(); // sobre 0x10, no sobre 0x20
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x10, b"pk1", b"madrid").unwrap();
+            tx.commit().unwrap();
+        }
+
+        let db = Db::open(storage(), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..5u32 {
+            tx.put(0x20, alloc::format!("{i:03}").as_bytes(), b"x").unwrap();
+        }
+        assert!(tx.delete(0x20, b"004").unwrap());
+        tx.delete_range(0x20, b"000", b"002").unwrap();
+        tx.commit().unwrap();
+
+        let r = db.begin_read();
+        assert_eq!(r.get(0x20, b"000").unwrap(), None);
+        assert_eq!(r.get(0x20, b"002").unwrap().unwrap(), b"x");
+        assert_eq!(r.get(0x20, b"004").unwrap(), None);
+        assert_eq!(r.get(0x10, b"pk1").unwrap().unwrap(), b"madrid");
     }
 }
