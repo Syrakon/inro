@@ -37,17 +37,30 @@ impl PageType {
     }
 }
 
+/// Todo lo que `PageRef::parse` DERIVA de la cabecera de una página después
+/// de comprobarla: los campos que los accesores usan sin volver a validar.
+/// Separado de los bytes a propósito, y es lo único que hace posible
+/// recordar "estos bytes ya pasaron por `parse`" sin quedarse con un
+/// préstamo de ellos — ver `ValidPage`, más abajo.
+///
+/// `Copy` y unas pocas decenas de bytes: copiarlo cuesta menos que releer
+/// la cabecera, y muchísimo menos que revalidarla.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    page_type: PageType,
+    flags: u8,
+    n_slots: usize,
+    prefix_len: usize,
+    slots_at: usize,
+}
+
 /// Vista de solo lectura sobre los bytes de una página ya validada.
 /// `parse` comprueba el CRC y toda la estructura una vez; a partir de ahí los
 /// accesores no vuelven a validar y no pueden salirse de la página.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageRef<'a> {
     bytes: &'a [u8],
-    page_type: PageType,
-    flags: u8,
-    n_slots: usize,
-    prefix_len: usize,
-    slots_at: usize,
+    layout: Layout,
 }
 
 /// Bit de `flags` (byte 1 de la cabecera) que, solo en páginas internas,
@@ -137,7 +150,8 @@ impl<'a> PageRef<'a> {
             return Err(corrupt(CorruptKind::CellBounds));
         }
 
-        let page = Self { bytes, page_type, flags, n_slots, prefix_len, slots_at };
+        let page =
+            Self { bytes, layout: Layout { page_type, flags, n_slots, prefix_len, slots_at } };
 
         // Cada slot debe apuntar dentro del área de celdas, cada celda debe
         // decodificarse entera dentro de la página, los sufijos deben quedar
@@ -182,7 +196,7 @@ impl<'a> PageRef<'a> {
     }
 
     fn slot(&self, i: usize) -> usize {
-        let at = self.slots_at + 2 * i;
+        let at = self.layout.slots_at + 2 * i;
         u16::from_le_bytes(self.bytes[at..at + 2].try_into().unwrap()) as usize
     }
 
@@ -193,7 +207,7 @@ impl<'a> PageRef<'a> {
         let b = self.bytes.get(off..)?;
         let (suffix_len, n1) = varint::read(b)?;
         let after_suffix = off.checked_add(n1)?.checked_add(suffix_len as usize)?;
-        match self.page_type {
+        match self.layout.page_type {
             PageType::Leaf => {
                 let b = self.bytes.get(after_suffix..)?;
                 let (value_len, n2) = varint::read(b)?;
@@ -216,7 +230,7 @@ impl<'a> PageRef<'a> {
     }
 
     pub fn page_type(&self) -> PageType {
-        self.page_type
+        self.layout.page_type
     }
 
     /// Solo tiene sentido en páginas internas (`PageType::Internal`): `true`
@@ -230,15 +244,15 @@ impl<'a> PageRef<'a> {
     /// hay garantía, compruébalo". En páginas hoja el bit está siempre a
     /// cero (`PageBuilder` nunca lo pone en una hoja) y no significa nada.
     pub fn children_plain(&self) -> bool {
-        self.flags & CHILDREN_PLAIN_FLAG != 0
+        self.layout.flags & CHILDREN_PLAIN_FLAG != 0
     }
 
     pub fn n_slots(&self) -> usize {
-        self.n_slots
+        self.layout.n_slots
     }
 
     pub fn prefix(&self) -> &'a [u8] {
-        &self.bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + self.prefix_len]
+        &self.bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + self.layout.prefix_len]
     }
 
     /// En nodos internos, el hijo más a la derecha. En páginas de overflow,
@@ -269,7 +283,7 @@ impl<'a> PageRef<'a> {
     /// buscada. Comparar sufijos equivale a comparar claves completas porque
     /// todas comparten exactamente el mismo prefijo.
     pub fn search(&self, suffix: &[u8]) -> core::result::Result<usize, usize> {
-        let (mut lo, mut hi) = (0usize, self.n_slots);
+        let (mut lo, mut hi) = (0usize, self.layout.n_slots);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             match self.suffix(mid).cmp(suffix) {
@@ -336,6 +350,77 @@ impl<'a> PageRef<'a> {
         k.extend_from_slice(self.prefix());
         k.extend_from_slice(self.suffix(i));
         k
+    }
+
+    /// Reconstruye la vista sobre bytes que YA pasaron por `parse`, sin
+    /// volver a validar nada.
+    ///
+    /// **Privada al módulo, no `pub(crate)`, y esa privacidad es la mitad
+    /// del argumento de corrección.** La precondición —`layout` tiene que
+    /// haber salido de un `parse` sobre exactamente ESTOS bytes— no la puede
+    /// comprobar la función; quien la rompa produce un `PageRef` cuyos
+    /// accesores creen estar dentro de la página y no lo están, y los
+    /// `.expect("validado en parse")` de arriba pasan de ser triviales a ser
+    /// pánicos en producción. Al no ser alcanzable fuera de este fichero, el
+    /// único llamante posible es `ValidPage::page` (más abajo), que mantiene
+    /// las dos mitades JUNTAS en una estructura y por tanto no puede
+    /// desparejarlas.
+    #[cfg(feature = "std")]
+    fn from_validated(bytes: &'a [u8], layout: Layout) -> Self {
+        Self { bytes, layout }
+    }
+}
+
+/// Una página validada que se lleva sus bytes consigo: el resultado de
+/// `parse` en una forma que se puede GUARDAR, devolver de una función o
+/// meter en una caché, cosa que `PageRef` —que solo presta— no puede.
+///
+/// **Por qué esto no debilita la validación.** `PageRef::parse` sigue siendo
+/// el único sitio donde se comprueba un CRC o un slot: `ValidPage::parse` lo
+/// llama y se queda con el `Layout` que produjo. Lo que hace que el par
+/// (bytes, layout) no pueda desparejarse nunca es que los bytes viven detrás
+/// de un `Arc<[u8]>`, que es **inmutable por construcción**: el crate no usa
+/// `Arc::get_mut` ni `Arc::make_mut` en ninguna parte, así que un búfer que
+/// entra en un `Arc` no vuelve a cambiar mientras alguien lo sostenga. Un
+/// `ValidPage` vivo es, entonces, la afirmación "estos bytes concretos
+/// pasaron `parse`", y esa afirmación no caduca: no hay forma de que los
+/// bytes muten por debajo de quien lo sostiene.
+///
+/// Lo que SÍ puede pasar —y ya pasaba antes de este tipo, palabra por
+/// palabra— es que el fichero cambie bajo ese número de página mientras
+/// alguien sostiene la versión vieja. Sostener `Arc<[u8]>` tenía exactamente
+/// la misma propiedad. Que nadie lea una página que el escritor va a
+/// reescribir no lo garantiza esta capa, sino la de transacciones (lista de
+/// libres más tabla de lectores); ver la documentación de `Pager::write`.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub struct ValidPage {
+    bytes: alloc::sync::Arc<[u8]>,
+    layout: Layout,
+}
+
+#[cfg(feature = "std")]
+impl ValidPage {
+    /// Valida `bytes` como la página número `page_no` y se queda con el
+    /// resultado. Mismos errores, mismas comprobaciones y mismo coste que
+    /// `PageRef::parse`: es una llamada a `PageRef::parse`.
+    pub fn parse(bytes: alloc::sync::Arc<[u8]>, page_no: PageNo) -> Result<Self> {
+        let layout = PageRef::parse(&bytes, page_no)?.layout;
+        Ok(Self { bytes, layout })
+    }
+
+    /// Vista prestada de la página, sin revalidar. Barata: dos punteros y
+    /// una copia del `Layout`.
+    pub fn page(&self) -> PageRef<'_> {
+        PageRef::from_validated(&self.bytes, self.layout)
+    }
+
+    /// Bytes crudos de la página ya validada, para los pocos sitios que leen
+    /// campos que no forman parte del modelo de `PageRef` — el hueco propio
+    /// del formato de la lista de libres (`freelist::decode_freelist_page`)
+    /// es el único hoy.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 

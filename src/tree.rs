@@ -1,6 +1,8 @@
 use alloc::vec::Vec;
 
-use crate::page::{CellPayload, LeafValue, PageBuilder, PageRef, PageType, PAGE_HEADER_SIZE};
+use crate::page::{
+    CellPayload, LeafValue, PageBuilder, PageRef, PageType, ValidPage, PAGE_HEADER_SIZE,
+};
 use crate::tx::{PageSource, WriteTxn};
 use crate::{CorruptKind, Error, PageNo, Result};
 
@@ -94,13 +96,40 @@ fn child_at(page: &PageRef<'_>, i: usize) -> PageNo {
 /// necesita exactamente la misma cota, no una propia (ver su comentario).
 pub(crate) const MAX_DEPTH: u32 = 128;
 
+/// Lo que `descend` encontró: la hoja donde vive o viviría la clave, YA
+/// VALIDADA, y el camino de nodos internos recorrido desde la raíz.
+///
+/// **`page` existe para que `get` no vuelva a parsear la hoja.** Antes,
+/// `descend` devolvía solo el número de página y `get` hacía otro
+/// `read_page` + `PageRef::parse` sobre la MISMA hoja que `descend` acababa
+/// de leer y validar: medido, cuatro `parse` por búsqueda a profundidad 3
+/// cuando tres bastan, o sea un CRC de página entera y una pasada completa
+/// de validación de slots tirados a la basura en cada lectura. La segunda
+/// lectura era un acierto de caché, pero el CRC no se amortizaba (ver
+/// `pager::Pager`), así que "acierto de caché" no significaba "barato".
+///
+/// No se devuelve un `PageRef` porque presta de los bytes, que son locales
+/// al bucle de `descend`; `ValidPage` los lleva consigo — ver su
+/// documentación en `page.rs` para por qué eso no debilita ninguna
+/// comprobación.
+/// `leaf` y `path` no los lee ningún camino de producción —`get`, el único
+/// llamante de `descend` fuera de pruebas, solo necesita `page`— pero sí las
+/// pruebas de forma del árbol (`descend_reports_the_path_from_root_to_leaf`,
+/// las que comprueban profundidad tras insertar, y las de aislamiento entre
+/// espacios de claves), que son justo las que verifican que el descenso
+/// llega donde debe. Marcado explícitamente, como `catalog_root` en `tx.rs`,
+/// en vez de dejar el aviso de código muerto sin explicar.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct Descent {
+    pub leaf: PageNo,
+    pub page: ValidPage,
+    pub path: Vec<PageNo>,
+}
+
 /// Localiza la hoja donde vive o viviría `key`, y el camino de nodos internos
 /// recorrido desde la raíz. `None` si el árbol está vacío.
-pub fn descend(
-    src: &impl PageSource,
-    root: PageNo,
-    key: &[u8],
-) -> Result<Option<(PageNo, Vec<PageNo>)>> {
+pub fn descend(src: &impl PageSource, root: PageNo, key: &[u8]) -> Result<Option<Descent>> {
     if root == 0 {
         return Ok(None);
     }
@@ -115,19 +144,28 @@ pub fn descend(
                 kind: crate::CorruptKind::TreeLoop,
             });
         }
-        let bytes = src.read_page(current)?;
-        let page = PageRef::parse(&bytes, current)?;
-        match page.page_type() {
-            PageType::Leaf => return Ok(Some((current, path))),
-            PageType::Internal => {
-                path.push(current);
-                current = child_at(&page, child_index(&page, key));
+        let valid = ValidPage::parse(src.read_page(current)?, current)?;
+        // El `PageRef` se suelta antes de decidir qué hacer: si esta página
+        // es la hoja, `valid` sale de la función, y no puede salir mientras
+        // haya un préstamo suyo vivo.
+        let next = {
+            let page = valid.page();
+            match page.page_type() {
+                PageType::Leaf => None,
+                PageType::Internal => Some(child_at(&page, child_index(&page, key))),
+                _ => {
+                    return Err(crate::Error::Corrupt {
+                        page: current,
+                        kind: crate::CorruptKind::PageType,
+                    })
+                }
             }
-            _ => {
-                return Err(crate::Error::Corrupt {
-                    page: current,
-                    kind: crate::CorruptKind::PageType,
-                })
+        };
+        match next {
+            None => return Ok(Some(Descent { leaf: current, page: valid, path })),
+            Some(child) => {
+                path.push(current);
+                current = child;
             }
         }
     }
@@ -427,11 +465,12 @@ impl<'a> From<LeafValue<'a>> for LeafPayload {
 
 /// Valor asociado a `key`, o `None` si no existe.
 pub fn get(src: &impl PageSource, root: PageNo, key: &[u8]) -> Result<Option<Vec<u8>>> {
-    let Some((leaf, _)) = descend(src, root, key)? else {
+    let Some(found) = descend(src, root, key)? else {
         return Ok(None);
     };
-    let bytes = src.read_page(leaf)?;
-    let page = PageRef::parse(&bytes, leaf)?;
+    // La hoja que `descend` ya leyó y validó, no otra lectura y otro
+    // `parse` de la misma página: ver `Descent`.
+    let page = found.page.page();
     match search_key(&page, key) {
         Ok(i) => Ok(Some(match page.leaf_value(i) {
             LeafValue::Inline(v) => v.to_vec(),
@@ -2322,7 +2361,8 @@ mod tests {
         let db = db();
         let root = tree_with_two_leaves(&db);
         let r = db.begin_read();
-        let (leaf, path) = descend(&r, root, b"zz").unwrap().unwrap();
+        let d = descend(&r, root, b"zz").unwrap().unwrap();
+        let (leaf, path) = (d.leaf, d.path);
         assert_eq!(path, alloc::vec![root]);
         assert_ne!(leaf, root);
     }
@@ -2426,7 +2466,8 @@ mod tests {
         assert_eq!(get(&r, r.root(), b"mm").unwrap().as_deref(), Some(b"5".as_slice()));
         assert_eq!(get(&r, r.root(), b"zz").unwrap().as_deref(), Some(b"8".as_slice()));
 
-        let (leaf, path) = descend(&r, r.root(), b"zz").unwrap().unwrap();
+        let d = descend(&r, r.root(), b"zz").unwrap().unwrap();
+        let (leaf, path) = (d.leaf, d.path);
         assert_eq!(leaf, leaf_d);
         assert_eq!(path, alloc::vec![root, mid_right]);
     }
@@ -2640,7 +2681,7 @@ mod put_tests {
         for i in (0..n).step_by(37) {
             let mut key = alloc::format!("{i:07}").into_bytes();
             key.resize(127, b'k');
-            let (_, path) = descend(&tx, root, &key).unwrap().unwrap();
+            let path = descend(&tx, root, &key).unwrap().unwrap().path;
             max_depth = max_depth.max(path.len() + 1); // +1: la propia hoja
         }
         assert!(
@@ -3904,7 +3945,7 @@ mod delete_invariant_tests {
                 if sampled % (live.len() / 200).max(1) != 0 {
                     continue;
                 }
-                let (_, path) = descend(tx, root, &key_for(i)).unwrap().unwrap();
+                let path = descend(tx, root, &key_for(i)).unwrap().unwrap().path;
                 max_depth = max_depth.max(path.len() + 1);
             }
             max_depth
@@ -4334,8 +4375,8 @@ mod cursor_tests {
                     k.extend_from_slice(&keys[i + 1]);
                     k
                 };
-                let (leaf_a, _) = descend(&r, r.root(), &scoped_a).unwrap().unwrap();
-                let (leaf_b, _) = descend(&r, r.root(), &scoped_b).unwrap().unwrap();
+                let leaf_a = descend(&r, r.root(), &scoped_a).unwrap().unwrap().leaf;
+                let leaf_b = descend(&r, r.root(), &scoped_b).unwrap().unwrap().leaf;
                 leaf_a != leaf_b
             })
             .expect("con 1000 claves en páginas de 512 bytes debe haber al menos un límite de hoja");
