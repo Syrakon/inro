@@ -139,14 +139,43 @@ impl<'a> PageRef<'a> {
 
         let page = Self { bytes, page_type, flags, n_slots, prefix_len, slots_at };
 
-        // Cada slot debe apuntar dentro del área de celdas, y cada celda debe
-        // decodificarse entera dentro de la página.
+        // Cada slot debe apuntar dentro del área de celdas, cada celda debe
+        // decodificarse entera dentro de la página, los sufijos deben quedar
+        // en orden ASCENDENTE ESTRICTO de clave (claves iguales en una misma
+        // página también son inválidas) y las celdas no deben solaparse.
+        //
+        // Dirección del solape: `PageBuilder::build` (más abajo) hace crecer
+        // las celdas desde el FINAL de la página hacia el hueco libre —
+        // `cursor` arranca en `page_size` y decrece con cada entrada. La
+        // entrada 0 (la clave más pequeña, porque `build` exige entradas ya
+        // ordenadas) es la PRIMERA en reservar hueco, así que se queda pegada
+        // al final de la página; cada entrada siguiente, con clave mayor,
+        // ocupa el hueco justo ANTES de la anterior, a un offset MENOR. En
+        // una página válida, entonces, `slot(i)` es estrictamente MENOR que
+        // `slot(i-1)`: los offsets bajan según sube la clave. Dos celdas
+        // vecinas no se solapan si la celda `i` (offset menor, crece hacia
+        // arriba) termina antes de donde empieza la celda `i-1` (offset
+        // mayor): `cell_end(slot(i)) <= slot(i-1)`. Comprobado contra
+        // `parses_a_well_formed_page` y `built_leaf_page_reads_back_identical`
+        // más abajo, donde la igualdad se da exactamente (celdas contiguas,
+        // sin hueco) — de ahí el `<=`, no `<`.
+        let mut prev: Option<(usize, &[u8])> = None;
         for i in 0..n_slots {
             let off = page.slot(i);
             if off < cell_start || off >= bytes.len() {
                 return Err(corrupt(CorruptKind::SlotOffset));
             }
-            page.cell_end(off).ok_or_else(|| corrupt(CorruptKind::CellBounds))?;
+            let end = page.cell_end(off).ok_or_else(|| corrupt(CorruptKind::CellBounds))?;
+            let suffix = page.suffix(i);
+            if let Some((prev_off, prev_suffix)) = prev {
+                if prev_suffix >= suffix {
+                    return Err(corrupt(CorruptKind::SlotOffset));
+                }
+                if end > prev_off {
+                    return Err(corrupt(CorruptKind::CellBounds));
+                }
+            }
+            prev = Some((off, suffix));
         }
 
         Ok(page)

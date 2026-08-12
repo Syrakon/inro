@@ -5700,3 +5700,175 @@ mod range_accounting_tests {
         }
     }
 }
+
+/// Regresión del hallazgo "celdas desordenadas"
+/// (`.superpowers/sdd/2026-08-10-inro-fase-1-nucleo/
+/// HALLAZGO-celdas-desordenadas.probe.diff`, evolución del minor diferido de
+/// la tarea 5 sobre celdas solapadas). `PageRef::parse` validaba el CRC, que
+/// cada slot cayera dentro del área de celdas y que cada celda decodificara
+/// entera dentro de la página, pero NO que el directorio de slots estuviera
+/// en orden ascendente de clave ni que las celdas no se solaparan. Una
+/// página con los slots permutados —y el CRC recalculado, que un atacante o
+/// una corrupción con suerte pueden producir— pasaba `parse` sin protestar:
+/// `get` devolvía `Ok(None)` para una clave presente (el binary search de
+/// `PageRef::search` no la encontraba, silenciosamente equivocado) y `put`
+/// entraba en pánico desde la API pública —en debug por el `debug_assert!`
+/// de precondición de `PageBuilder::build`, en release por un slice fuera
+/// de rango en `common_prefix`/`build` que ese `debug_assert!` no cubre—
+/// justo la clase de fallo que el motor descarta desde la tarea 5: entrada
+/// corrupta siempre `Err(Corrupt)`, nunca una respuesta equivocada ni un
+/// pánico. Las pruebas de este módulo reproducen los dos casos desde la API
+/// pública (`get`/`put`), no llamando a `parse` directamente, para probar
+/// el contrato de punta a punta.
+#[cfg(all(test, feature = "std"))]
+mod parse_order_and_overlap_tests {
+    use super::*;
+    use crate::storage::MemStorage;
+    use crate::tx::{Db, Options};
+
+    fn db() -> Db {
+        Db::create(Box::new(MemStorage::new()), Options::default()).unwrap()
+    }
+
+    /// Escribe `raw` como raíz de un árbol nuevo y confirma la transacción,
+    /// para que las pruebas lean/escriban después a través de la API
+    /// pública de `Db`/`WriteTxn`, no de `parse` directamente. `commit` no
+    /// valida la estructura del árbol (solo mueve páginas y escribe la
+    /// meta — ver su comentario en `tx.rs`), así que acepta `raw` corrupto
+    /// sin protestar: la corrupción solo debe salir a la luz cuando algo
+    /// intente LEER esa página de verdad.
+    fn commit_as_root(db: &Db, raw: &[u8]) {
+        let mut tx = db.begin_write().unwrap();
+        let root = tx.alloc().unwrap();
+        tx.write_page(root, raw).unwrap();
+        tx.set_root(root);
+        tx.commit().unwrap();
+    }
+
+    fn fix_crc(b: &mut [u8]) {
+        let mut h = crate::crc32::Hasher::new();
+        h.update(&b[..8]);
+        h.update(&b[12..]);
+        b[8..12].copy_from_slice(&h.finish().to_le_bytes());
+    }
+
+    /// Página hoja de tres entradas con claves "a", "abcd", "abce" DENTRO
+    /// del espacio de nombres `0x00` -- `crate::tx::scoped` antepone el
+    /// byte de `ns` antes de que la clave llegue al árbol (única
+    /// transformación entre lo que ve `Db::get`/`WriteTxn::put` y lo que
+    /// vive en la página), así que construir la página con claves SIN ese
+    /// byte haría que `search_key` la descartase por prefijo antes incluso
+    /// de tocar `PageRef::search` -- el binary search corrupto nunca se
+    /// ejercitaría, y la prueba "detectaría" el defecto por la razón
+    /// equivocada. Slots 0 y 1 permutados a mano y CRC recalculado: bytes
+    /// que ningún `PageBuilder::build` legítimo produce nunca, pero que
+    /// `parse`, antes de esta corrección, aceptaba igual.
+    fn permuted_slots_leaf_page() -> Vec<u8> {
+        let k_a = crate::tx::scoped(0x00, b"a");
+        let k_abcd = crate::tx::scoped(0x00, b"abcd");
+        let k_abce = crate::tx::scoped(0x00, b"abce");
+        let mut raw = PageBuilder::new(512, PageType::Leaf)
+            .build(&[
+                (k_a.as_slice(), CellPayload::Value(b"1")),
+                (k_abcd.as_slice(), CellPayload::Value(b"2")),
+                (k_abce.as_slice(), CellPayload::Value(b"3")),
+            ])
+            .unwrap();
+
+        let prefix_len = u16::from_le_bytes(raw[16..18].try_into().unwrap()) as usize;
+        let slots_at = PAGE_HEADER_SIZE + prefix_len;
+        raw.swap(slots_at, slots_at + 2);
+        raw.swap(slots_at + 1, slots_at + 3);
+        fix_crc(&mut raw);
+        raw
+    }
+
+    #[test]
+    fn get_on_a_page_with_permuted_slots_returns_corrupt_not_a_wrong_answer() {
+        let db = db();
+        commit_as_root(&db, &permuted_slots_leaf_page());
+
+        let result = db.begin_read().get(0x00, b"abcd");
+        assert!(
+            matches!(result, Err(Error::Corrupt { kind: CorruptKind::SlotOffset, .. })),
+            "clave presente en una pagina con slots permutados: se esperaba \
+             Err(Corrupt{{kind: SlotOffset}}), se obtuvo {result:?} -- Ok(None) \
+             seria una respuesta equivocada silenciosa, no una corrupcion detectada"
+        );
+    }
+
+    /// Igual que la prueba anterior, pero contra `put`: antes de esta
+    /// corrección entraba en pánico desde la API pública (debug y release
+    /// por caminos distintos, ver el comentario del módulo) en vez de
+    /// devolver `Err`. Esta prueba corre igual bajo `cargo test` (debug,
+    /// `debug_assertions` activas) y bajo `cargo test --release`
+    /// (`debug_assertions` desactivadas): el pánico de release, en
+    /// `common_prefix`/`build`, NO está condicionado por `debug_assertions`
+    /// -- es un slice fuera de rango corriente -- así que una prueba que
+    /// solo se ejecutase en modo debug no lo habría detectado nunca; ver el
+    /// informe de esta tarea para la confirmación manual con
+    /// `cargo test --release`.
+    #[test]
+    fn put_on_a_page_with_permuted_slots_returns_corrupt_instead_of_panicking() {
+        let db = db();
+        commit_as_root(&db, &permuted_slots_leaf_page());
+
+        let mut tx = db.begin_write().unwrap();
+        let result = tx.put(0x00, b"abcf", b"x");
+        assert!(
+            matches!(result, Err(Error::Corrupt { kind: CorruptKind::SlotOffset, .. })),
+            "put contra una hoja con slots permutados debe devolver \
+             Err(Corrupt{{kind: SlotOffset}}) en vez de entrar en panico; se \
+             obtuvo {result:?}"
+        );
+    }
+
+    /// Página hoja de dos entradas, construida a mano (no con
+    /// `PageBuilder`, que nunca produciría celdas solapadas): los slots
+    /// están en orden ascendente correcto ("a" < "bb", así que la
+    /// comprobación de orden no dispara) pero las dos celdas comparten
+    /// bytes -- la celda de "bb" (slot 1, offset 505, 5 bytes) llega hasta
+    /// el byte 510, dos bytes DENTRO del rango [508, 512) de la celda de
+    /// "a" (slot 0, offset 508, 4 bytes). Aísla la comprobación de solape
+    /// de la de orden: si solo existiera la de orden, esta página pasaría
+    /// `parse` igual que antes de esta corrección.
+    fn overlapping_cells_leaf_page() -> Vec<u8> {
+        let mut b = alloc::vec![0u8; 512];
+        b[0] = PageType::Leaf as u8;
+        b[2..4].copy_from_slice(&2u16.to_le_bytes()); // n_slots
+        b[4..6].copy_from_slice(&(PAGE_HEADER_SIZE as u16 + 4).to_le_bytes()); // free_start
+        b[6..8].copy_from_slice(&505u16.to_le_bytes()); // cell_start
+
+        b[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 2].copy_from_slice(&508u16.to_le_bytes());
+        b[PAGE_HEADER_SIZE + 2..PAGE_HEADER_SIZE + 4].copy_from_slice(&505u16.to_le_bytes());
+
+        // Bytes [505..512), compartidos en [508, 510): la celda de "bb"
+        // (offset 505: len_sufijo=2, "bb", len_valor=1, valor) y la celda
+        // de "a" (offset 508: len_sufijo=1, "a", len_valor=1, valor) leen
+        // los mismos dos bytes centrales con significados distintos --
+        // exactamente lo que "solapar" significa a nivel de bytes.
+        b[505] = 0x02; // "bb": len_sufijo
+        b[506] = b'b';
+        b[507] = b'b';
+        b[508] = 0x01; // "bb": len_valor -- y también "a": len_sufijo
+        b[509] = b'a'; // "bb": valor -- y también "a": sufijo
+        b[510] = 0x01; // "a": len_valor
+        b[511] = b'1'; // "a": valor
+
+        fix_crc(&mut b);
+        b
+    }
+
+    #[test]
+    fn get_on_a_page_with_overlapping_cells_returns_corrupt() {
+        let db = db();
+        commit_as_root(&db, &overlapping_cells_leaf_page());
+
+        let result = db.begin_read().get(0x00, b"a");
+        assert!(
+            matches!(result, Err(Error::Corrupt { kind: CorruptKind::CellBounds, .. })),
+            "se esperaba Err(Corrupt{{kind: CellBounds}}) sobre una pagina con \
+             celdas solapadas, se obtuvo {result:?}"
+        );
+    }
+}
