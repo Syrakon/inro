@@ -89,7 +89,10 @@ fn child_at(page: &PageRef<'_>, i: usize) -> PageNo {
 /// hijo que no ramifica y que degenera aún más rápido de lo que ya degenera
 /// el colapso sin fusión. Si algún día se toca ese límite, o se añade fusión,
 /// hay que revisar este comentario entero, no solo el número.
-const MAX_DEPTH: u32 = 128;
+/// `pub(crate)`: además de las siete funciones de este módulo que descienden
+/// el árbol, la usa `tx::audit_walk_tree` — que recurre igual que ellas y
+/// necesita exactamente la misma cota, no una propia (ver su comentario).
+pub(crate) const MAX_DEPTH: u32 = 128;
 
 /// Localiza la hoja donde vive o viviría `key`, y el camino de nodos internos
 /// recorrido desde la raíz. `None` si el árbol está vacío.
@@ -223,9 +226,37 @@ pub fn write_overflow(tx: &mut WriteTxn, value: &[u8]) -> Result<(u64, PageNo)> 
 /// la tarea 5 (entrada corrupta se reporta como `Err`, nunca como una
 /// respuesta incorrecta silenciosa).
 ///
-/// La cota de saltos se conserva de todos modos, no como mecanismo de
-/// corrección (ya no lo es, ver arriba) sino como cota EXPLÍCITA de
-/// recorrido: con páginas de tamaño uniforme —cierto para cualquier `Pager`
+/// **La cota derivada de `len`, SOLA, no acota nada: `len` lo escribe quien
+/// manipula el fichero.** `len` son los 8 bytes de una celda de overflow
+/// (`LeafValue::Overflow`), y `PageRef::parse` no los mira — `cell_end`
+/// calcula el final de una celda de overflow como `body + 12` sea cual sea
+/// su contenido — así que una hoja con `len = u64::MAX` y su CRC
+/// recalculado pasa `parse` sin una queja. Con `len` de 64 MiB declarados,
+/// un `get` de una sola clave hacía 136 403 lecturas sobre un fichero de
+/// SEIS páginas (628 ms); con `u64::MAX`, `out` crecía hasta agotar la
+/// memoria y el proceso moría con SIGABRT — no un pánico recuperable: un
+/// abort, desde `Db::get`, el camino de solo lectura. El comentario que
+/// descartaba `with_capacity(len as usize)` («`len` puede ser
+/// arbitrariamente grande») razonaba bien y se quedaba a medias: crecer con
+/// `extend_from_slice` llega al mismo sitio, solo que más despacio y
+/// habiendo hecho 10^16 lecturas por el camino.
+///
+/// Por eso el techo de saltos es el MÍNIMO entre lo que `len` implica y
+/// `src.max_pages()` — las páginas que el fichero tiene de verdad, según la
+/// meta ya contrastada contra su longitud al abrir (ver
+/// `Db::check_meta_against_file` y `PageSource::max_pages`). Es la misma
+/// cota, y el mismo argumento, que ya usan `freelist::fill_from_disk`
+/// («una cadena bien formada visita cada página física a lo sumo una vez,
+/// así que no puede necesitar más saltos que páginas tiene el fichero») y
+/// `tree::RangeBudget`. Con ella, el trabajo Y la memoria de esta función
+/// quedan acotados por el tamaño real del fichero, no por un número que
+/// escribe el atacante: `out` no puede pasar de `max_pages · capacidad`.
+/// No cuesta ni una lectura de más — `max_pages` sale de la meta, que está
+/// en memoria.
+///
+/// La cota derivada de `len` se conserva de todos modos, no como mecanismo
+/// de corrección (ya no lo es, ver arriba) sino como cota EXPLÍCITA y más
+/// ajustada del recorrido normal: con páginas de tamaño uniforme —cierto para cualquier `Pager`
 /// real de este crate, que fija un único `page_size` por fichero— el propio
 /// `while current != 0 && out.len() < len` ya termina en, como mucho,
 /// `ceil(len/capacidad)` vueltas, cicle o no. Pero `read_overflow` recibe
@@ -250,6 +281,9 @@ pub fn read_overflow(src: &impl PageSource, len: u64, first: PageNo) -> Result<V
     let mut current = first;
     let mut hops: u64 = 0;
     let mut max_hops: Option<u64> = None;
+    // El techo que NO depende de `len`: las páginas que el fichero tiene.
+    // Ver el comentario de la función.
+    let in_file = u64::from(src.max_pages()).max(1);
     while current != 0 && (out.len() as u64) < len {
         let bytes = src.read_page(current)?;
         let page = PageRef::parse(&bytes, current)?;
@@ -259,7 +293,7 @@ pub fn read_overflow(src: &impl PageSource, len: u64, first: PageNo) -> Result<V
         let available = bytes.len() - PAGE_HEADER_SIZE;
         let max = *max_hops.get_or_insert_with(|| {
             let capacity = core::cmp::max(available as u64, 1);
-            len.div_ceil(capacity).max(1)
+            core::cmp::min(len.div_ceil(capacity).max(1), in_file)
         });
         hops += 1;
         if hops > max {
@@ -323,7 +357,19 @@ pub fn read_overflow(src: &impl PageSource, len: u64, first: PageNo) -> Result<V
 /// capacidad)` la limita al tamaño real del valor que se está liberando.
 pub fn free_overflow(tx: &mut WriteTxn, len: u64, first: PageNo) -> Result<()> {
     let capacity = core::cmp::max(tx.logical_page_size() as u64 - PAGE_HEADER_SIZE as u64, 1);
-    let max_hops = len.div_ceil(capacity).max(1);
+    // Mismo techo doble que `read_overflow` (ver su comentario), y por el
+    // mismo motivo: `len` sale de una celda de disco que `PageRef::parse` no
+    // valida, así que acotar SOLO con él es dejar que quien escribe el
+    // fichero fije el trabajo. Con 16 MiB declarados sobre un fichero de
+    // seis páginas, un `delete` de una sola clave hacía 34 102 lecturas —y
+    // otras tantas llamadas a `tx.free()` sobre las páginas repetidas del
+    // ciclo, cada una una entrada más en memoria— antes de rendirse; con
+    // `u64::MAX`, el proceso moría. `tx.n_pages()` es el mismo número que
+    // ya usa `RangeBudget` un poco más abajo en este mismo fichero.
+    let max_hops = core::cmp::min(
+        len.div_ceil(capacity).max(1),
+        u64::from(tx.n_pages()).max(1),
+    );
     let mut current = first;
     let mut hops: u64 = 0;
     while current != 0 {
@@ -4441,6 +4487,12 @@ mod cursor_tests {
             }
             self.inner.read_page(page)
         }
+
+        /// Delega: este envoltorio solo altera las LECTURAS, no la
+        /// extensión del fichero que hay debajo.
+        fn max_pages(&self) -> PageNo {
+            self.inner.max_pages()
+        }
     }
 
     /// Hallazgo 1: reconstruye el mecanismo exacto que encontró la
@@ -6165,3 +6217,158 @@ mod parse_order_and_overlap_tests {
         );
     }
 }
+
+/// Regresión de la clase «un dato de disco fija el trabajo»: el `len` de una
+/// celda de overflow.
+///
+/// `read_overflow`/`free_overflow` derivaban su cota de saltos ÚNICAMENTE de
+/// ese campo, y `PageRef::parse` no lo mira (para una celda de overflow,
+/// `cell_end` calcula el final como `body + 12` sea cual sea su contenido),
+/// así que una hoja con `len` arbitrario y su CRC recalculado pasa `parse`
+/// sin una queja y fija cuántas páginas lee el motor y cuánta memoria
+/// acumula. Ambas cotas llevan ahora un segundo techo —`n_pages`, contrastado
+/// contra la longitud real del fichero al abrir— y estas pruebas comprueban
+/// justo eso: que el trabajo NO crece con el número que declara la celda.
+///
+/// Las dos pruebas entran por la API pública (`ReadTxn::get`,
+/// `WriteTxn::delete`), no llamando a `read_overflow`/`free_overflow` con un
+/// `len` de parámetro: las dos pruebas que ya existían sobre estas funciones
+/// (`read_overflow_rejects_a_cycle_instead_of_returning_wrong_data` y su
+/// gemela de `free_overflow`) pasan `len` como argumento con un valor
+/// plausible (`capacity * 5`), así que nunca hacen la pregunta que importa
+/// —qué pasa cuando `len` viene del disco y vale lo que quiera— y el defecto
+/// cabía holgado dentro de su cota.
+#[cfg(all(test, feature = "std"))]
+mod overflow_len_from_disk_tests {
+    use super::*;
+    use crate::storage::MemStorage;
+    use crate::tx::{Db, Options};
+
+    /// Base con UNA clave cuyo valor vive en una cadena de overflow de una
+    /// sola página que apunta a sí misma, y cuya celda de hoja declara
+    /// `declared` bytes de longitud. Todo se construye con los
+    /// constructores del propio crate (`PageBuilder`, `write_page`), así
+    /// que cada página lleva su CRC correcto y pasa `PageRef::parse`: la
+    /// única anomalía es el número que la celda declara.
+    fn db_declaring(declared: u64) -> Db {
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        let page_size = tx.logical_page_size();
+
+        // Página de overflow que se referencia a sí misma: `next == ella
+        // misma`. Es la forma más barata de una cadena que nunca termina, y
+        // la que usó la revisión.
+        let chain = tx.alloc().unwrap();
+        let mut b = alloc::vec![0u8; page_size as usize];
+        b[0] = PageType::Overflow as u8;
+        b[4..6].copy_from_slice(&(PAGE_HEADER_SIZE as u16).to_le_bytes());
+        b[6..8].copy_from_slice(&(page_size as u16).to_le_bytes());
+        b[12..16].copy_from_slice(&chain.to_le_bytes());
+        let mut h = crate::crc32::Hasher::new();
+        h.update(&b[..8]);
+        h.update(&b[12..]);
+        b[8..12].copy_from_slice(&h.finish().to_le_bytes());
+        tx.write_page(chain, &b).unwrap();
+
+        let key = crate::tx::scoped(0x01, b"k");
+        let leaf = tx.alloc().unwrap();
+        let leaf_bytes = PageBuilder::new(page_size, PageType::Leaf)
+            .build(&[(key.as_slice(), CellPayload::Overflow { len: declared, first: chain })])
+            .unwrap();
+        tx.write_page(leaf, &leaf_bytes).unwrap();
+        tx.set_root(leaf);
+        tx.commit().unwrap();
+        db
+    }
+
+    /// Lecturas de página que cuesta `f` sobre una base que declara
+    /// `declared`.
+    fn reads_for(declared: u64, f: impl FnOnce(&Db)) -> u64 {
+        let db = db_declaring(declared);
+        let before = db.pages_read();
+        f(&db);
+        db.pages_read() - before
+    }
+
+    /// El fichero de estas pruebas tiene menos de una docena de páginas. La
+    /// cota real tras la corrección es `n_pages` saltos más el descenso;
+    /// este número redondo, holgado, distingue de sobra "acotado por el
+    /// fichero" de "acotado por lo que declara la celda" (2 134 lecturas
+    /// con 1 MiB declarado, 136 403 con 64 MiB, medido sobre el código sin
+    /// corregir).
+    const GENEROUS: u64 = 40;
+
+    #[test]
+    fn a_get_of_an_overflow_value_never_works_harder_because_the_cell_says_so() {
+        let small = reads_for(1 << 20, |db| {
+            assert!(
+                matches!(
+                    db.begin_read().get(0x01, b"k"),
+                    Err(Error::Corrupt { kind: CorruptKind::OverflowLoop, .. })
+                ),
+                "una cadena de overflow que se muerde la cola debe dar OverflowLoop"
+            );
+        });
+        let large = reads_for(64 << 20, |db| {
+            assert!(db.begin_read().get(0x01, b"k").is_err());
+        });
+
+        assert_eq!(
+            small, large,
+            "el trabajo de `get` crece con la longitud que declara la celda \
+             ({small} lecturas con 1 MiB declarado, {large} con 64 MiB) sobre \
+             el MISMO fichero de una docena de páginas: la cota la fija el \
+             disco, no el fichero"
+        );
+        assert!(
+            large <= GENEROUS,
+            "{large} lecturas de página para un fichero de una docena: la cota \
+             de saltos no está atada al tamaño real del fichero"
+        );
+
+        // Y el caso extremo, que es donde la escala lineal deja de ser una
+        // molestia y se vuelve la muerte del proceso: con `u64::MAX`, `out`
+        // crecía 492 bytes por vuelta durante 3,7×10^16 vueltas — sin
+        // límite de memoria agota la RAM de la máquina, y con uno el
+        // proceso muere por SIGABRT dentro de `Db::get`, un camino de solo
+        // lectura. Va DESPUÉS de las comprobaciones de arriba a propósito:
+        // sobre el código sin corregir, la aserción de `small == large`
+        // falla primero y esta línea no llega a ejecutarse nunca, así que
+        // una regresión se reporta como un fallo de prueba en vez de
+        // llevarse por delante la corrida entera.
+        let extreme = reads_for(u64::MAX, |db| {
+            assert!(
+                matches!(
+                    db.begin_read().get(0x01, b"k"),
+                    Err(Error::Corrupt { kind: CorruptKind::OverflowLoop, .. })
+                ),
+                "con `u64::MAX` declarado, `get` debe devolver Err, no morir"
+            );
+        });
+        assert!(extreme <= GENEROUS, "{extreme} lecturas con `u64::MAX` declarado");
+    }
+
+    #[test]
+    fn a_delete_of_an_overflow_value_never_works_harder_because_the_cell_says_so() {
+        let del = |db: &Db| {
+            let mut tx = db.begin_write().unwrap();
+            assert!(tx.delete(0x01, b"k").is_err());
+        };
+        let small = reads_for(1 << 20, del);
+        let large = reads_for(16 << 20, del);
+
+        assert_eq!(
+            small, large,
+            "el trabajo de `delete` crece con la longitud que declara la celda \
+             ({small} lecturas con 1 MiB declarado, {large} con 16 MiB): cada \
+             vuelta de más es además una llamada a `tx.free()` sobre la misma \
+             página repetida (34 102 lecturas medidas sobre el código sin \
+             corregir)"
+        );
+        assert!(large <= GENEROUS, "{large} lecturas de página para un fichero de una docena");
+
+        let extreme = reads_for(u64::MAX, del);
+        assert!(extreme <= GENEROUS, "{extreme} lecturas con `u64::MAX` declarado");
+    }
+}
+

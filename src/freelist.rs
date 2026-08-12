@@ -18,11 +18,91 @@ struct Group {
     is_preloaded_tail: bool,
 }
 
-/// Decodifica una página de lista de libres ya leída: valida el tipo y
-/// limita `count` al máximo que cabe físicamente en la página. Común a
-/// `fill_from_disk` y a la carga directa de `tail` en `load`, para no
-/// duplicar (y arriesgar desincronizar) la comprobación de límites.
-fn decode_freelist_page(bytes: &[u8], page_no: PageNo) -> Result<(TxnId, VecDeque<PageNo>, PageNo)> {
+/// Números de página que una entrada de lista de libres puede tener en ESTE
+/// fichero, ahora mismo. Es la frontera de validación de la lista de libres,
+/// el equivalente de `PageRef::parse` para el hueco del formato que `parse`
+/// no modela — igual que el límite de `count`, que ya vivía aquí por la
+/// misma razón.
+///
+/// **Por qué hacía falta.** `decode_freelist_page` acotaba `count` con
+/// cuidado y de las entradas en sí no comprobaba ni una cosa: un número de
+/// página que saliera de ahí llegaba intacto a `WriteTxn::alloc`, que lo
+/// entregaba como página libre. Sustituir UNA entrada por `0` y recalcular
+/// el CRC de la página bastaba para que `alloc` repartiera la página 0 —la
+/// cabecera del fichero— y para que el siguiente `put` la sobrescribiera
+/// con una hoja: `commit` devolvía `Ok(())` y la base entera quedaba
+/// irrecuperable (`Err(BadFormat)` al reabrir, con el espejo de cabecera
+/// perdido en la misma escritura, porque vive en esa misma página). Con `1`,
+/// lo mismo contra la meta A. Y con un número GRANDE —un solo byte alto
+/// cambiado, 2,67×10^9— `Pager::write` calculaba `page_no * page_size` y
+/// escribía a 1,37 TB: sobre un fichero real eso no falla, crea un fichero
+/// disperso y el commit tiene éxito; el daño aparece al reabrir, cuando la
+/// reconciliación de `Db::open` intenta recuperar 2,7×10^9 páginas.
+///
+/// `tree::validate_child` existe desde la tarea 15 para exactamente esta
+/// clase de defecto —un número de página leído del disco que se usa sin
+/// preguntar si direcciona algo real— pero se puso en el consumidor del
+/// ÁRBOL, no en el punto por el que las páginas libres entran al sistema.
+/// Esto es la misma condición, en el otro punto de entrada.
+///
+/// Qué se rechaza, y qué NO:
+///
+/// - `<= LAST_RESERVED_PAGE`: la cabecera (0) y la meta A (1) no vuelven
+///   nunca a la circulación, en ningún momento de la vida del fichero.
+/// - `== final_meta_b_page`: el destino de la reubicación de la meta B.
+///   `skip_meta_b_target` (`tx.rs`) lo retira del espacio de numeración
+///   desde la primera vez que una extensión de fichero podría entregarlo,
+///   así que NADIE lo asigna jamás y por tanto nadie puede liberarlo: si
+///   aparece en una lista de libres, esa lista no la escribió este motor.
+/// - `>= file_pages`: una entrada que no direcciona ninguna página del
+///   fichero. Es la longitud REAL, medida ahora, no un contador de disco.
+/// - **No** se rechaza la página de la meta B ACTUAL
+///   (`geometry().meta_b_page`), aunque `validate_child` sí lo haga con los
+///   hijos de un nodo interno: mientras la meta B está en su posición
+///   inicial (la página 2) esa página es legítimamente liberable —
+///   `relocate_meta_b` la libera de verdad al completar la reubicación— y
+///   un corte que deshiciera la escritura de la cabecera dejaría una cadena
+///   perfectamente válida, ya escrita, con esa entrada dentro. Rechazarla
+///   costaría la lista de libres entera de esa apertura (la degradación con
+///   gracia de `Db::open`) para proteger una ranura de meta que, a
+///   diferencia de la cabecera, tiene una copia redundante.
+struct PageDomain {
+    file_pages: PageNo,
+    /// Destino final de la meta B, derivado solo de `page_size`: fijo
+    /// durante toda la vida del fichero, a diferencia de
+    /// `geometry().meta_b_page`.
+    reserved_target: PageNo,
+}
+
+impl PageDomain {
+    /// Una llamada a `Storage::len` y una lectura de la geometría. Se
+    /// construye UNA vez por recorrido de cadena, no por entrada — y en
+    /// `fill_from_disk`/`absorb` sustituye a la llamada a `file_pages` que
+    /// esos recorridos ya hacían por salto para su propia cota de ciclos,
+    /// así que no añade ni una llamada al medio de almacenamiento.
+    fn of(pager: &Pager) -> Result<Self> {
+        Ok(Self {
+            file_pages: pager.file_pages()?,
+            reserved_target: crate::tx::WriteTxn::final_meta_b_page(pager.geometry().page_size),
+        })
+    }
+
+    fn accepts(&self, p: PageNo) -> bool {
+        p > crate::tx::LAST_RESERVED_PAGE && p != self.reserved_target && p < self.file_pages
+    }
+}
+
+/// Decodifica una página de lista de libres ya leída: valida el tipo,
+/// limita `count` al máximo que cabe físicamente en la página y comprueba
+/// que cada entrada direccione una página que existe de verdad
+/// (`PageDomain`). Común a `fill_from_disk` y a la carga directa de `tail`
+/// en `load`, para no duplicar (y arriesgar desincronizar) la comprobación
+/// de límites.
+fn decode_freelist_page(
+    bytes: &[u8],
+    page_no: PageNo,
+    domain: &PageDomain,
+) -> Result<(TxnId, VecDeque<PageNo>, PageNo)> {
     let p = PageRef::parse(bytes, page_no)?;
     if p.page_type() != PageType::Freelist {
         return Err(Error::Corrupt { page: page_no, kind: CorruptKind::PageType });
@@ -43,7 +123,14 @@ fn decode_freelist_page(bytes: &[u8], page_no: PageNo) -> Result<(TxnId, VecDequ
     let mut pages = VecDeque::with_capacity(count);
     for i in 0..count {
         let at = FREELIST_HEADER + 4 * i;
-        pages.push_back(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()));
+        let entry = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        // El coste de la frontera: una comparación por entrada, sobre
+        // bytes que esta función ya tiene en la mano y ya está copiando.
+        // Ver `PageDomain` para qué se rechaza y por qué.
+        if !domain.accepts(entry) {
+            return Err(Error::Corrupt { page: page_no, kind: CorruptKind::CellBounds });
+        }
+        pages.push_back(entry);
     }
     Ok((max_txn, pages, p.extra()))
 }
@@ -166,14 +253,38 @@ impl Freelist {
         if head == 0 {
             return Ok(f);
         }
+        // Los DOS extremos de la cadena son números de página leídos de la
+        // meta, y entran aquí sin haber pasado por ninguna comprobación:
+        // `Db::check_meta_against_file` (`tx.rs`) deja a propósito estos dos
+        // campos sin validar para que un puntero imposible salga por la
+        // degradación con gracia que `Db::open` ya tiene para una cadena
+        // ilegible —abrir igualmente y perder la lista— en vez de negarle la
+        // entrada a un fichero cuyo árbol está sano. `Err(Corrupt)` es
+        // justo lo que esa degradación espera. Sin esto, un `tail` fuera del
+        // fichero llegaba a `pager.read` y salía como `Error::Io`, que
+        // `Db::open` trata (correctamente) como fallo real del medio y
+        // propaga: el fichero entero se volvía inabrible por un campo de
+        // cuatro bytes.
+        let domain = PageDomain::of(pager)?;
+        if !domain.accepts(head) || !domain.accepts(tail) {
+            return Err(Error::Corrupt { page: head, kind: CorruptKind::CellBounds });
+        }
         if head != tail {
             f.tail_page = tail;
         }
         f.next_on_disk = head;
-        f.fill_from_disk(pager)?;
+        // `fill_from_disk_in`, no `fill_from_disk`: reutiliza el dominio ya
+        // construido en vez de pedir otro. Medido: sin esta reutilización,
+        // abrir una base con cadena de libres pagaba una llamada a
+        // `Storage::len` de más — 1,08 → 1,17 µs por apertura sobre
+        // `MemStorage`, un 8 % de una operación que este motor mide y acota
+        // a propósito (ver `open_costs_the_same_on_a_small_and_a_large_file`).
+        // Con ella, la apertura hace exactamente las mismas llamadas al
+        // medio que antes de esta corrección.
+        f.fill_from_disk_in(pager, &domain)?;
         if head != tail {
             let bytes = pager.read(tail)?;
-            let (max_txn, pages, _next) = decode_freelist_page(&bytes, tail)?;
+            let (max_txn, pages, _next) = decode_freelist_page(&bytes, tail, &domain)?;
             f.groups.push_back(Group { max_txn, pages, is_preloaded_tail: true });
             f.reclaimed.push_back(tail);
             f.dirty = true;
@@ -182,7 +293,30 @@ impl Freelist {
     }
 
     /// Trae el siguiente tramo de disco, si queda alguno.
+    ///
+    /// Construye el dominio de páginas de ESTA vuelta (`PageDomain`) y
+    /// delega. El dominio se calcula por salto, no una vez por recorrido, a
+    /// propósito: el fichero puede haber crecido entre una vuelta y la
+    /// siguiente (`absorb` se llama a mitad de un commit), y una frontera
+    /// obsoleta rechazaría entradas legítimas. No cuesta ninguna llamada al
+    /// medio de más que antes de existir: el recorrido ya pedía
+    /// `file_pages()` por salto para su cota de ciclos, y ahora esa misma
+    /// llamada sirve para las dos cosas.
     fn fill_from_disk(&mut self, pager: &Pager) -> Result<bool> {
+        if self.next_on_disk == 0 {
+            return Ok(false);
+        }
+        if self.next_on_disk == self.tail_page {
+            self.next_on_disk = 0;
+            return Ok(false);
+        }
+        let domain = PageDomain::of(pager)?;
+        self.fill_from_disk_in(pager, &domain)
+    }
+
+    /// Como `fill_from_disk`, con el dominio ya construido: lo usa `load`,
+    /// que acaba de construir uno para validar los extremos de la cadena.
+    fn fill_from_disk_in(&mut self, pager: &Pager, domain: &PageDomain) -> Result<bool> {
         if self.next_on_disk == 0 {
             return Ok(false);
         }
@@ -200,13 +334,18 @@ impl Freelist {
         // aunque no sea el caso trivial de una página que apunta a sí
         // misma (comprobado más abajo aparte, porque ese es más barato de
         // detectar en cuanto se da, sin esperar a agotar la cota).
+        //
+        // El mismo `file_pages` del dominio sirve para las dos cosas: la
+        // cota de saltos de aquí y la frontera de las entradas que
+        // `decode_freelist_page` valida más abajo. Una sola llamada al
+        // medio, la misma que este recorrido ya hacía.
         self.hops += 1;
-        if u64::from(self.hops) > u64::from(pager.file_pages()?) {
+        if u64::from(self.hops) > u64::from(domain.file_pages) {
             return Err(Error::Corrupt { page: page_no, kind: CorruptKind::FreelistLoop });
         }
 
         let bytes = pager.read(page_no)?;
-        let (max_txn, pages, next) = decode_freelist_page(&bytes, page_no)?;
+        let (max_txn, pages, next) = decode_freelist_page(&bytes, page_no, domain)?;
         if next == page_no {
             return Err(Error::Corrupt { page: page_no, kind: CorruptKind::FreelistLoop });
         }
@@ -351,14 +490,15 @@ impl Freelist {
         if self.written_head != 0 {
             let mut p = self.written_head;
             let mut hops: u32 = 0;
+            let domain = PageDomain::of(pager)?;
             loop {
                 self.reclaimed.push_back(p);
                 hops += 1;
-                if u64::from(hops) > u64::from(pager.file_pages()?) {
+                if u64::from(hops) > u64::from(domain.file_pages) {
                     return Err(Error::Corrupt { page: p, kind: CorruptKind::FreelistLoop });
                 }
                 let bytes = pager.read(p)?;
-                let (_max_txn, _pages, next) = decode_freelist_page(&bytes, p)?;
+                let (_max_txn, _pages, next) = decode_freelist_page(&bytes, p, &domain)?;
                 if next == p {
                     return Err(Error::Corrupt { page: p, kind: CorruptKind::FreelistLoop });
                 }
@@ -825,14 +965,18 @@ impl Freelist {
     ) -> Result<()> {
         let mut current = head;
         let mut hops: u64 = 0;
-        let limit = u64::from(pager.file_pages()?);
+        // Una sola construcción para todo el recorrido: da a la vez la cota
+        // de saltos (como antes) y la frontera de las entradas que
+        // `decode_freelist_page` va a validar (ver `PageDomain`).
+        let domain = PageDomain::of(pager)?;
+        let limit = u64::from(domain.file_pages);
         while current != 0 {
             hops += 1;
             if hops > limit {
                 return Err(Error::Corrupt { page: current, kind: CorruptKind::FreelistLoop });
             }
             let bytes = pager.read(current)?;
-            let (_max_txn, pages, next) = decode_freelist_page(&bytes, current)?;
+            let (_max_txn, pages, next) = decode_freelist_page(&bytes, current, &domain)?;
             visit(current, &pages);
             if next == current {
                 return Err(Error::Corrupt { page: current, kind: CorruptKind::FreelistLoop });
@@ -1031,11 +1175,21 @@ mod tests {
     #[test]
     fn detects_a_multi_page_cycle_not_just_a_direct_self_loop() {
         let p = pager();
+        // Las entradas tienen que direccionar páginas que existen de verdad
+        // (`PageDomain`, ver su comentario): con las de antes de esa
+        // frontera —100, 200 y 300 sobre un medio de cuatro páginas— la
+        // decodificación corta con `CellBounds` en la PRIMERA página y el
+        // ciclo que este test examina no se llega a recorrer. Una página
+        // libre real (la 4, escrita aquí para que el fichero la tenga) sirve
+        // igual: lo que se prueba es el recorrido de `next`, no qué listan
+        // las páginas. Con cinco páginas de fichero, la cota de saltos salta
+        // en la sexta vuelta, dentro de las veinte del bucle de abajo.
+        p.write(4, &vec![0u8; 512]).unwrap();
         // Cabeza real (1) con contenido, que apunta a un ciclo entre 2 y 3
         // que nunca llega a ninguna cola: 1 -> 2 -> 3 -> 2 -> 3 -> ...
-        write_raw_freelist_page(&p, 1, 5, &[100], 2);
-        write_raw_freelist_page(&p, 2, 5, &[200], 3);
-        write_raw_freelist_page(&p, 3, 5, &[300], 2);
+        write_raw_freelist_page(&p, 1, 5, &[4], 2);
+        write_raw_freelist_page(&p, 2, 5, &[4], 3);
+        write_raw_freelist_page(&p, 3, 5, &[4], 2);
 
         let mut f = Freelist::empty();
         f.next_on_disk = 1;

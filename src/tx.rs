@@ -316,6 +316,50 @@ struct WriterState {
     n_pages_floor: u32,
 }
 
+/// Última página del prefijo FIJO reservado del fichero: la cabecera es la
+/// página `0` y la meta A la `1`, y ninguna de las dos cambia jamás de sitio
+/// ni vuelve nunca a la circulación. Ninguna página `<= 1` es, por tanto, un
+/// número de página legítimo en NINGÚN sitio donde el motor lea uno del
+/// disco: ni como hijo de un nodo interno (`tree::validate_child`), ni como
+/// entrada de la lista de libres (`freelist::PageDomain`), ni como raíz
+/// (`Db::check_meta_against_file`).
+///
+/// Constante y no solo el método `WriteTxn::last_reserved_page` (que ahora
+/// la devuelve): los otros dos sitios que la necesitan no tienen —ni deben
+/// tener— un `WriteTxn` a mano; la lista de libres se decodifica con un
+/// `Pager` y la meta se valida antes de que exista ninguna transacción.
+pub(crate) const LAST_RESERVED_PAGE: PageNo = 1;
+
+/// Páginas que `Db::open` acepta reconciliar por encima de las que la meta
+/// declara — la cola que dejó una transacción interrumpida (ver el bucle de
+/// recuperación en `open`).
+///
+/// **Existe porque ese bucle cuesta memoria proporcional a un número que
+/// sale del medio de almacenamiento**, no del motor: una entrada de lista de
+/// libres manipulada que hiciera escribir a un offset de terabytes deja el
+/// fichero (disperso, sin ocupar disco de verdad) con miles de millones de
+/// páginas, y reabrirlo pedía una entrada de lista de libres por cada una —
+/// del orden de 10 GB de `VecDeque` para un fichero con 15 páginas de datos
+/// reales. El proceso moría en el `Db::open`, así que la base quedaba
+/// inservible para siempre: ninguna herramienta del propio motor
+/// (`audit_pages` incluida) llegaba a ejecutarse, porque `open` es la
+/// puerta.
+///
+/// **Por qué 2^20 y no una cota derivada.** No hay ninguna cota estructural:
+/// una transacción legítima puede extender el fichero tanto como pida el
+/// valor que esté escribiendo, así que cualquier número aquí es una
+/// decisión de ingeniería y no un teorema. 1 048 576 páginas son 512 MB con
+/// páginas de 512 B (4 GB con páginas de 4 KB) de extensión NO confirmada, y
+/// como mucho 4 MB de `VecDeque` mientras dura la reconciliación. El banco
+/// más grande que este proyecto se mide a sí mismo (un millón de registros,
+/// `tests/size.rs`) ocupa del orden de 66 000 páginas: quince veces por
+/// debajo de esta cota, así que una carga masiva interrumpida a mitad se
+/// reconcilia entera sin acercarse. Por encima, la desproporción entre lo
+/// que la meta declara y lo que el fichero mide deja de ser plausible como
+/// "transacción interrumpida" y se trata como lo que es: corrupción, con
+/// `Err`, que es el desenlace que el motor promete para una entrada corrupta.
+const MAX_RECOVERABLE_TAIL: u32 = 1 << 20;
+
 /// Página de la meta B al crear la base (tarea 18). Siempre la página 2, sin
 /// importar `page_size`: es el suelo de 1,5 KB (cabecera + meta A + meta B,
 /// tres páginas). Con páginas de 4 KB o más eso YA cae en un sector físico
@@ -453,6 +497,37 @@ impl Db {
         // misma clave para poder leerlas.
         let encryption = Self::open_data_key(&opts, &meta)?;
         let pager = Pager::new(storage, geometry, opts.cache_pages).with_encryption(encryption);
+
+        // **LA FRONTERA DE VALIDACIÓN DE LA META.** Se toma la extensión
+        // REAL del fichero UNA vez, aquí, antes de que ningún campo de la
+        // meta se use para dimensionar nada ni para direccionar nada, y se
+        // contrasta la meta contra ella (`check_meta_against_file`, ver su
+        // comentario para qué se comprueba y por qué).
+        //
+        // Antes de esto, `file_pages` se leía DESPUÉS de montar la lista de
+        // libres y se usaba en una sola dirección: subir `n_pages` hasta la
+        // extensión real cuando el fichero tenía más páginas de las que la
+        // meta declaraba. La dirección contraria —la meta declara MÁS
+        // páginas de las que el fichero tiene— no se miraba, y era la que
+        // sostenía media clase de defectos: `alloc` repartía `n_pages` como
+        // página nueva y `Pager::write` escribía a `n_pages * page_size`,
+        // a terabytes del dato real, mientras `audit_pages` reservaba un
+        // `Vec` de `n_pages` entradas. Ninguna de las dos cosas necesitaba
+        // más que este `>` para cerrarse.
+        //
+        // **Aquí, y no en cada uso.** El coste es una llamada a
+        // `Storage::len` (que esta función ya hacía unas líneas más abajo,
+        // para otra cosa) y tres comparaciones, una sola vez por apertura:
+        // no crece con el tamaño de la base, así que el criterio de salida
+        // que fija `open_costs_the_same_on_a_small_and_a_large_file` sigue
+        // intacto — no se lee ni una página de más. Y a partir de aquí
+        // `meta.n_pages` es un número CONTRASTADO con el fichero, no un
+        // dato de disco cualquiera: eso es lo que deja que el resto del
+        // motor lo use como cota sin volver a tocar el medio (ver
+        // `PageSource::max_pages` y `tree::read_overflow`).
+        let file_pages = pager.file_pages()?;
+        Self::check_meta_against_file(&meta, file_pages, slot.page(&geometry))?;
+
         // Degrada con gracia si la cadena heredada no decodifica, en vez de
         // propagar el error con `?` (tarea 19, autorrevisión tras el hallazgo
         // de las pruebas basadas en propiedades).
@@ -543,7 +618,14 @@ impl Db {
         // corrupción silenciosa que sobrevive a la reapertura. Confirmado de
         // punta a punta con
         // `reopening_after_a_crash_during_relocation_never_recovers_the_relocation_target_into_the_freelist`.
-        let file_pages = pager.file_pages()?;
+        //
+        // El recorrido está acotado por `check_meta_against_file`, más
+        // arriba: sin esa cota, este bucle es trabajo Y memoria
+        // proporcionales a `file_pages`, un número que sale del medio de
+        // almacenamiento — una entrada de lista de libres sin validar que
+        // hiciera escribir a 1,37 TB dejaba el fichero con 2,7×10^9
+        // páginas, y esta reconciliación pedía del orden de 10 GB de
+        // `VecDeque` para reabrirlo. Ver `MAX_RECOVERABLE_TAIL`.
         let relocation_target = WriteTxn::final_meta_b_page(geometry.page_size);
         for p in meta.n_pages..file_pages {
             if p == relocation_target {
@@ -586,6 +668,67 @@ impl Db {
 
         let storage = pager.into_storage();
         Ok(Self::assemble(storage, geometry, meta, slot, opts, writer_state, encryption))
+    }
+
+    /// Contrasta la meta recién leída con lo que el fichero ES: su longitud
+    /// real, medida ahora mismo. Única frontera de validación de la meta,
+    /// igual que `PageRef::parse` lo es de una página — y por el mismo
+    /// motivo: todo lo que hay más abajo (`alloc`, `audit_pages`,
+    /// `read_overflow`, la propia reconciliación de `open`) usa estos
+    /// campos como si fueran números de página y cuentas de página de ESTE
+    /// fichero, sin volver a preguntar.
+    ///
+    /// Lo que se comprueba, y por qué cada cosa:
+    ///
+    /// - **`n_pages > file_pages`**: un fichero no encoge por su cuenta. La
+    ///   meta que dice tener más páginas de las que hay solo puede venir de
+    ///   una manipulación (el CRC de la meta lo cubre, así que la
+    ///   podredumbre de bits se detiene antes) o de un medio que miente. Es
+    ///   el campo más peligroso de los cinco: `alloc` reparte `n_pages`
+    ///   como página nueva por el camino de extensión, y `Pager::write`
+    ///   calcula `page_no * page_size` sin más, así que un solo byte
+    ///   cambiado aquí hacía que el primer `put` escribiera a cientos de
+    ///   gigabytes del dato real (sobre un fichero de verdad, un fichero
+    ///   DISPERSO que el commit acepta sin quejarse y que ya no se puede
+    ///   reabrir); y `audit_pages` reservaba `vec![false; n_pages]`, 4,29 GB
+    ///   de golpe con `n_pages = u32::MAX`. La comprobación vale para
+    ///   bases CIFRADAS igual que para las demás: las metas viajan en claro
+    ///   con solo un CRC32 (`Meta::store`), así que este es el único sitio
+    ///   donde una `n_pages` manipulada de una base cifrada se puede parar.
+    ///
+    /// - **`root` / `catalog_root` fuera del fichero**: una raíz que no
+    ///   direcciona ninguna página real. Hoy degradan solas (leerla da
+    ///   `UnexpectedEof` del medio, o `Corrupt` si esos bytes existen pero
+    ///   no son una página del tipo esperado), así que esto no cierra
+    ///   ningún fallo abierto — pero deja el criterio en un solo sitio en
+    ///   vez de repartido entre "lo que pasa cuando alguien intenta leerla",
+    ///   y convierte un `IoError` (que quien llama tiene que interpretar
+    ///   como problema del disco) en `Corrupt` (que es lo que de verdad
+    ///   es). `0` es el árbol vacío, y se acepta como tal.
+    ///
+    /// - **La cola por reconciliar**: ver `MAX_RECOVERABLE_TAIL`.
+    ///
+    /// `freelist_head`/`freelist_tail` NO se comprueban aquí a propósito:
+    /// los valida `Freelist::load` contra su propio dominio de páginas (ver
+    /// `PageDomain` en `freelist.rs`) para que un puntero de cadena
+    /// imposible entre por la degradación con gracia que `open` ya tiene
+    /// para una cadena ilegible —abrir la base y perder la lista— en vez de
+    /// negarle la entrada a un fichero cuyo árbol está perfectamente sano.
+    fn check_meta_against_file(meta: &Meta, file_pages: PageNo, meta_page: PageNo) -> Result<()> {
+        let corrupt =
+            Err(Error::Corrupt { page: meta_page, kind: crate::CorruptKind::MetaMismatch });
+        if meta.n_pages > file_pages {
+            return corrupt;
+        }
+        if file_pages - meta.n_pages > MAX_RECOVERABLE_TAIL {
+            return corrupt;
+        }
+        for root in [meta.root, meta.catalog_root] {
+            if root != 0 && (root <= LAST_RESERVED_PAGE || root >= file_pages) {
+                return corrupt;
+            }
+        }
+        Ok(())
     }
 
     /// Toma `WriterState` ya construido, no sus campos sueltos
@@ -922,17 +1065,41 @@ pub(crate) fn scoped(ns: u8, key: &[u8]) -> Vec<u8> {
 /// público habría dejado la misma puerta abierta con otro nombre.
 pub(crate) trait PageSource {
     fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>>;
+
+    /// Páginas que existen en el fichero según el snapshot de ESTA
+    /// transacción: la cota superior del número de páginas DISTINTAS que
+    /// cualquier recorrido legítimo puede visitar, y por tanto la cota con
+    /// la que se acota un recorrido cuya longitud, si no, la fijaría un
+    /// dato leído del disco. Es el mismo argumento —y el mismo número— que
+    /// ya usa `tree::RangeBudget` a través de `WriteTxn::n_pages`, ahora
+    /// disponible también para un lector.
+    ///
+    /// **Sale de la meta y no cuesta E/S**, que es justo lo que la hace
+    /// utilizable en el camino caliente: `meta.n_pages` está en memoria
+    /// desde `begin_read`/`begin_write`, y desde
+    /// `Db::check_meta_against_file` es además un número ya contrastado
+    /// contra la longitud real del fichero — sin esa comprobación al abrir,
+    /// acotar con él sería acotar un dato de disco con otro dato de disco.
+    fn max_pages(&self) -> PageNo;
 }
 
 impl PageSource for ReadTxn<'_> {
     fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
         self.db.pager.read(page)
     }
+
+    fn max_pages(&self) -> PageNo {
+        self.meta.n_pages
+    }
 }
 
 impl PageSource for WriteTxn<'_> {
     fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
         self.db.pager.read(page)
+    }
+
+    fn max_pages(&self) -> PageNo {
+        self.meta.n_pages
     }
 }
 
@@ -1220,7 +1387,7 @@ impl<'db> WriteTxn<'db> {
     /// vive la meta B desde `Db::create`, ver `INITIAL_META_B_PAGE`) ya está
     /// en otro sector, así que esas bases nunca reubican: `relocate_meta_b`
     /// devuelve enseguida al ver que la geometría ya coincide con esto.
-    fn final_meta_b_page(page_size: u32) -> PageNo {
+    pub(crate) fn final_meta_b_page(page_size: u32) -> PageNo {
         core::cmp::max(2, 4096 / page_size)
     }
 
@@ -1301,7 +1468,7 @@ impl<'db> WriteTxn<'db> {
     /// revisión, hallazgo 1) para rechazar un hijo corrupto que caiga en
     /// una de las ranuras de meta, no solo en la página `0`.
     pub(crate) fn last_reserved_page(&self) -> PageNo {
-        1
+        LAST_RESERVED_PAGE
     }
 
     /// Página de la meta B AHORA MISMO: la `2` (`INITIAL_META_B_PAGE`)
@@ -1368,12 +1535,26 @@ impl<'db> WriteTxn<'db> {
     /// binario de integración que enlaza `libinro` compilada sin
     /// `--cfg test` — ver la nota de `Db::pages_read`, arriba, mismo motivo
     /// exacto.
+    /// **`saturating_sub`, no `-`.** `free` cuenta lo que la lista de libres
+    /// trajo del disco, y aunque `PageDomain` (`freelist.rs`) ya garantiza
+    /// que cada entrada direcciona una página que existe de verdad, no
+    /// garantiza —ni puede, sin memoria proporcional a la lista entera— que
+    /// no haya REPETIDAS entre páginas distintas de la cadena. Una cadena
+    /// manipulada que liste cien veces la misma página válida deja `free`
+    /// por encima de `n_pages`, y con la resta a pelo eso era un pánico
+    /// («attempt to subtract with overflow») en depuración y un número
+    /// silenciosamente falso en release (`4 294 967 183` páginas en uso en
+    /// un fichero de 7). Saturando, un fichero manipulado da un número
+    /// pequeño en vez de un pánico o una respuesta absurda; la duplicación
+    /// en sí la denuncia `audit_pages`, que es la función que existe para
+    /// eso — esto es contabilidad de diagnóstico, no una respuesta a una
+    /// consulta.
     pub fn pages_in_use(&mut self) -> u32 {
         let n = self.meta.n_pages;
         let free = self.state().freelist.len() as u32 + self.own_free.len() as u32;
         let target = self.meta_b_relocation_target();
         let skip_gap = if target > INITIAL_META_B_PAGE && n > target { 1 } else { 0 };
-        n - free - skip_gap
+        n.saturating_sub(free).saturating_sub(skip_gap)
     }
 
     /// Toma una página libre reutilizable o extiende el fichero.
@@ -2759,6 +2940,24 @@ impl Db {
         let n_pages = meta.n_pages;
         let geometry = self.pager.geometry();
 
+        // Defensa en profundidad sobre la frontera de `Db::open`
+        // (`check_meta_against_file`): esa comprobación ya garantiza que la
+        // meta confirmada nunca declara más páginas de las que el fichero
+        // tiene, así que este `if` no debería poder dispararse nunca. Se
+        // paga igual —una llamada a `Storage::len` frente a un recorrido
+        // O(n_pages) que esta función va a hacer a continuación, es decir,
+        // nada— porque esta es LA función que uno ejecuta ante la sospecha
+        // de corrupción: es la última que puede permitirse creerse un
+        // contador de disco para dimensionar una reserva de memoria. Con
+        // `n_pages = u32::MAX` eran 4,29 GB de golpe (SIGABRT bajo
+        // cualquier límite razonable) para auditar un fichero de 4 KB.
+        if n_pages > self.pager.file_pages()? {
+            return Err(Error::Corrupt {
+                page: self.committed.read().unwrap().1.page(&geometry),
+                kind: crate::CorruptKind::MetaMismatch,
+            });
+        }
+
         // Una única bolsa para las tres categorías (reservadas, árbol,
         // lista de libres): así una página que dos de ellas reclaman a la
         // vez — el defecto exacto que esta función existe para atrapar —
@@ -2791,7 +2990,7 @@ impl Db {
         }
 
         if meta.root != 0 {
-            ok &= audit_walk_tree(&self.pager, meta.root, &mut mark)?;
+            ok &= audit_walk_tree(&self.pager, meta.root, 1, &mut mark)?;
         }
 
         if meta.freelist_head != 0 {
@@ -2820,14 +3019,41 @@ impl Db {
 /// Corta en cuanto `mark` dice "ya vista" — no sigue explorando desde ahí —
 /// así que una página que aparece dos veces en el árbol (un DAG corrupto
 /// con hijos compartidos) nunca hace recorrer el mismo subárbol dos veces:
-/// la profundidad de la recursión queda acotada por `n_pages`, sin
-/// necesitar un contador de saltos aparte como `tree::RangeBudget`.
+/// el TRABAJO total queda acotado por `n_pages`, sin necesitar un contador
+/// de saltos aparte como `tree::RangeBudget`.
+///
+/// **Pero el trabajo no es la profundidad, y confundirlos costaba el
+/// proceso entero.** Esto recurre de verdad (se llama a sí misma en las dos
+/// líneas de la rama `Internal`), así que lo que hay que acotar es la
+/// PROFUNDIDAD de la pila, y "acotada por `n_pages`" son hasta 2^32 marcos.
+/// Una cadena de nodos internos encadenados por `extra` —cada uno con cero
+/// separadores, cada uno una página perfectamente válida con su CRC
+/// correcto— desbordaba la pila y abortaba el proceso (SIGABRT) con 10 000
+/// páginas, un fichero de 5 MB; sobre la pila de 8 MiB del hilo principal,
+/// del orden de 40 000, un tamaño de fichero corriente. Y lo hacía
+/// precisamente en `audit_pages`, es decir, en lo que uno ejecuta ANTE LA
+/// SOSPECHA de corrupción.
+///
+/// La cota es `MAX_DEPTH`, la misma que llevan las siete funciones de
+/// `tree.rs` que descienden el árbol (`descend`, `insert_rec`,
+/// `delete_rec`, `free_subtree`, `delete_range_rec`, `Cursor::seek_from`,
+/// `Cursor::advance_to_next_leaf`) y por la misma razón: un árbol legítimo
+/// nunca es más profundo que eso —ninguna operación de escritura puede
+/// construirlo, porque todas ellas se niegan a bajar más— así que superarla
+/// prueba un ciclo o un injerto, no un árbol grande. `free_subtree` ya
+/// rechazó expresamente este mismo razonamiento de "queda acotado por el
+/// número de páginas" en su comentario, con estas palabras: *desbordar la
+/// pila es un fallo del propio proceso, no solo un cuelgue*.
 #[cfg(feature = "audit")]
 fn audit_walk_tree(
     pager: &Pager,
     page_no: PageNo,
+    depth: u32,
     mark: &mut impl FnMut(PageNo) -> bool,
 ) -> Result<bool> {
+    if depth > crate::tree::MAX_DEPTH {
+        return Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::TreeLoop });
+    }
     if !mark(page_no) {
         return Ok(false);
     }
@@ -2844,9 +3070,9 @@ fn audit_walk_tree(
         }
         crate::page::PageType::Internal => {
             for i in 0..page.n_slots() {
-                ok &= audit_walk_tree(pager, page.child(i), mark)?;
+                ok &= audit_walk_tree(pager, page.child(i), depth + 1, mark)?;
             }
-            ok &= audit_walk_tree(pager, page.extra(), mark)?;
+            ok &= audit_walk_tree(pager, page.extra(), depth + 1, mark)?;
         }
         _ => return Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::PageType }),
     }
@@ -4720,5 +4946,435 @@ mod tests {
                 "la pagina destino de la reubicacion de la meta B no debe repartirse nunca"
             );
         }
+    }
+}
+
+/// Regresión de la clase entera: **un número leído del disco se usa para
+/// dimensionar una reserva de memoria o para direccionar el fichero, sin
+/// contrastarlo con lo que el fichero ES.**
+///
+/// Los siete defectos que cierra esta ronda comparten esa raíz. La frontera
+/// está en dos sitios, uno por cada punto de entrada: `Db::open`
+/// (`check_meta_against_file`) para los campos de la meta, y
+/// `freelist::PageDomain` para las entradas de la lista de libres. Estas
+/// pruebas entran por el API público —`Db::open`, `get`, `put`, `delete`,
+/// `audit_pages`— porque el defecto es que el API público se porta mal;
+/// llamar al validador comprobaría que el validador funciona, que es otra
+/// cosa.
+///
+/// **Alcanzabilidad: manipulación.** El CRC32 por página se comprueba antes
+/// que ningún campo, así que la podredumbre de bits y las escrituras
+/// desgarradas se detienen en `CorruptKind::Checksum`. Cada fixture de aquí
+/// recalcula el CRC —con el mismo `crc32` del crate— exactamente como haría
+/// quien manipulase el fichero a propósito. Dos de ellos (`n_pages`)
+/// funcionan igual sobre una base CIFRADA, porque las metas se escriben en
+/// claro: ver la prueba con `#[cfg(feature = "encryption")]` al final.
+#[cfg(all(test, feature = "std"))]
+mod tampering_tests {
+    use super::*;
+    use crate::freelist::FREELIST_HEADER;
+    use crate::storage::MemStorage;
+    use crate::CorruptKind;
+    use alloc::vec;
+
+    const PS: u64 = 512;
+
+    fn medium() -> Arc<MemStorage> {
+        Arc::new(MemStorage::new())
+    }
+
+    fn open(s: &Arc<MemStorage>) -> Result<Db> {
+        Db::open(Box::new(Arc::clone(s)), Options::default())
+    }
+
+    /// Base con datos reales y una cadena de lista de libres real en disco:
+    /// 40 `put` y 30 `delete` dejan páginas liberadas de sobra. Devuelve la
+    /// página de la meta ganadora y la cabeza de la cadena de libres.
+    fn seeded(s: &Arc<MemStorage>) -> (PageNo, PageNo) {
+        let db = Db::create(Box::new(Arc::clone(s)), Options::default()).unwrap();
+        for i in 0..40u32 {
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, &i.to_be_bytes(), &[7u8; 60]).unwrap();
+            tx.commit().unwrap();
+        }
+        for i in 0..30u32 {
+            let mut tx = db.begin_write().unwrap();
+            tx.delete(0x01, &i.to_be_bytes()).unwrap();
+            tx.commit().unwrap();
+        }
+        let (meta, slot) = *db.committed.read().unwrap();
+        let geometry = db.pager.geometry();
+        assert_ne!(meta.freelist_head, 0, "el fixture debe dejar una cadena de libres real");
+        (slot.page(&geometry), meta.freelist_head)
+    }
+
+    fn read_page(s: &Arc<MemStorage>, page: PageNo) -> Vec<u8> {
+        let mut b = vec![0u8; PS as usize];
+        s.read_at(page as u64 * PS, &mut b).unwrap();
+        b
+    }
+
+    /// Recalcula el CRC de una página exactamente como lo hace el motor: sin
+    /// esto, la manipulación se detendría en `CorruptKind::Checksum` y la
+    /// prueba no llegaría a tocar el código que de verdad examina.
+    fn rewrite_page(s: &Arc<MemStorage>, page: PageNo, mut b: Vec<u8>) {
+        let mut h = crate::crc32::Hasher::new();
+        h.update(&b[..8]);
+        h.update(&b[12..]);
+        b[8..12].copy_from_slice(&h.finish().to_le_bytes());
+        s.write_at(page as u64 * PS, &b).unwrap();
+    }
+
+    /// Reescribe un campo de la meta ganadora con el propio codificador del
+    /// crate (CRC de meta incluido), igual que la sonda de la revisión.
+    fn tamper_meta(s: &Arc<MemStorage>, meta_page: PageNo, f: impl FnOnce(&mut Meta)) {
+        let b = read_page(s, meta_page);
+        let mut meta = Meta::decode(&b).unwrap();
+        f(&mut meta);
+        s.write_at(meta_page as u64 * PS, &meta.encode(PS as u32)).unwrap();
+    }
+
+    /// Cuántas entradas dice tener la página de lista de libres `page`.
+    fn freelist_count(s: &Arc<MemStorage>, page: PageNo) -> u16 {
+        u16::from_le_bytes(read_page(s, page)[28..30].try_into().unwrap())
+    }
+
+    // ---- Hallazgo 7 (+6): `meta.n_pages` contra la longitud real -------
+
+    /// **Hallazgo 7.** Un solo byte del campo `n_pages` bastaba para que el
+    /// primer `alloc` repartiera un número de página disparatado y
+    /// `Pager::write` escribiera a `n_pages * page_size`: 7,5 GB en la
+    /// sonda de la revisión, 343 GB con el byte de al lado. Sobre un
+    /// fichero real no falla —crea un fichero disperso, el `commit`
+    /// devuelve `Ok`— y la base queda con una extensión gigantesca que ya
+    /// no se puede reabrir.
+    ///
+    /// Sin la corrección, `Db::open` devuelve `Ok` aquí: acepta la meta tal
+    /// cual y la adopta (`max(meta.n_pages, file_pages)`), que es
+    /// exactamente lo contrario de rechazarla. Esta prueba sigue con un
+    /// `put` acotado a propósito —`n_pages` manipulada a 100 000, no a
+    /// `u32::MAX`— para que el fallo sobre código sin corregir sea un
+    /// fichero de 51 MB que la aserción de longitud denuncia, y no una
+    /// reserva de gigabytes que se lleve por delante la corrida entera.
+    #[test]
+    fn a_meta_that_declares_more_pages_than_the_file_has_is_rejected_at_open() {
+        let s = medium();
+        let (meta_page, _) = seeded(&s);
+        let real_len = s.len().unwrap();
+        tamper_meta(&s, meta_page, |m| m.n_pages = 100_000);
+
+        let result = open(&s);
+        assert!(
+            matches!(result.as_ref(), Err(Error::Corrupt { kind: CorruptKind::MetaMismatch, .. })),
+            "una meta que declara 100 000 páginas sobre un fichero de {} debe \
+             dar Err(Corrupt{{MetaMismatch}}); se obtuvo {:?}",
+            real_len / PS,
+            result.map(|_| "Ok(Db)")
+        );
+        assert_eq!(
+            s.len().unwrap(),
+            real_len,
+            "abrir no debe haber tocado el fichero"
+        );
+    }
+
+    /// **Hallazgo 6.** `audit_pages` reservaba `vec![false; n_pages]` con
+    /// `n_pages` leída de la meta: 4,29 GB de golpe (SIGABRT bajo cualquier
+    /// límite de memoria) para auditar un fichero de 4 KB. La corrección no
+    /// está en `audit_pages` sino en la puerta: una meta así ya no llega a
+    /// montar. Sin ella, `Db::open` devuelve `Ok` y es la LLAMADA A
+    /// `audit_pages` —lo que uno ejecuta justo ante la sospecha de
+    /// corrupción— la que mata el proceso.
+    #[test]
+    fn a_page_count_of_u32_max_never_reaches_the_vec_that_audit_pages_sizes_from_it() {
+        let s = medium();
+        let (meta_page, _) = seeded(&s);
+        tamper_meta(&s, meta_page, |m| m.n_pages = u32::MAX);
+
+        let result = open(&s);
+        assert!(
+            matches!(result.as_ref(), Err(Error::Corrupt { kind: CorruptKind::MetaMismatch, .. })),
+            "se esperaba Err(Corrupt{{MetaMismatch}}); se obtuvo {:?} — y con \
+             `Ok`, el `audit_pages` siguiente reserva 4,29 GB",
+            result.map(|_| "Ok(Db)")
+        );
+    }
+
+    /// La misma manipulación sobre una base CIFRADA. Las metas viajan en
+    /// claro con solo un CRC32 (`Meta::store` escribe por `pager.write`, no
+    /// por `write_encrypted`), así que los hallazgos 6 y 7 son alcanzables
+    /// sin conocer la clave — a diferencia del resto de la clase, que el
+    /// cifrado por página cierra por accidente. Autenticar la meta es un
+    /// cambio de formato aparte; lo que esta prueba fija es que la frontera
+    /// de `Db::open` cubre ese caso igual, porque se comprueba ANTES de
+    /// tocar ninguna página cifrada.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn a_tampered_page_count_is_rejected_on_an_encrypted_database_too() {
+        let key = crate::crypto::Encryption {
+            key: [3u8; 32],
+            algorithm: crate::crypto::Algorithm::XChaCha20Poly1305,
+        };
+        let opts = || Options { encryption: Some(key), ..Options::default() };
+        let s = medium();
+        let meta_page = {
+            let db = Db::create(Box::new(Arc::clone(&s)), opts()).unwrap();
+            for i in 0..20u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), &[7u8; 60]).unwrap();
+                tx.commit().unwrap();
+            }
+            let (_, slot) = *db.committed.read().unwrap();
+            slot.page(&db.pager.geometry())
+        };
+        tamper_meta(&s, meta_page, |m| m.n_pages = u32::MAX);
+
+        let result = Db::open(Box::new(Arc::clone(&s)), opts());
+        assert!(
+            matches!(result.as_ref(), Err(Error::Corrupt { kind: CorruptKind::MetaMismatch, .. })),
+            "una base cifrada no protege su meta: la frontera tiene que \
+             rechazarla igual; se obtuvo {:?}",
+            result.map(|_| "Ok(Db)")
+        );
+    }
+
+    // ---- Hallazgos 3, 3 bis y 5: entradas de la lista de libres --------
+
+    /// **Hallazgo 3.** Sustituir UNA entrada de la página de lista de libres
+    /// por `0` y recalcular su CRC hacía que `alloc()` repartiera la página
+    /// 0 —la cabecera del fichero— y que el siguiente `put` la
+    /// sobrescribiera con una hoja. El `commit` devolvía `Ok(())`; el daño
+    /// solo se veía al reabrir, con `Err(BadFormat)` y sin espejo de
+    /// cabecera al que caer, porque vive en esa misma página.
+    ///
+    /// Sobre el código sin corregir, esta prueba falla en el segundo
+    /// `open`, con `Err(BadFormat)`: la base entera se ha perdido.
+    #[test]
+    fn a_freelist_entry_of_zero_never_becomes_a_page_that_put_overwrites() {
+        let s = medium();
+        let (_, head) = seeded(&s);
+        assert!(freelist_count(&s, head) >= 1, "el fixture necesita al menos una entrada");
+        let mut b = read_page(&s, head);
+        b[FREELIST_HEADER..FREELIST_HEADER + 4].copy_from_slice(&0u32.to_le_bytes());
+        rewrite_page(&s, head, b);
+
+        {
+            let db = open(&s).expect("una lista de libres manipulada no debe impedir abrir");
+            for i in 100..140u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), &[9u8; 60]).unwrap();
+                tx.commit().unwrap();
+            }
+        }
+
+        let db = open(&s).expect(
+            "la base tiene que poder reabrirse: si `alloc` repartió la página 0, \
+             el `put` de arriba escribió una hoja encima de la cabecera",
+        );
+        let r = db.begin_read();
+        for i in 100..140u32 {
+            assert_eq!(
+                r.get(0x01, &i.to_be_bytes()).unwrap(),
+                Some(vec![9u8; 60]),
+                "clave {i} escrita tras la manipulación"
+            );
+        }
+        assert_eq!(r.get(0x01, &35u32.to_be_bytes()).unwrap(), Some(vec![7u8; 60]));
+    }
+
+    /// **Hallazgo 3 bis.** La misma entrada sin validar, pero GRANDE: el
+    /// motor escribe a `page_no * page_size`. La revisión lo alcanzó
+    /// cambiando UN byte (el más alto de la segunda entrada), que llevó la
+    /// entrada a 2,67×10^9 y la escritura a 1,37 TB; sobre un fichero real
+    /// eso crea un fichero disperso, el `commit` tiene éxito, y la base ya
+    /// no se puede reabrir jamás.
+    ///
+    /// Aquí la entrada se pone en 200 000 —no en 2,67×10^9— a propósito:
+    /// sobre código sin corregir el daño es un fichero de 102 MB que la
+    /// aserción de longitud denuncia, en vez de una reserva de terabytes
+    /// que mataría la corrida. Es el mismo camino, con el mismo `alloc`,
+    /// escalado para que el fallo se pueda REPORTAR.
+    #[test]
+    fn a_freelist_entry_past_the_end_of_the_file_never_becomes_a_write_at_that_offset() {
+        let s = medium();
+        let (_, head) = seeded(&s);
+        let mut b = read_page(&s, head);
+        b[FREELIST_HEADER..FREELIST_HEADER + 4].copy_from_slice(&200_000u32.to_le_bytes());
+        rewrite_page(&s, head, b);
+
+        let db = open(&s).expect("una lista de libres manipulada no debe impedir abrir");
+        for i in 100..120u32 {
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, &i.to_be_bytes(), &[9u8; 60]).unwrap();
+            tx.commit().unwrap();
+        }
+        let len = s.len().unwrap();
+        assert!(
+            len < 200 * 1024,
+            "el fichero mide {len} bytes: `alloc` sirvió la entrada manipulada y \
+             algo escribió a {} bytes del principio",
+            200_000u64 * PS
+        );
+    }
+
+    /// **Hallazgo 5.** `pages_in_use` restaba sin proteger `n_pages - free`,
+    /// con `free` contado desde lo que la lista de libres trajo del disco.
+    /// Subiendo el `count` de la página de cabeza a su máximo físico (120
+    /// entradas con páginas de 512 B, que `decode_freelist_page` aceptaba
+    /// porque su única comprobación era justo ese máximo), `free` supera a
+    /// `n_pages`: pánico en depuración («attempt to subtract with
+    /// overflow») y `Ok(4294967183)` en release — páginas en uso en un
+    /// fichero de siete. Ninguna de las dos cosas es `Err`.
+    ///
+    /// Hoy las 117 entradas de relleno son ceros, que la frontera rechaza
+    /// (`PageDomain`), así que la cadena entera se descarta al abrir y
+    /// `pages_in_use` no llega a ver un número inflado. El
+    /// `saturating_sub` cubre lo que la frontera no puede ver sin memoria
+    /// proporcional a la lista entera: entradas válidas REPETIDAS.
+    #[test]
+    fn a_freelist_count_larger_than_the_file_does_not_underflow_pages_in_use() {
+        let s = medium();
+        let (_, head) = seeded(&s);
+        let mut b = read_page(&s, head);
+        b[28..30].copy_from_slice(&120u16.to_le_bytes());
+        rewrite_page(&s, head, b);
+
+        let db = open(&s).expect("una lista de libres manipulada no debe impedir abrir");
+        let mut tx = db.begin_write().unwrap();
+        let (in_use, total) = (tx.pages_in_use(), tx.n_pages());
+        assert!(
+            in_use <= total,
+            "{in_use} páginas en uso de {total}: la cuenta sale de un contador de disco"
+        );
+    }
+
+    // ---- Hallazgo 3 bis, cara de la reapertura ------------------------
+
+    /// Medio que informa una longitud MAYOR que la real sin escribir un
+    /// solo byte: es lo que un sistema de ficheros devuelve tras un
+    /// `pwrite` disperso a un offset enorme (hallazgo 3 bis) y la única
+    /// forma de reproducir ese estado sin reservar los terabytes de verdad.
+    struct LongTail {
+        inner: Arc<MemStorage>,
+        reported: u64,
+    }
+
+    impl Storage for LongTail {
+        fn read_at(&self, o: u64, b: &mut [u8]) -> Result<()> {
+            self.inner.read_at(o, b)
+        }
+        fn write_at(&self, o: u64, b: &[u8]) -> Result<()> {
+            self.inner.write_at(o, b)
+        }
+        fn sync(&self) -> Result<()> {
+            self.inner.sync()
+        }
+        fn len(&self) -> Result<u64> {
+            Ok(core::cmp::max(self.inner.len()?, self.reported))
+        }
+        fn truncate(&self, len: u64) -> Result<()> {
+            self.inner.truncate(len)
+        }
+    }
+
+    /// El bucle de reconciliación de `Db::open` empuja una entrada de lista
+    /// de libres por cada página entre `meta.n_pages` y el final del
+    /// fichero: trabajo Y memoria proporcionales a la longitud del medio.
+    /// Con el fichero disperso que dejaba el hallazgo 3 bis (2,7×10^9
+    /// páginas) eso pedía del orden de 10 GB y el proceso moría DENTRO de
+    /// `Db::open`, así que la base quedaba inservible para siempre: ninguna
+    /// herramienta del motor llegaba a arrancar, porque `open` es la puerta.
+    ///
+    /// Dos casos, en este orden a propósito. El primero (una cola justo por
+    /// encima de `MAX_RECOVERABLE_TAIL`) sobre código sin corregir devuelve
+    /// `Ok` tras reconciliar un millón de páginas: falla como aserción, sin
+    /// matar nada. El segundo (un medio de 3 TB, que desborda el espacio de
+    /// numeración de 32 bits) sí mataría la corrida sin la corrección, y no
+    /// se llega a ejecutar porque el primero ya ha fallado.
+    #[test]
+    fn a_file_far_longer_than_its_meta_declares_is_rejected_instead_of_reconciled_page_by_page() {
+        let s = medium();
+        seeded(&s);
+        let real = s.len().unwrap();
+
+        let just_over = real + (u64::from(MAX_RECOVERABLE_TAIL) + 1) * PS;
+        let result = Db::open(
+            Box::new(LongTail { inner: Arc::clone(&s), reported: just_over }),
+            Options::default(),
+        );
+        assert!(
+            matches!(result.as_ref(), Err(Error::Corrupt { kind: CorruptKind::MetaMismatch, .. })),
+            "un fichero con {} páginas más de las que la meta declara no es una \
+             transacción interrumpida; se obtuvo {:?}",
+            MAX_RECOVERABLE_TAIL + 1,
+            result.map(|_| "Ok(Db)")
+        );
+
+        // 3 TB: `len / page_size` son 6×10^9 páginas, que NO caben en el
+        // `u32` con el que el motor direcciona. Truncar (`as u32`) las
+        // convertía en 1,7×10^9 — un número pequeño, y por tanto una
+        // frontera que deja pasar justo lo que tenía que parar. Ver
+        // `Pager::file_pages`.
+        let three_terabytes = 3 * 1024 * 1024 * 1024 * 1024u64;
+        let result = Db::open(
+            Box::new(LongTail { inner: Arc::clone(&s), reported: three_terabytes }),
+            Options::default(),
+        );
+        assert!(
+            matches!(result.as_ref(), Err(Error::Corrupt { kind: CorruptKind::MetaMismatch, .. })),
+            "un medio que informa 3 TB debe rechazarse, no dar la vuelta al \
+             contador de páginas; se obtuvo {:?}",
+            result.map(|_| "Ok(Db)")
+        );
+    }
+
+    // ---- Hallazgo 4: profundidad de `audit_walk_tree` -----------------
+
+    /// **Hallazgo 4.** `audit_walk_tree` recurre de verdad y no llevaba
+    /// cota de profundidad: su comentario razonaba que «queda acotada por
+    /// `n_pages`», que son hasta 2^32 marcos de pila. Una cadena de nodos
+    /// internos válidos encadenados por `extra` desbordaba la pila y
+    /// abortaba el proceso (SIGABRT) con 10 000 páginas —un fichero de 5
+    /// MB— y `audit_pages` es, justamente, lo que uno ejecuta ante la
+    /// sospecha de corrupción.
+    ///
+    /// La cadena de esta prueba tiene 130 eslabones: dos por encima de
+    /// `MAX_DEPTH` y muy por debajo de lo que desborda ninguna pila. Es
+    /// deliberado — lo que hay que probar es la COTA, y probarla con 10 000
+    /// eslabones mataría la corrida entera en vez de reportar un fallo.
+    /// Sobre código sin corregir esta prueba no aborta: devuelve
+    /// `Ok(false)`, una respuesta silenciosamente equivocada («este fichero
+    /// tiene páginas descolgadas») en lugar de `Err(Corrupt)` («este
+    /// fichero no es un árbol»). La muerte del proceso con la cadena larga
+    /// se comprobó aparte, en un binario de pruebas lanzado a propósito.
+    #[cfg(feature = "audit")]
+    #[test]
+    fn audit_pages_rejects_a_chain_of_internal_nodes_deeper_than_a_tree_can_be() {
+        use crate::page::{PageBuilder, PageType};
+
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        let page_size = tx.logical_page_size();
+        let chain: Vec<PageNo> =
+            (0..crate::tree::MAX_DEPTH + 2).map(|_| tx.alloc().unwrap()).collect();
+        for (i, &page) in chain.iter().enumerate() {
+            let mut b = PageBuilder::new(page_size, PageType::Internal);
+            // Cero separadores y `extra` al siguiente eslabón: páginas que
+            // `PageBuilder` construye, con su CRC correcto, que
+            // `PageRef::parse` acepta sin una queja.
+            b.set_extra(chain.get(i + 1).copied().unwrap_or(0));
+            let bytes = b.build(&[]).unwrap();
+            tx.write_page(page, &bytes).unwrap();
+        }
+        tx.set_root(chain[0]);
+        tx.commit().unwrap();
+
+        let result = db.audit_pages();
+        assert!(
+            matches!(result, Err(Error::Corrupt { kind: CorruptKind::TreeLoop, .. })),
+            "una cadena de {} nodos internos debe cortar con Err(Corrupt{{TreeLoop}}) \
+             a la profundidad máxima; se obtuvo {result:?}",
+            chain.len()
+        );
     }
 }

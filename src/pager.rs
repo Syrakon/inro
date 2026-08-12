@@ -328,10 +328,22 @@ impl Pager {
     }
 
     /// Páginas que caben en el fichero actual. Se usa al abrir para detectar
-    /// las que dejó una transacción interrumpida.
+    /// las que dejó una transacción interrumpida, y —desde la corrección de
+    /// la clase "número de página leído de disco"— como la FRONTERA contra
+    /// la que se valida todo número de página que sale del medio: ver
+    /// `Db::open` en `tx.rs` y `PageDomain` en `freelist.rs`.
+    ///
+    /// **Satura en `u32::MAX` en vez de truncar.** El motor direcciona 2^32
+    /// páginas, así que un fichero más largo que eso no es representable;
+    /// con `as u32` a secas, un fichero de 3 TB con páginas de 512 B (6×10^9
+    /// páginas) daba la vuelta y se presentaba como 1,7×10^9 — un número
+    /// PEQUEÑO, y por tanto una frontera que deja pasar exactamente los
+    /// números de página que tenía que rechazar. Saturar convierte ese caso
+    /// en la cota más alta posible, que es lo único honesto que se puede
+    /// decir de un fichero que no cabe en el espacio de numeración.
     pub fn file_pages(&self) -> Result<u32> {
         let len = self.storage.len()?;
-        Ok((len / self.geometry().page_size as u64) as u32)
+        Ok((len / self.geometry().page_size as u64).min(u32::MAX as u64) as u32)
     }
 
     /// Acceso directo al medio, sin pasar por la caché ni la geometría
