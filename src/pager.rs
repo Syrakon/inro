@@ -7,13 +7,18 @@ use std::sync::{Mutex, RwLock};
 
 use crate::crypto::Encryption;
 use crate::header::Geometry;
+use crate::page::ValidPage;
 use crate::{PageNo, Result, Storage};
 
 /// Entrada de caché. `used` es un contador monótono, no un reloj: sirve solo
 /// para elegir la víctima menos usada recientemente.
+///
+/// Guarda una página YA VALIDADA, no los bytes crudos. Ver el comentario de
+/// `Pager::read` para el argumento entero: qué se amortiza con eso, y por
+/// qué la invalidación no cambia ni una línea al hacerlo.
 struct Entry {
     page_no: PageNo,
-    bytes: Arc<[u8]>,
+    page: ValidPage,
     used: u64,
 }
 
@@ -151,7 +156,64 @@ impl Pager {
     /// a salvo por ese argumento distinto, no por el de arriba — y se
     /// rompe si algún código futuro empieza a leer una meta-página a
     /// través de `Pager::read`.
-    pub fn read(&self, page_no: PageNo) -> Result<Arc<[u8]>> {
+    ///
+    /// # Por qué devuelve una página validada y no bytes
+    ///
+    /// Hasta este cambio la caché guardaba `Arc<[u8]>` y todo llamante
+    /// hacía `PageRef::parse` sobre lo que recibía, así que **un acierto de
+    /// caché volvía a verificar el CRC de la página entera y a recorrer
+    /// otra vez el bucle de validación de slots**. El CRC no se amortizaba
+    /// nunca: medido, un recorrido completo pagaba un CRC de 4092 bytes por
+    /// ENTRADA devuelta, porque el cursor vuelve a pedir la misma hoja en
+    /// cada `next`, y una búsqueda puntual pagaba uno por cada nivel del
+    /// árbol aunque la raíz llevara cacheada desde la primera consulta.
+    /// Guardar `ValidPage` convierte eso en "se valida una vez, al entrar
+    /// en la caché".
+    ///
+    /// **`parse` sigue siendo el único punto de validación.** No se ha
+    /// añadido ningún camino que produzca una página sin pasar por él: lo
+    /// único que cambia es dónde se llama (aquí, una vez) y que el
+    /// resultado se guarda en vez de tirarse. Ver `page::ValidPage` para
+    /// por qué el par (bytes, disposición) no puede desparejarse.
+    ///
+    /// # Invalidación: qué cambia (nada)
+    ///
+    /// La pregunta peligrosa de este cambio es si una entrada validada
+    /// puede servirse cuando ya no debería. **La respuesta es que las
+    /// reglas de invalidación son exactamente las de antes, aplicadas a las
+    /// mismas entradas y en los mismos sitios**, porque lo que cambia es el
+    /// TIPO guardado, no cuándo se guarda ni cuándo se tira:
+    ///
+    /// 1. Solo hay una forma de que el contenido de una página cambie:
+    ///    `Pager::write` (y su envoltorio `write_encrypted`). Sigue
+    ///    borrando la entrada de la caché justo después de escribir, así
+    ///    que ninguna lectura POSTERIOR a esa escritura puede acertar
+    ///    contra la entrada vieja — ni validada ni cruda. Es la misma línea
+    ///    de código que antes.
+    /// 2. `truncate` sigue descartando toda entrada por encima del corte,
+    ///    antes de recortar, por el mismo motivo que ya documenta.
+    /// 3. Una escritura de la transacción en curso pasa siempre por
+    ///    `WriteTxn::write_page` → `Pager::write_encrypted` → `Pager::write`
+    ///    (`tx.rs`), así que entra en el punto 1. No hay ninguna vía que
+    ///    escriba una página del árbol saltándose `Pager::write`: la única
+    ///    escritura directa al medio es la de la cabecera en
+    ///    `relocate_meta_b`, sobre la página 0, que nadie lee por aquí.
+    /// 4. Quien ya SOSTIENE una página puede seguir viéndola después de que
+    ///    otro la reescriba — pero eso pasaba idéntico cuando lo que
+    ///    sostenía era `Arc<[u8]>`: los bytes clonados no se enteraban de
+    ///    la escritura. Que ningún lector vivo sostenga una página que el
+    ///    escritor va a reescribir no lo garantiza esta capa, sino la de
+    ///    transacciones (lista de libres más tabla de lectores); ver la
+    ///    documentación de `write`, más abajo, que ya lo decía y sigue
+    ///    valiendo palabra por palabra.
+    ///
+    /// Dicho al revés: si este cambio pudiera servir una página validada
+    /// obsoleta, la versión anterior habría servido los BYTES obsoletos de
+    /// esa misma página, y el `parse` del llamante los habría aceptado —
+    /// son bytes con su CRC correcto, solo que de otro momento. El fallo
+    /// que hay que evitar no es "validar demasiado pronto", es "no
+    /// invalidar", y de eso no se ha tocado nada.
+    pub fn read(&self, page_no: PageNo) -> Result<ValidPage> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         {
             let mut c = self.cache.lock().unwrap();
@@ -159,7 +221,7 @@ impl Pager {
             let tick = c.tick;
             if let Some(e) = c.entries.iter_mut().find(|e| e.page_no == page_no) {
                 e.used = tick;
-                return Ok(Arc::clone(&e.bytes));
+                return Ok(e.page.clone());
             }
         }
 
@@ -184,9 +246,37 @@ impl Pager {
             Some(enc) => Arc::from(self.decrypt(enc, page_no, buf)?.into_boxed_slice()),
         };
 
+        // Validar ANTES de cachear, por el mismo motivo por el que se
+        // descifra antes de cachear: una entrada de caché es una respuesta
+        // ya preparada, y una página que no pasa `parse` no es una
+        // respuesta que se pueda dar. Una página corrupta, además, no entra
+        // en la caché — así que no ocupa sitio ni se le vuelve a preguntar.
+        let page = ValidPage::parse(bytes, page_no)?;
+
         let mut c = self.cache.lock().unwrap();
-        c.insert(page_no, Arc::clone(&bytes));
-        Ok(bytes)
+        c.insert(page_no, page.clone());
+        Ok(page)
+    }
+
+    /// Bytes crudos de una página, SIN validar y sin tocar la caché.
+    ///
+    /// Solo pruebas: las dos que escriben una página que a propósito no es
+    /// una página válida (`commit_makes_writes_visible_to_new_readers` en
+    /// `tx.rs`, que usa un relleno reconocible como marca) o que esperan
+    /// que el descifrado falle antes de cualquier otra cosa
+    /// (`a_sealed_page_moved_to_another_number_fails_to_open` en
+    /// `crypto.rs`). No cachea a propósito: lo que devuelve no ha pasado
+    /// por `parse`, así que no tiene nada que hacer en una caché cuya
+    /// invariante es justo la contraria.
+    #[cfg(test)]
+    pub fn read_bytes(&self, page_no: PageNo) -> Result<Arc<[u8]>> {
+        let page_size = self.geometry().page_size;
+        let mut buf = vec![0u8; page_size as usize];
+        self.storage.read_at(self.offset(page_no), &mut buf)?;
+        Ok(match &self.encryption {
+            None => Arc::from(buf.into_boxed_slice()),
+            Some(enc) => Arc::from(self.decrypt(enc, page_no, buf)?.into_boxed_slice()),
+        })
     }
 
     /// Descifra `buf` (el contenido físico completo recién leído) y devuelve
@@ -406,7 +496,7 @@ impl Pager {
 }
 
 impl Cache {
-    fn insert(&mut self, page_no: PageNo, bytes: Arc<[u8]>) {
+    fn insert(&mut self, page_no: PageNo, page: ValidPage) {
         if self.budget == 0 {
             return;
         }
@@ -422,7 +512,7 @@ impl Cache {
                 self.entries.swap_remove(i);
             }
         }
-        self.entries.push(Entry { page_no, bytes, used: self.tick });
+        self.entries.push(Entry { page_no, page, used: self.tick });
     }
 
     fn remove(&mut self, page_no: PageNo) {
@@ -449,32 +539,76 @@ mod tests {
         Pager::new(Box::new(MemStorage::new()), geometry(), cache_pages)
     }
 
+    /// Una página VÁLIDA con una marca reconocible en su campo `extra`.
+    ///
+    /// Antes bastaba con `vec![0u8; 512]` y un byte suelto cambiado: la
+    /// caché guardaba bytes crudos y `Pager::read` no miraba lo que
+    /// devolvía. Desde que guarda páginas ya validadas, `read` llama a
+    /// `PageRef::parse`, y un relleno arbitrario no es una página — sería
+    /// `Err(Corrupt)`. La marca se lee de vuelta con `extra()` en vez de
+    /// indexando un byte.
+    fn marked_page(mark: u32) -> alloc::vec::Vec<u8> {
+        let mut b = crate::page::PageBuilder::new(512, crate::page::PageType::Leaf);
+        b.set_extra(mark);
+        b.build(&[]).unwrap()
+    }
+
     #[test]
     fn reads_back_a_written_page() {
         let p = pager(4);
-        let mut page = alloc::vec![0u8; 512];
-        page[100] = 42;
-        p.write(3, &page).unwrap();
-        assert_eq!(p.read(3).unwrap()[100], 42);
+        p.write(3, &marked_page(42)).unwrap();
+        assert_eq!(p.read(3).unwrap().page().extra(), 42);
     }
 
     #[test]
     fn a_rewritten_page_is_not_served_stale_from_cache() {
         let p = pager(4);
-        let mut page = alloc::vec![0u8; 512];
-        p.write(3, &page).unwrap();
-        assert_eq!(p.read(3).unwrap()[100], 0);
-        page[100] = 9;
-        p.write(3, &page).unwrap();
-        assert_eq!(p.read(3).unwrap()[100], 9, "write invalida la entrada cacheada");
+        p.write(3, &marked_page(0)).unwrap();
+        assert_eq!(p.read(3).unwrap().page().extra(), 0);
+        p.write(3, &marked_page(9)).unwrap();
+        assert_eq!(
+            p.read(3).unwrap().page().extra(),
+            9,
+            "write invalida la entrada cacheada"
+        );
+    }
+
+    /// El riesgo propio de cachear páginas YA VALIDADAS: que una entrada
+    /// validada sobreviva a una escritura y se siga sirviendo como buena.
+    /// La página 3 se cachea validada, y encima se escriben bytes que NO
+    /// forman una página; la lectura siguiente tiene que ver la corrupción,
+    /// no la validación vieja.
+    #[test]
+    fn a_page_overwritten_with_garbage_is_not_served_from_the_validated_entry() {
+        let p = pager(4);
+        p.write(3, &marked_page(7)).unwrap();
+        assert_eq!(p.read(3).unwrap().page().extra(), 7);
+        assert!(p.is_cached(3));
+
+        p.write(3, &alloc::vec![0xabu8; 512]).unwrap();
+        assert!(
+            matches!(p.read(3), Err(crate::Error::Corrupt { page: 3, .. })),
+            "una entrada validada no puede sobrevivir a la reescritura de su pagina"
+        );
+    }
+
+    /// Una página que no pasa `parse` no entra en la caché: si entrara,
+    /// ocuparía un hueco del presupuesto para no poder servirse nunca, y el
+    /// error tendría que volver a producirse desde una entrada guardada.
+    #[test]
+    fn a_corrupt_page_is_rejected_and_never_cached() {
+        let p = pager(4);
+        p.write(3, &alloc::vec![0xabu8; 512]).unwrap();
+        assert!(matches!(p.read(3), Err(crate::Error::Corrupt { page: 3, .. })));
+        assert_eq!(p.cached_pages(), 0);
+        assert!(!p.is_cached(3));
     }
 
     #[test]
     fn cache_never_grows_past_its_budget() {
         let p = pager(2);
-        let page = alloc::vec![0u8; 512];
         for n in 0..10 {
-            p.write(n, &page).unwrap();
+            p.write(n, &marked_page(n)).unwrap();
             p.read(n).unwrap();
         }
         // No basta con "<= 2": un `insert` que no hiciera nada con ningún
@@ -492,10 +626,10 @@ mod tests {
     #[test]
     fn eviction_prefers_the_least_recently_used_entry() {
         let p = pager(2);
-        let page = alloc::vec![0u8; 512];
-        p.write(0, &page).unwrap();
+        for n in 0..3 {
+            p.write(n, &marked_page(n)).unwrap();
+        }
         p.read(0).unwrap();
-        p.write(1, &page).unwrap();
         p.read(1).unwrap();
 
         // Tocar la página 0 la vuelve la más recientemente usada; la 1
@@ -504,7 +638,6 @@ mod tests {
         // con "la 0 es la más vieja" y desalojaría la equivocada.
         p.read(0).unwrap();
 
-        p.write(2, &page).unwrap();
         p.read(2).unwrap();
 
         assert_eq!(p.cached_pages(), 2);
@@ -516,8 +649,7 @@ mod tests {
     #[test]
     fn a_zero_page_budget_disables_caching() {
         let p = pager(0);
-        let page = alloc::vec![0u8; 512];
-        p.write(1, &page).unwrap();
+        p.write(1, &marked_page(1)).unwrap();
         p.read(1).unwrap();
         assert_eq!(p.cached_pages(), 0);
     }
@@ -525,8 +657,7 @@ mod tests {
     #[test]
     fn file_pages_rounds_down_to_whole_pages() {
         let p = pager(1);
-        let page = alloc::vec![0u8; 512];
-        p.write(4, &page).unwrap();
+        p.write(4, &marked_page(0)).unwrap();
         assert_eq!(p.file_pages().unwrap(), 5);
     }
 

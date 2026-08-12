@@ -144,7 +144,7 @@ pub fn descend(src: &impl PageSource, root: PageNo, key: &[u8]) -> Result<Option
                 kind: crate::CorruptKind::TreeLoop,
             });
         }
-        let valid = ValidPage::parse(src.read_page(current)?, current)?;
+        let valid = src.read_page(current)?;
         // El `PageRef` se suelta antes de decidir qué hacer: si esta página
         // es la hoja, `valid` sale de la función, y no puede salir mientras
         // haya un préstamo suyo vivo.
@@ -323,11 +323,12 @@ pub fn read_overflow(src: &impl PageSource, len: u64, first: PageNo) -> Result<V
     // Ver el comentario de la función.
     let in_file = u64::from(src.max_pages()).max(1);
     while current != 0 && (out.len() as u64) < len {
-        let bytes = src.read_page(current)?;
-        let page = PageRef::parse(&bytes, current)?;
+        let valid = src.read_page(current)?;
+        let page = valid.page();
         if page.page_type() != PageType::Overflow {
             return Err(Error::Corrupt { page: current, kind: CorruptKind::PageType });
         }
+        let bytes = valid.bytes();
         let available = bytes.len() - PAGE_HEADER_SIZE;
         let max = *max_hops.get_or_insert_with(|| {
             let capacity = core::cmp::max(available as u64, 1);
@@ -415,8 +416,8 @@ pub fn free_overflow(tx: &mut WriteTxn, len: u64, first: PageNo) -> Result<()> {
         if hops > max_hops {
             return Err(Error::Corrupt { page: first, kind: CorruptKind::OverflowLoop });
         }
-        let bytes = tx.read_page(current)?;
-        let page = PageRef::parse(&bytes, current)?;
+        let valid = tx.read_page(current)?;
+        let page = valid.page();
         // Como en `read_overflow`: sin comprobar el tipo, una cadena `first`
         // corrupta que apuntara a una página viva del árbol (hoja o
         // interna) liberaría esa página en vez de fallar — el campo
@@ -830,8 +831,8 @@ fn insert_rec(
     if depth > MAX_DEPTH {
         return Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::TreeLoop });
     }
-    let bytes = tx.read_page(page_no)?;
-    let page = PageRef::parse(&bytes, page_no)?;
+    let valid = tx.read_page(page_no)?;
+    let page = valid.page();
 
     match page.page_type() {
         PageType::Leaf => {
@@ -1078,8 +1079,8 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
     if depth > MAX_DEPTH {
         return Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::TreeLoop });
     }
-    let bytes = tx.read_page(page_no)?;
-    let page = PageRef::parse(&bytes, page_no)?;
+    let valid = tx.read_page(page_no)?;
+    let page = valid.page();
 
     match page.page_type() {
         PageType::Leaf => {
@@ -1545,8 +1546,8 @@ fn free_subtree(
         return Err(Error::Corrupt { page: page_no, kind: CorruptKind::TreeLoop });
     }
     budget.charge(page_no)?;
-    let bytes = tx.read_page(page_no)?;
-    let page = PageRef::parse(&bytes, page_no)?;
+    let valid = tx.read_page(page_no)?;
+    let page = valid.page();
     match page.page_type() {
         PageType::Leaf => {
             // Las cadenas de overflow sí exigen abrir la hoja, porque sus
@@ -1676,8 +1677,8 @@ fn delete_range_rec(
     }
 
     budget.charge(page_no)?;
-    let bytes = tx.read_page(page_no)?;
-    let page = PageRef::parse(&bytes, page_no)?;
+    let valid = tx.read_page(page_no)?;
+    let page = valid.page();
 
     match page.page_type() {
         PageType::Leaf => {
@@ -2084,8 +2085,8 @@ impl<'a, S: PageSource> Cursor<'a, S> {
             if depth > MAX_DEPTH {
                 return Err(Error::Corrupt { page: current, kind: CorruptKind::TreeLoop });
             }
-            let bytes = self.src.read_page(current)?;
-            let page = PageRef::parse(&bytes, current)?;
+            let valid = self.src.read_page(current)?;
+            let page = valid.page();
             match page.page_type() {
                 PageType::Leaf => {
                     let idx = match search_key(&page, key) {
@@ -2157,8 +2158,8 @@ impl<'a, S: PageSource> Cursor<'a, S> {
             };
             let page_no = *page_no;
             Self::charge(work, page_no)?;
-            let bytes = self.src.read_page(page_no)?;
-            let page = PageRef::parse(&bytes, page_no)?;
+            let valid = self.src.read_page(page_no)?;
+            let page = valid.page();
             // `extra` es el hijo con índice `n_slots`, así que hay hijo
             // siguiente mientras el índice no lo haya superado.
             if *idx >= page.n_slots() {
@@ -2173,8 +2174,8 @@ impl<'a, S: PageSource> Cursor<'a, S> {
                     return Err(Error::Corrupt { page: current, kind: CorruptKind::TreeLoop });
                 }
                 Self::charge(work, current)?;
-                let bytes = self.src.read_page(current)?;
-                let p = PageRef::parse(&bytes, current)?;
+                let valid = self.src.read_page(current)?;
+                let p = valid.page();
                 self.stack.push((current, 0));
                 match p.page_type() {
                     PageType::Leaf => return Ok(true),
@@ -2227,8 +2228,8 @@ impl<'a, S: PageSource> Cursor<'a, S> {
                 return Ok(None);
             };
             Self::charge(&mut work, leaf)?;
-            let bytes = self.src.read_page(leaf)?;
-            let page = PageRef::parse(&bytes, leaf)?;
+            let valid = self.src.read_page(leaf)?;
+            let page = valid.page();
 
             if idx >= page.n_slots() {
                 if !self.advance_to_next_leaf(&mut work)? {
@@ -2761,8 +2762,8 @@ mod invariant_tests {
     /// Aquí, en una prueba, sí toca: es el criterio de verdad contra el que
     /// `check_invariants` contrasta el bit `children_plain()`.
     fn child_is_actually_plain(tx: &impl PageSource, child: PageNo) -> bool {
-        let bytes = tx.read_page(child).unwrap();
-        let page = PageRef::parse(&bytes, child).unwrap();
+        let valid = tx.read_page(child).unwrap();
+        let page = valid.page();
         page.page_type() == PageType::Leaf
             && (0..page.n_slots())
                 .all(|i| !matches!(page.leaf_value(i), LeafValue::Overflow { .. }))
@@ -2784,8 +2785,8 @@ mod invariant_tests {
         visited: &mut BTreeSet<PageNo>,
     ) {
         assert!(visited.insert(page_no), "página {page_no} referenciada dos veces en el árbol");
-        let bytes = tx.read_page(page_no).unwrap();
-        let page = PageRef::parse(&bytes, page_no).unwrap();
+        let valid = tx.read_page(page_no).unwrap();
+        let page = valid.page();
         match page.page_type() {
             PageType::Leaf => {
                 let mut prev: Option<Vec<u8>> = None;
@@ -2875,8 +2876,8 @@ mod invariant_tests {
     /// Recorre el árbol y acumula cuántas entradas guarda CADA hoja. Es la
     /// materia prima de las dos pruebas de política de división de abajo.
     fn leaf_slot_counts(tx: &impl PageSource, page_no: PageNo, out: &mut Vec<usize>) {
-        let bytes = tx.read_page(page_no).unwrap();
-        let page = PageRef::parse(&bytes, page_no).unwrap();
+        let valid = tx.read_page(page_no).unwrap();
+        let page = valid.page();
         match page.page_type() {
             PageType::Leaf => out.push(page.n_slots()),
             PageType::Internal => {
@@ -3510,8 +3511,8 @@ mod delete_invariant_tests {
     /// esta prueba comprueba antes de borrarla, para no dar por hecho el
     /// propio mecanismo que quiere ejercitar.
     fn first_root_separator(tx: &WriteTxn, root: PageNo) -> Vec<u8> {
-        let bytes = tx.read_page(root).unwrap();
-        let page = PageRef::parse(&bytes, root).unwrap();
+        let valid = tx.read_page(root).unwrap();
+        let page = valid.page();
         assert_eq!(page.page_type(), PageType::Internal, "se esperaba una raíz interna");
         page.key(0)
     }
@@ -3604,8 +3605,8 @@ mod delete_invariant_tests {
             "la raíz colapsada debe ser exactamente la hoja superviviente, sin nivel intermedio"
         );
 
-        let bytes = tx.read_page(root).unwrap();
-        let page = PageRef::parse(&bytes, root).unwrap();
+        let valid = tx.read_page(root).unwrap();
+        let page = valid.page();
         assert_eq!(page.page_type(), PageType::Leaf, "el nodo interno de un solo hijo debe desaparecer");
 
         assert_eq!(get(&tx, root, b"aa").unwrap(), None);
@@ -3674,8 +3675,8 @@ mod delete_invariant_tests {
         let (root, existed) = delete(&mut tx, root, b"zz").unwrap();
         assert!(existed, "la segunda clave de la hoja `extra` también existía");
 
-        let bytes = tx.read_page(root).unwrap();
-        let page = PageRef::parse(&bytes, root).unwrap();
+        let valid = tx.read_page(root).unwrap();
+        let page = valid.page();
         assert_eq!(page.page_type(), PageType::Internal, "queda un separador: no debe colapsar");
         assert_eq!(page.n_slots(), 1, "el separador `mm` de la celda de `middle` debe perderse");
         assert_eq!(page.key(0), b"gg");
@@ -4520,7 +4521,7 @@ mod cursor_tests {
     }
 
     impl<'a, S: PageSource> PageSource for FlakySource<'a, S> {
-        fn read_page(&self, page: PageNo) -> Result<alloc::sync::Arc<[u8]>> {
+        fn read_page(&self, page: PageNo) -> Result<crate::page::ValidPage> {
             let n = self.calls.get() + 1;
             self.calls.set(n);
             if n == self.fail_at {
@@ -4968,9 +4969,9 @@ mod range_tests {
         let db = seeded(10);
         let mut tx = db.begin_write().unwrap();
         let root = tx.root();
-        let bytes = tx.read_page(root).unwrap();
+        let valid = tx.read_page(root).unwrap();
         assert_eq!(
-            PageRef::parse(&bytes, root).unwrap().page_type(),
+            valid.page().page_type(),
             PageType::Leaf,
             "la prueba asume que 10 claves cortas caben en una sola hoja"
         );
@@ -5419,16 +5420,16 @@ mod range_accounting_tests {
         if !seen.insert(page_no) {
             return;
         }
-        let bytes = tx.read_page(page_no).unwrap();
-        let page = PageRef::parse(&bytes, page_no).unwrap();
+        let valid = tx.read_page(page_no).unwrap();
+        let page = valid.page();
         match page.page_type() {
             PageType::Leaf => {
                 for i in 0..page.n_slots() {
                     if let LeafValue::Overflow { first, .. } = page.leaf_value(i) {
                         let mut current = first;
                         while current != 0 && seen.insert(current) {
-                            let b = tx.read_page(current).unwrap();
-                            let p = PageRef::parse(&b, current).unwrap();
+                            let vp = tx.read_page(current).unwrap();
+                            let p = vp.page();
                             current = p.extra();
                         }
                     }

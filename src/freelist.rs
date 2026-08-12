@@ -1,7 +1,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec;
 
-use crate::page::{PageRef, PageType, PAGE_HEADER_SIZE};
+use crate::page::{PageType, ValidPage, PAGE_HEADER_SIZE};
 use crate::pager::Pager;
 use crate::{crc32, CorruptKind, Error, PageNo, Result, TxnId};
 
@@ -99,11 +99,12 @@ impl PageDomain {
 /// en `load`, para no duplicar (y arriesgar desincronizar) la comprobación
 /// de límites.
 fn decode_freelist_page(
-    bytes: &[u8],
+    valid: &ValidPage,
     page_no: PageNo,
     domain: &PageDomain,
 ) -> Result<(TxnId, VecDeque<PageNo>, PageNo)> {
-    let p = PageRef::parse(bytes, page_no)?;
+    let bytes = valid.bytes();
+    let p = valid.page();
     if p.page_type() != PageType::Freelist {
         return Err(Error::Corrupt { page: page_no, kind: CorruptKind::PageType });
     }
@@ -283,8 +284,8 @@ impl Freelist {
         // medio que antes de esta corrección.
         f.fill_from_disk_in(pager, &domain)?;
         if head != tail {
-            let bytes = pager.read(tail)?;
-            let (max_txn, pages, _next) = decode_freelist_page(&bytes, tail, &domain)?;
+            let valid = pager.read(tail)?;
+            let (max_txn, pages, _next) = decode_freelist_page(&valid, tail, &domain)?;
             f.groups.push_back(Group { max_txn, pages, is_preloaded_tail: true });
             f.reclaimed.push_back(tail);
             f.dirty = true;
@@ -344,8 +345,8 @@ impl Freelist {
             return Err(Error::Corrupt { page: page_no, kind: CorruptKind::FreelistLoop });
         }
 
-        let bytes = pager.read(page_no)?;
-        let (max_txn, pages, next) = decode_freelist_page(&bytes, page_no, domain)?;
+        let valid = pager.read(page_no)?;
+        let (max_txn, pages, next) = decode_freelist_page(&valid, page_no, domain)?;
         if next == page_no {
             return Err(Error::Corrupt { page: page_no, kind: CorruptKind::FreelistLoop });
         }
@@ -497,8 +498,8 @@ impl Freelist {
                 if u64::from(hops) > u64::from(domain.file_pages) {
                     return Err(Error::Corrupt { page: p, kind: CorruptKind::FreelistLoop });
                 }
-                let bytes = pager.read(p)?;
-                let (_max_txn, _pages, next) = decode_freelist_page(&bytes, p, &domain)?;
+                let valid = pager.read(p)?;
+                let (_max_txn, _pages, next) = decode_freelist_page(&valid, p, &domain)?;
                 if next == p {
                     return Err(Error::Corrupt { page: p, kind: CorruptKind::FreelistLoop });
                 }
@@ -975,8 +976,8 @@ impl Freelist {
             if hops > limit {
                 return Err(Error::Corrupt { page: current, kind: CorruptKind::FreelistLoop });
             }
-            let bytes = pager.read(current)?;
-            let (_max_txn, pages, next) = decode_freelist_page(&bytes, current, &domain)?;
+            let valid = pager.read(current)?;
+            let (_max_txn, pages, next) = decode_freelist_page(&valid, current, &domain)?;
             visit(current, &pages);
             if next == current {
                 return Err(Error::Corrupt { page: current, kind: CorruptKind::FreelistLoop });

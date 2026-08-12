@@ -1,5 +1,10 @@
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
+// Solo en pruebas desde que la caché del `Pager` guarda páginas validadas:
+// el único `Arc` que queda en este fichero es el de `ReadTxn::read_page`
+// (gateado igual) y el de los `Storage` compartidos de los módulos de
+// prueba de más abajo, que lo toman de aquí por `use super::*`.
+#[cfg(test)]
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -11,6 +16,7 @@ use crate::freelist::Freelist;
 use crate::header::{Geometry, FORMAT_MAJOR, MAX_PAGE_SIZE, MIN_PAGE_SIZE, FLAG_ENCRYPTED};
 use crate::index::{index_key, primary_of, IndexDef, CATALOG_NS, INDEX_NS_BASE};
 use crate::meta::{Meta, MetaSlot};
+use crate::page::ValidPage;
 use crate::pager::Pager;
 use crate::{Error, PageNo, Result, Storage, TxnId};
 
@@ -965,7 +971,7 @@ impl<'db> ReadTxn<'db> {
     /// mano.
     #[cfg(test)]
     pub(crate) fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
-        self.db.pager.read(page)
+        self.db.pager.read_bytes(page)
     }
 
     pub fn get(&self, ns: u8, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -1064,7 +1070,10 @@ pub(crate) fn scoped(ns: u8, key: &[u8]) -> Vec<u8> {
 /// entero, no cada implementación por separado, así que dejar el trait
 /// público habría dejado la misma puerta abierta con otro nombre.
 pub(crate) trait PageSource {
-    fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>>;
+    /// Una página YA VALIDADA, no bytes crudos: quien la recibe no vuelve a
+    /// llamar a `PageRef::parse`. La validación ocurre una sola vez, al
+    /// entrar en la caché del `Pager` — ver `Pager::read`.
+    fn read_page(&self, page: PageNo) -> Result<ValidPage>;
 
     /// Páginas que existen en el fichero según el snapshot de ESTA
     /// transacción: la cota superior del número de páginas DISTINTAS que
@@ -1084,7 +1093,7 @@ pub(crate) trait PageSource {
 }
 
 impl PageSource for ReadTxn<'_> {
-    fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
+    fn read_page(&self, page: PageNo) -> Result<ValidPage> {
         self.db.pager.read(page)
     }
 
@@ -1094,7 +1103,7 @@ impl PageSource for ReadTxn<'_> {
 }
 
 impl PageSource for WriteTxn<'_> {
-    fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
+    fn read_page(&self, page: PageNo) -> Result<ValidPage> {
         self.db.pager.read(page)
     }
 
@@ -1679,7 +1688,7 @@ impl<'db> WriteTxn<'db> {
         }
     }
 
-    pub(crate) fn read_page(&self, page: PageNo) -> Result<Arc<[u8]>> {
+    pub(crate) fn read_page(&self, page: PageNo) -> Result<ValidPage> {
         self.db.pager.read(page)
     }
 
@@ -3057,8 +3066,8 @@ fn audit_walk_tree(
     if !mark(page_no) {
         return Ok(false);
     }
-    let bytes = pager.read(page_no)?;
-    let page = crate::page::PageRef::parse(&bytes, page_no)?;
+    let valid = pager.read(page_no)?;
+    let page = valid.page();
     let mut ok = true;
     match page.page_type() {
         crate::page::PageType::Leaf => {
@@ -3097,8 +3106,8 @@ fn audit_walk_overflow(
             ok = false;
             break;
         }
-        let bytes = pager.read(current)?;
-        let page = crate::page::PageRef::parse(&bytes, current)?;
+        let valid = pager.read(current)?;
+        let page = valid.page();
         if page.page_type() != crate::page::PageType::Overflow {
             return Err(Error::Corrupt { page: current, kind: crate::CorruptKind::PageType });
         }
