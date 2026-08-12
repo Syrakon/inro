@@ -13,6 +13,19 @@ pub enum Error {
     BadFormat,
     /// El fichero usa una versión de formato que este binario no entiende.
     VersionTooNew { found: u16, supported: u16 },
+    /// Este proceso ya tiene abierto ese mismo fichero (`FileStorage::open`,
+    /// comparando rutas CANONICALIZADAS: `./base` y `/abs/base` son la
+    /// misma). Dos asas independientes sobre un fichero significan dos
+    /// `Db::write_lock` distintos —el escritor único deja de serlo, y el
+    /// copy-on-write de dos escritores concurrentes es corrupción— y, con
+    /// cifrado, dos `live_counter` independientes, es decir los MISMOS
+    /// nonces bajo la misma clave de datos: dos textos cifrados con el
+    /// mismo nonce se anulan al XOR y revelan el texto plano.
+    ///
+    /// No cubre un SEGUNDO PROCESO: ver la sección 3.4 de la
+    /// especificación. Quien reparta un mismo fichero entre varios procesos
+    /// tiene que excluirlos por su cuenta.
+    AlreadyOpen,
     /// Ya hay una transacción de escritura en curso en este proceso.
     WriterBusy,
     /// La transacción de escritura anterior entró en pánico mientras tenía

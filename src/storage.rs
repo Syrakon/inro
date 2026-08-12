@@ -27,10 +27,11 @@ pub use imp_std::{Fault, FaultStorage, FileStorage, MemStorage};
 mod imp_std {
     use super::Storage;
     use crate::{Error, IoError, Result};
+    use std::collections::BTreeSet;
     use std::fs::{File, OpenOptions};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
     /// Cualquier `Arc<S>` sobre un medio es, a su vez, un medio (tarea 20):
     /// un arnés de pruebas necesita conservar un asa (`Arc::clone`) tras
@@ -274,11 +275,103 @@ mod imp_std {
         }
     }
 
+    /// Ficheros que ESTE proceso tiene abiertos ahora mismo, por ruta
+    /// canonicalizada.
+    ///
+    /// Existe porque `Db` no tiene ningún estado compartido entre asas: dos
+    /// `Db` sobre el mismo fichero traen cada uno su `write_lock` (el
+    /// escritor único deja de ser único, y dos escritores copy-on-write
+    /// sobre un mismo fichero es corrupción, con cifrado o sin él) y, con
+    /// cifrado, su propio `WriterState::live_counter` — que arranca en el
+    /// mismo `write_counter` de la meta para los dos, así que ambos reparten
+    /// LOS MISMOS contadores y, con ellos, los mismos nonces `página ||
+    /// contador` bajo la misma clave de datos. Dos textos cifrados con el
+    /// mismo nonce se anulan al XOR: eso no es "un árbol corrupto", es la
+    /// pérdida total de la confidencialidad que la feature existe para dar.
+    /// `NonceReuse` no lo ve: comprueba la unicidad DENTRO de una
+    /// transacción, y aquí cada asa es coherente consigo misma.
+    ///
+    /// **Solo cubre este proceso, y es todo lo que se puede cubrir aquí**
+    /// (ver la sección 3.4 de la especificación, corregida en esta misma
+    /// ronda): `flock(2)` no es alcanzable — `std` no lo expone, `libc`/
+    /// `rustix` exigen `unsafe` (prohibido en todo el crate por
+    /// `[lints.rust] unsafe_code = "forbid"`) y `fs4`/`fs2` serían una
+    /// dependencia de runtime; un fichero `.lock` al lado sí sería posible
+    /// con cero dependencias, pero renuncia justo a la ventaja sobre LMDB
+    /// que la sección 3.4 reclama dos párrafos antes. Quien reparta un
+    /// fichero entre varios PROCESOS tiene que excluirlos por su cuenta.
+    ///
+    /// `BTreeSet` y no `HashSet`: es `const`-construible, así que el
+    /// registro es un `static` sin `OnceLock` ni inicialización perezosa, y
+    /// se ahorra el estado del hasher aleatorio. Con un puñado de bases
+    /// abiertas por proceso, la diferencia entre O(log n) y O(1) en una
+    /// operación que ocurre dos veces por apertura no se mide.
+    static OPEN_FILES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+    /// El envenenamiento se ignora a propósito. La sección crítica es un
+    /// `insert` o un `remove` y nada más — ni código del llamante ni
+    /// asignaciones que puedan entrar en pánico a mitad — así que un
+    /// `BTreeSet` envenenado es un `BTreeSet` íntegro. Propagarlo con
+    /// `unwrap()` convertiría un pánico ajeno en "esta base ya no se puede
+    /// abrir NI CERRAR en lo que queda de proceso", y en `Drop` sería un
+    /// pánico durante un pánico, es decir un abort.
+    fn open_files() -> MutexGuard<'static, BTreeSet<PathBuf>> {
+        OPEN_FILES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Reserva viva de una ruta en `OPEN_FILES`. Toda la garantía de
+    /// liberación está en el `Drop` de este tipo, no en los caminos de
+    /// error de nadie: una entrada fugada dejaría el fichero imposible de
+    /// abrir durante el resto de la vida del proceso, que es peor que el
+    /// fallo que esto corrige.
+    struct PathGuard {
+        path: PathBuf,
+    }
+
+    impl PathGuard {
+        /// Comprueba y reserva bajo el MISMO candado: `insert` devuelve
+        /// `false` si ya estaba, así que no hay ventana entre mirar y
+        /// apuntarse por la que dos hilos puedan colarse a la vez.
+        fn acquire(path: PathBuf) -> Result<Self> {
+            if !open_files().insert(path.clone()) {
+                return Err(Error::AlreadyOpen);
+            }
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            open_files().remove(&self.path);
+        }
+    }
+
     pub struct FileStorage {
         file: File,
+        /// Nunca se lee: su único valor es el `Drop`, que devuelve la ruta
+        /// al registro. Vive DENTRO de `FileStorage` para que la liberación
+        /// no dependa de que nadie se acuerde de nada: el asa muere cuando
+        /// muere el `Box<dyn Storage>` que la posee, y eso ocurre igual si
+        /// `Db::open` devuelve `Ok` y el `Db` se suelta más tarde que si
+        /// falla a medias (`BadFormat`, `VersionTooNew`, `Corrupt`, la
+        /// clave equivocada de una base cifrada…) y el `Box` que recibió
+        /// por valor se destruye al retornar el `Err`.
+        _registry: PathGuard,
     }
 
     impl FileStorage {
+        /// Abre `path` para lectura y escritura, creándolo si no existe, y
+        /// lo reserva en el registro de este proceso: una SEGUNDA apertura
+        /// del mismo fichero mientras la primera siga viva falla con
+        /// `Error::AlreadyOpen` en vez de entregar un asa independiente.
+        ///
+        /// Esta comprobación vive aquí, y no en `Db::create`/`Db::open`,
+        /// porque aquí es donde hay una RUTA: aquellos reciben un
+        /// `Box<dyn Storage>` ya construido y no pueden saber qué fichero
+        /// —si es que hay alguno— hay detrás. Ponerla aquí, además, cubre a
+        /// cualquiera que abra el mismo fichero para algo que no sea un
+        /// `Db`, y deja `MemStorage`/`FaultStorage` intactos: no tienen
+        /// ruta, dos de ellos son dos bases distintas.
         pub fn open(path: &Path) -> Result<Self> {
             let file = OpenOptions::new()
                 .read(true)
@@ -286,7 +379,15 @@ mod imp_std {
                 .create(true)
                 .open(path)
                 .map_err(map_io)?;
-            Ok(Self { file })
+            // Canonicaliza DESPUÉS de abrir, no antes: `canonicalize` exige
+            // que la ruta exista ya, y `create(true)` de arriba es
+            // justamente lo que la crea la primera vez. Resuelve enlaces
+            // simbólicos, `.` y `..`, y devuelve una ruta absoluta, así que
+            // `base.inro` y `/tmp/x/base.inro` chocan como deben en vez de
+            // pasar por dos ficheros distintos.
+            let canonical = path.canonicalize().map_err(map_io)?;
+            let registry = PathGuard::acquire(canonical)?;
+            Ok(Self { file, _registry: registry })
         }
     }
 
@@ -386,5 +487,164 @@ mod tests {
         s.write_at(0, b"ab").unwrap();
         let mut buf = [0u8; 4];
         assert_eq!(s.read_at(0, &mut buf), Err(Error::Io(IoError::UnexpectedEof)));
+    }
+
+    // ---- Registro de ficheros abiertos (ver `OPEN_FILES`) ----
+
+    use crate::{Db, Options};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Ruta temporal única por prueba: las pruebas del mismo binario corren
+    /// en paralelo y el registro es GLOBAL AL PROCESO, así que dos que
+    /// compartieran fichero se refutarían entre ellas.
+    fn temp_path(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let name = format!("inro-open-{tag}-{}-{n}.inro", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn opening_the_same_file_twice_in_one_process_is_refused() {
+        let path = temp_path("doble");
+        let first = FileStorage::open(&path).unwrap();
+        assert_eq!(
+            FileStorage::open(&path).err(),
+            Some(Error::AlreadyOpen),
+            "dos asas sobre un fichero son dos `write_lock` y dos `live_counter`"
+        );
+        drop(first);
+
+        // El mismo caso por el camino que de verdad lo destapó: con un `Db`
+        // vivo sobre el fichero, no hay forma de construir el medio para un
+        // segundo `Db`, así que tampoco hay dos contadores de nonce.
+        let db = Db::create(Box::new(FileStorage::open(&path).unwrap()), Options::default()).unwrap();
+        assert_eq!(FileStorage::open(&path).err(), Some(Error::AlreadyOpen));
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// El mismo rechazo sobre una base CIFRADA: es el caso que de verdad
+    /// duele — dos asas reparten los mismos contadores desde el mismo
+    /// `write_counter` de la meta, así que sellan páginas con los mismos
+    /// nonces `página || contador` bajo la misma clave de datos.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn an_encrypted_database_refuses_the_second_handle_too() {
+        use crate::crypto::{Algorithm, Encryption};
+        let path = temp_path("cifrada");
+        let opts = Options {
+            encryption: Some(Encryption { key: [7u8; 32], algorithm: Algorithm::ChaCha20Poly1305 }),
+            ..Options::default()
+        };
+        let db = Db::create(Box::new(FileStorage::open(&path).unwrap()), opts).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        tx.put(1, b"k", b"v").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(FileStorage::open(&path).err(), Some(Error::AlreadyOpen));
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn closing_the_database_returns_its_path_to_the_registry() {
+        let path = temp_path("suelta");
+        let db = Db::create(Box::new(FileStorage::open(&path).unwrap()), Options::default()).unwrap();
+        drop(db);
+        let db = Db::open(Box::new(FileStorage::open(&path).unwrap()), Options::default()).unwrap();
+        drop(db);
+        // Una tercera vez: descarta que la liberación funcione una sola vez.
+        drop(FileStorage::open(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// El caso que convertiría la corrección en algo PEOR que el fallo: si
+    /// una apertura que falla DESPUÉS de reservar la ruta no la devolviera,
+    /// el fichero quedaría imposible de abrir durante el resto de la vida
+    /// del proceso.
+    #[test]
+    fn an_open_that_fails_after_registering_the_path_still_releases_it() {
+        let path = temp_path("fallida");
+        // Un fichero que no es una base inro: `FileStorage::open` reserva
+        // la ruta y `Db::open` falla más tarde, con el `Box<dyn Storage>`
+        // que recibió por valor destruyéndose al retornar el `Err`.
+        std::fs::write(&path, vec![0xabu8; 4096]).unwrap();
+        // `.err()`, no `unwrap_err()`: `Db` no implementa `Debug` (ni debe
+        // — ver `Encryption`, que redacta su clave precisamente para no
+        // acabar en un `{:?}`).
+        let first = Db::open(Box::new(FileStorage::open(&path).unwrap()), Options::default())
+            .err()
+            .expect("un fichero de basura no puede abrirse como base");
+        assert_ne!(first, Error::AlreadyOpen, "debe fallar por el contenido, no por el registro");
+
+        let second = Db::open(Box::new(FileStorage::open(&path).unwrap()), Options::default())
+            .err()
+            .expect("sigue siendo basura");
+        assert_eq!(second, first, "el mismo fallo, no `AlreadyOpen`: la ruta se liberó");
+
+        // Y una apertura REHUSADA tampoco deja rastro: la reserva es de
+        // quien la consiguió, y sigue siéndolo hasta que la suelta.
+        let held = FileStorage::open(&path).unwrap();
+        assert_eq!(FileStorage::open(&path).err(), Some(Error::AlreadyOpen));
+        drop(held);
+        drop(FileStorage::open(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Sin canonicalizar, `dir/base.inro` y `/abs/dir/base.inro` serían dos
+    /// entradas distintas del registro para un mismo fichero — es decir, el
+    /// fallo intacto para quien abra por rutas escritas de dos formas.
+    #[test]
+    fn a_relative_and_an_absolute_path_to_the_same_file_collide() {
+        // Bajo el directorio de trabajo, que es lo único que hace
+        // significativa una ruta RELATIVA. `target/` ya lo produce la propia
+        // compilación, así que no ensucia el árbol de fuentes.
+        let dir = std::path::Path::new("target").join("inro-open-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let relative = dir.join(format!("relativa-{}.inro", std::process::id()));
+        let absolute = std::env::current_dir().unwrap().join(&relative);
+        let _ = std::fs::remove_file(&absolute);
+        assert!(relative.is_relative() && absolute.is_absolute());
+
+        let held = FileStorage::open(&relative).unwrap();
+        assert_eq!(FileStorage::open(&absolute).err(), Some(Error::AlreadyOpen));
+        drop(held);
+
+        // Y en el otro sentido, para que no dependa de cuál se abrió antes.
+        let held = FileStorage::open(&absolute).unwrap();
+        assert_eq!(FileStorage::open(&relative).err(), Some(Error::AlreadyOpen));
+        drop(held);
+        let _ = std::fs::remove_file(&absolute);
+    }
+
+    #[test]
+    fn distinct_files_stay_independently_openable() {
+        let a = temp_path("distinta-a");
+        let b = temp_path("distinta-b");
+        let sa = FileStorage::open(&a).unwrap();
+        let sb = FileStorage::open(&b).unwrap();
+        exercise(&sa);
+        exercise(&sb);
+        drop((sa, sb));
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    /// El registro es de RUTAS: `MemStorage` no tiene ninguna, y dos medios
+    /// en memoria son dos bases distintas, no dos asas de la misma.
+    #[test]
+    fn the_registry_leaves_mem_storage_alone() {
+        let uno = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let dos = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        for db in [&uno, &dos] {
+            let mut tx = db.begin_write().unwrap();
+            tx.put(1, b"k", b"v").unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(uno.begin_read().get(1, b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert_eq!(dos.begin_read().get(1, b"k").unwrap().as_deref(), Some(&b"v"[..]));
     }
 }
