@@ -156,6 +156,23 @@ mod imp_std {
         /// escritura incluida): simula una escritura desgarrada, que es lo
         /// que de verdad hace un disco al perder la corriente a mitad de un
         /// sector — algo de la escritura SÍ llega al plato, el resto no.
+        ///
+        /// **Digno de registrar, no de corregir** (ronda de revisión de la
+        /// tarea 20): si `bytes` es mayor o igual que el contenido ÚTIL de
+        /// lo que se estaba escribiendo — para una ranura de meta,
+        /// `meta::META_SIZE` = 112, el resto de la página ya es relleno a
+        /// cero en ambos lados — el desgarro no desgarra NADA de contenido
+        /// real: lo que llega al plato es indistinguible de una escritura
+        /// completa. `write_at` sigue devolviendo `Err` de todos modos (así
+        /// lo define esta variante: "falla a partir de ahí", sin excepción
+        /// para el caso en que ya no quede nada útil por desgarrar), así
+        /// que el resultado observable es que el COMMIT QUEDA DURADERO DE
+        /// VERDAD aunque `WriteTxn::commit` devuelva `Err` — correcto (los
+        /// bytes llegaron), pero sorprendente para quien solo mire el
+        /// `Result`. Ver
+        /// `a_torn_write_of_the_meta_page_with_a_prefix_at_or_above_meta_size_lands_a_full_commit_anyway`
+        /// en `tests/faults.rs`, que documenta y fija este caso por
+        /// separado en vez de dejarlo como una sorpresa sin probar.
         TearAt { write: u64, bytes: usize },
     }
 
