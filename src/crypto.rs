@@ -965,6 +965,7 @@ mod tests {
         fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
         fn sync(&self) -> Result<()> { self.0.sync() }
         fn len(&self) -> Result<u64> { self.0.len() }
+        fn truncate(&self, len: u64) -> Result<()> { self.0.truncate(len) }
     }
 
     #[test]
@@ -2056,6 +2057,10 @@ mod tests {
         fn len(&self) -> Result<u64> {
             self.inner.len()
         }
+
+        fn truncate(&self, len: u64) -> Result<()> {
+            self.inner.truncate(len)
+        }
     }
 
     struct ArcPowerLoss(Arc<PowerLossStorage>);
@@ -2064,6 +2069,7 @@ mod tests {
         fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
         fn sync(&self) -> Result<()> { self.0.sync() }
         fn len(&self) -> Result<u64> { self.0.len() }
+        fn truncate(&self, len: u64) -> Result<()> { self.0.truncate(len) }
     }
 
     /// Sonda 3 de la segunda ronda de revisión (hallazgo HIGH): bajo
@@ -2144,6 +2150,7 @@ mod tests {
             self.inner.sync()
         }
         fn len(&self) -> Result<u64> { self.inner.len() }
+        fn truncate(&self, len: u64) -> Result<()> { self.inner.truncate(len) }
     }
     struct ArcSyncCounting(Arc<SyncCountingStorage>);
     impl Storage for ArcSyncCounting {
@@ -2151,6 +2158,7 @@ mod tests {
         fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
         fn sync(&self) -> Result<()> { self.0.sync() }
         fn len(&self) -> Result<u64> { self.0.len() }
+        fn truncate(&self, len: u64) -> Result<()> { self.0.truncate(len) }
     }
 
     /// Sonda 4 de la segunda ronda de revisión: el coste de sincronización

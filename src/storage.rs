@@ -18,6 +18,36 @@ pub trait Storage: Send + Sync {
     fn sync(&self) -> Result<()>;
 
     fn len(&self) -> Result<u64>;
+
+    /// Recorta el medio a `len` bytes y devuelve la cola al sistema de
+    /// ficheros. Es la única operación del trait que hace DESAPARECER bytes
+    /// ya escritos, y por eso su contrato es más estrecho que el del resto:
+    ///
+    /// - **Nunca extiende.** Si `len` es mayor o igual que la longitud
+    ///   actual, el medio se queda exactamente como estaba y la llamada
+    ///   devuelve `Ok(())`. `File::set_len` de la biblioteca estándar SÍ
+    ///   extiende con ceros, así que `FileStorage` lo comprueba antes de
+    ///   llamarla: una implementación que extendiera por accidente
+    ///   convertiría un error de cálculo del llamante en un fichero más
+    ///   grande, en silencio, justo en la operación que existe para hacerlo
+    ///   más pequeño.
+    /// - **No promete durabilidad por sí sola.** Como cualquier escritura,
+    ///   necesita un `sync()` posterior para que el nuevo tamaño sobreviva
+    ///   a un corte de corriente. Quien llama decide el orden; el motor lo
+    ///   fija en `Db::reclaim_tail` (`tx.rs`): la meta con el `n_pages`
+    ///   reducido se escribe y se sincroniza ANTES de recortar, nunca al
+    ///   revés, para que ninguna meta que pueda sobrevivir a un corte
+    ///   referencie una página más allá del final del fichero.
+    /// - **Parcial no existe.** Un corte durante un recorte deja el tamaño
+    ///   viejo o el nuevo, nunca uno intermedio: un `Storage` que no pueda
+    ///   ofrecer eso debe devolver `Err` en vez de recortar a medias (ver
+    ///   `FaultStorage`, que por eso modela un "desgarro" de recorte como
+    ///   un fallo total).
+    ///
+    /// El único llamador dentro del motor es `Db::reclaim_tail`, siempre
+    /// con el candado de escritor tomado y con un `len` múltiplo del tamaño
+    /// de página.
+    fn truncate(&self, len: u64) -> Result<()>;
 }
 
 #[cfg(feature = "std")]
@@ -59,6 +89,10 @@ mod imp_std {
 
         fn len(&self) -> Result<u64> {
             (**self).len()
+        }
+
+        fn truncate(&self, len: u64) -> Result<()> {
+            (**self).truncate(len)
         }
     }
 
@@ -135,6 +169,23 @@ mod imp_std {
 
         fn len(&self) -> Result<u64> {
             Ok(self.data.lock().unwrap().len() as u64)
+        }
+
+        /// `shrink_to_fit` además de `truncate`: sin él, `Vec::truncate`
+        /// baja la longitud pero conserva la CAPACIDAD, así que el medio en
+        /// memoria seguiría ocupando la RAM del pico histórico y las
+        /// pruebas de recuperación de espacio medirían una devolución que
+        /// no ha ocurrido. Es el equivalente en memoria de devolverle los
+        /// bloques al sistema de ficheros, que es de lo que trata esta
+        /// operación.
+        fn truncate(&self, len: u64) -> Result<()> {
+            let mut data = self.data.lock().unwrap();
+            let len = len as usize;
+            if len < data.len() {
+                data.truncate(len);
+                data.shrink_to_fit();
+            }
+            Ok(())
         }
     }
 
@@ -272,6 +323,32 @@ mod imp_std {
 
         fn len(&self) -> Result<u64> {
             self.inner.len()
+        }
+
+        /// **El recorte consume un ordinal de la MISMA secuencia que las
+        /// escrituras**, y no es un detalle de implementación: es lo que
+        /// deja apuntar un `Fault::AbortAt` a un recorte concreto igual que
+        /// a cualquier otra operación física, sin que la prueba tenga que
+        /// saber cuál de las dos cosas es la operación número N. Un
+        /// `Db::reclaim_tail` emite escrituras (lista de libres, dos
+        /// ranuras de meta) y UN recorte al final, y el barrido de
+        /// `tests/faults.rs` los recorre todos por ordinal sin distinguir
+        /// tipos — exactamente el mismo criterio con el que este arnés trata
+        /// ya la escritura de la meta.
+        ///
+        /// Un `TearAt` sobre un recorte falla ENTERO, sin recortar nada: el
+        /// tamaño de un fichero cambia o no cambia, no hay estado
+        /// intermedio que desgarrar (ver el contrato de `Storage::truncate`).
+        fn truncate(&self, len: u64) -> Result<()> {
+            let n = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
+            let fault = *self.fault.lock().unwrap();
+            match fault {
+                Some(Fault::AbortAt(k)) if n >= k => Err(Error::Io(IoError::WriteZero)),
+                Some(Fault::TearAt { write, .. }) if n >= write => {
+                    Err(Error::Io(IoError::WriteZero))
+                }
+                _ => self.inner.truncate(len),
+            }
         }
     }
 
@@ -412,6 +489,19 @@ mod imp_std {
 
         fn len(&self) -> Result<u64> {
             Ok(self.file.metadata().map_err(map_io)?.len())
+        }
+
+        /// La comprobación previa NO es defensiva de más: `File::set_len`
+        /// con un `len` mayor que el actual EXTIENDE el fichero con ceros
+        /// (así lo define `std`), que es justo lo contrario de lo que esta
+        /// operación promete — ver el contrato en el trait. Con ella,
+        /// `truncate` es monótona: solo puede dejar el fichero igual o más
+        /// pequeño, pase lo que pase por encima.
+        fn truncate(&self, len: u64) -> Result<()> {
+            if len >= self.len()? {
+                return Ok(());
+            }
+            self.file.set_len(len).map_err(map_io)
         }
     }
 

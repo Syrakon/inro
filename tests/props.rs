@@ -19,9 +19,10 @@
 #![cfg(feature = "std")]
 
 use inro::storage::MemStorage;
-use inro::{Db, IndexDef, Options};
+use inro::{Db, IndexDef, Options, Storage};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 enum Op {
@@ -271,6 +272,82 @@ proptest! {
                 "pagina perdida o contada dos veces tras {:?} (con indice secundario)",
                 op
             );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(), ..ProptestConfig::default() })]
+
+    /// Propiedad añadida con la recuperación de la cola: **intercalar
+    /// `Db::reclaim_tail` en una secuencia aleatoria de operaciones no
+    /// puede cambiar ni una sola respuesta del árbol, ni dejar ninguna
+    /// página sin dueño, ni sobrevivir mal a un cierre.**
+    ///
+    /// Es la propiedad que le corresponde comprobar a este fichero y no a
+    /// una prueba escrita a mano: un recorte decide qué páginas dejan de
+    /// existir a partir de la lista de libres, y las formas de lista que
+    /// dan problemas —tramos intermedios sin traer, grupos no servibles
+    /// mezclados con servibles, contenedores reciclándose entre sí— salen
+    /// de secuencias que a nadie se le ocurre escribir a propósito. Las
+    /// tres comprobaciones van tras CADA recorte, no solo al final, para
+    /// que la reducción de `proptest` señale la operación exacta.
+    ///
+    /// El `reopen` importa tanto como el resto: recortar mal no siempre se
+    /// nota en la sesión que recorta —el estado en memoria puede seguir
+    /// siendo coherente— sino al volver a montar desde el fichero, que es
+    /// donde `n_pages`, la cadena de libres y la longitud real tienen que
+    /// cuadrar entre sí.
+    #[test]
+    fn reclaiming_the_tail_never_changes_what_the_tree_answers(
+        ops in proptest::collection::vec(op_strategy(), 1..200)
+    ) {
+        let s = Arc::new(MemStorage::new());
+        let mut db = Db::create(Box::new(Arc::clone(&s)), Options::default()).unwrap();
+        let mut model = BTreeMap::new();
+
+        for (i, op) in ops.iter().enumerate() {
+            let mut tx = db.begin_write().unwrap();
+            match op {
+                Op::Put(k, v) => tx.put(0x01, k, v).unwrap(),
+                Op::Delete(k) => { tx.delete(0x01, k).unwrap(); }
+                Op::DeleteRange(a, b) => tx.delete_range(0x01, a, b).unwrap(),
+            }
+            tx.commit().unwrap();
+            apply(&mut model, op);
+
+            if i % 7 != 6 {
+                continue;
+            }
+            let before = s.len().unwrap();
+            let freed = db.reclaim_tail().unwrap();
+            let after = s.len().unwrap();
+            prop_assert_eq!(
+                before - after, freed,
+                "los bytes que dice devolver no son los que el fichero ha perdido"
+            );
+            prop_assert!(db.audit_pages().unwrap(), "pagina perdida o contada dos veces");
+
+            let r = db.begin_read();
+            let mut cursor = r.scan(0x01, b"", b"\xff\xff\xff\xff\xff\xff\xff").unwrap();
+            let mut actual = Vec::new();
+            while let Some(entry) = cursor.next().unwrap() {
+                actual.push(entry);
+            }
+            let expected: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            prop_assert_eq!(actual, expected, "divergencia tras recortar en la operacion {}", i);
+            drop(r);
+
+            // Y desde el fichero, no desde la memoria de esta sesión.
+            drop(db);
+            db = Db::open(Box::new(Arc::clone(&s)), Options::default()).unwrap();
+            prop_assert!(db.audit_pages().unwrap(), "contabilidad rota tras reabrir");
+        }
+
+        let r = db.begin_read();
+        for (k, v) in &model {
+            let stored = r.get(0x01, k).unwrap();
+            prop_assert_eq!(stored.as_ref(), Some(v));
         }
     }
 }

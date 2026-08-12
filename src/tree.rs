@@ -3074,6 +3074,9 @@ mod invariant_tests {
         fn len(&self) -> Result<u64> {
             self.0.len()
         }
+        fn truncate(&self, len: u64) -> Result<()> {
+            self.0.truncate(len)
+        }
     }
 
     /// Repetir puts sobre la MISMA clave, DENTRO de la misma transacción sin
@@ -3667,6 +3670,9 @@ mod delete_invariant_tests {
         }
         fn len(&self) -> Result<u64> {
             self.0.len()
+        }
+        fn truncate(&self, len: u64) -> Result<()> {
+            self.0.truncate(len)
         }
     }
 

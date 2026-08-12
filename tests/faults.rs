@@ -281,6 +281,9 @@ fn measure_header_primary_rewrite_ordinal() -> Option<u64> {
         fn len(&self) -> inro::Result<u64> {
             self.inner.len()
         }
+        fn truncate(&self, len: u64) -> inro::Result<()> {
+            self.inner.truncate(len)
+        }
     }
 
     let s = Arc::new(Recording { inner: MemStorage::new(), writes: Mutex::new(Vec::new()) });
@@ -858,11 +861,28 @@ fn relaxed_sync_loses_commits_but_never_corrupts() {
 // escenario en el que vive la sincronización relajada).
 // ---------------------------------------------------------------------
 
-/// Una escritura emitida contra el medio, con su ordinal global.
-struct PendingWrite {
-    ordinal: u64,
-    offset: u64,
-    bytes: Vec<u8>,
+/// Una operación emitida contra el medio, con su ordinal global.
+///
+/// **Dos variantes, no una** (recuperación de la cola libre): hasta que
+/// existió `Storage::truncate`, toda operación que cambiaba el medio era una
+/// escritura, y bastaba con guardar `(offset, bytes)`. Un recorte no es una
+/// escritura: no deposita bytes, hace desaparecer los que había del final. Si
+/// el arnés lo dejara pasar directamente a `inner` sin registrarlo, el corte
+/// de corriente NO PODRÍA perderlo — y perderlo es exactamente el caso que
+/// hay que probar, porque el recorte es lo último que hace `reclaim_tail` y
+/// por tanto lo primero que un corte se lleva. Registrado aquí, `cut` decide
+/// si llegó al plato igual que con cualquier escritura.
+enum PendingOp {
+    Write { ordinal: u64, offset: u64, bytes: Vec<u8> },
+    Truncate { ordinal: u64, len: u64 },
+}
+
+impl PendingOp {
+    fn ordinal(&self) -> u64 {
+        match self {
+            PendingOp::Write { ordinal, .. } | PendingOp::Truncate { ordinal, .. } => *ordinal,
+        }
+    }
 }
 
 /// Medio que modela un corte de corriente DE VERDAD: `sync()` marca un
@@ -901,10 +921,17 @@ struct PowerCutStorage {
     /// ahora mismo y no sobreviviera ninguna escritura pendiente: la foto
     /// del último `sync()` correcto.
     durable: Mutex<Vec<u8>>,
-    /// Escrituras emitidas desde ese `sync()`, en orden.
-    pending: Mutex<Vec<PendingWrite>>,
+    /// Operaciones emitidas desde ese `sync()`, en orden.
+    pending: Mutex<Vec<PendingOp>>,
     writes: std::sync::atomic::AtomicU64,
     syncs: std::sync::atomic::AtomicU64,
+    /// Ordinales de las operaciones que fueron un RECORTE, en toda la vida
+    /// del medio — a diferencia de `pending`, esto no lo borra ningún
+    /// `sync()`. Es lo que deja a una prueba decir "el cambio de tamaño sí
+    /// llegó al plato, lo demás no" sin codificar a mano en qué posición de
+    /// la secuencia cae el recorte: se MIDE, igual que `Acked::last_write`
+    /// mide dónde acaba cada commit.
+    truncations: Mutex<Vec<u64>>,
 }
 
 impl PowerCutStorage {
@@ -915,7 +942,13 @@ impl PowerCutStorage {
             pending: Mutex::new(Vec::new()),
             writes: std::sync::atomic::AtomicU64::new(0),
             syncs: std::sync::atomic::AtomicU64::new(0),
+            truncations: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Ordinales de todos los recortes emitidos hasta ahora.
+    fn truncations(&self) -> Vec<u64> {
+        self.truncations.lock().unwrap().clone()
     }
 
     /// Ordinal de la última escritura emitida (1 en adelante). La prueba lo
@@ -932,23 +965,39 @@ impl PowerCutStorage {
         self.syncs.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Corta la corriente: de las escrituras emitidas desde el último
+    /// Corta la corriente: de las operaciones emitidas desde el último
     /// `sync()`, sobreviven exactamente aquellas cuyo ordinal acepta
     /// `keep`; el resto no llegó nunca al plato. Tras esto, el medio
     /// contiene un estado que un `Db::open` real podría encontrarse.
+    ///
+    /// Se reproducen EN ORDEN, escrituras y recortes mezclados: un recorte
+    /// que sobrevive acorta la imagen, y una escritura posterior que
+    /// también sobreviva vuelve a extenderla — igual que en un fichero de
+    /// verdad. Reproducir solo las escrituras y aplicar los recortes al
+    /// final (o al revés) inventaría estados que ningún disco produce.
     fn cut(&self, keep: &mut dyn FnMut(u64) -> bool) {
         let mut image = self.durable.lock().unwrap().clone();
         let mut pending = self.pending.lock().unwrap();
-        for w in pending.iter() {
-            if !keep(w.ordinal) {
+        for op in pending.iter() {
+            if !keep(op.ordinal()) {
                 continue;
             }
-            let start = w.offset as usize;
-            let end = start + w.bytes.len();
-            if image.len() < end {
-                image.resize(end, 0);
+            match op {
+                PendingOp::Write { offset, bytes, .. } => {
+                    let start = *offset as usize;
+                    let end = start + bytes.len();
+                    if image.len() < end {
+                        image.resize(end, 0);
+                    }
+                    image[start..end].copy_from_slice(bytes);
+                }
+                PendingOp::Truncate { len, .. } => {
+                    let len = *len as usize;
+                    if len < image.len() {
+                        image.truncate(len);
+                    }
+                }
             }
-            image[start..end].copy_from_slice(&w.bytes);
         }
         pending.clear();
         self.inner.restore(image.clone());
@@ -963,7 +1012,7 @@ impl Storage for PowerCutStorage {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> inro::Result<()> {
         let ordinal = self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        self.pending.lock().unwrap().push(PendingWrite {
+        self.pending.lock().unwrap().push(PendingOp::Write {
             ordinal,
             offset,
             bytes: buf.to_vec(),
@@ -984,6 +1033,17 @@ impl Storage for PowerCutStorage {
 
     fn len(&self) -> inro::Result<u64> {
         self.inner.len()
+    }
+
+    /// Consume un ordinal de la MISMA secuencia que las escrituras (igual
+    /// que `FaultStorage::truncate`, ver su comentario en `storage.rs`): así
+    /// una prueba puede decir "pierde la operación número N" sin saber si N
+    /// es una página, una meta o el recorte.
+    fn truncate(&self, len: u64) -> inro::Result<()> {
+        let ordinal = self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.truncations.lock().unwrap().push(ordinal);
+        self.pending.lock().unwrap().push(PendingOp::Truncate { ordinal, len });
+        self.inner.truncate(len)
     }
 }
 
@@ -1276,4 +1336,255 @@ fn relaxed_sync_costs_bounded_space_and_far_fewer_fsyncs() {
         long_pages, pages,
         "con cuatro veces más commits sobre las mismas claves el fichero no debe crecer"
     );
+}
+
+// ---------------------------------------------------------------------
+// Prueba 7: recuperación de la cola libre del fichero (`Db::reclaim_tail`).
+//
+// Un recorte es una escritura de una clase que ninguno de los dos arneses
+// modelaba: no deposita bytes, hace desaparecer los que había. Los dos se
+// han extendido para poder perderlo o conservarlo como cualquier otra
+// operación —`FaultStorage::truncate` consume un ordinal de la misma
+// secuencia que las escrituras, `PowerCutStorage` lo registra como
+// `PendingOp::Truncate`— así que las dos preguntas de este fichero siguen
+// pudiendo hacerse sobre él sin codificar a mano dónde cae.
+//
+// La propiedad que se exige es la misma de siempre, y no se relaja ni un
+// milímetro por el hecho de que ahora el fichero pueda encoger: **toda
+// clave que el motor reconoció como confirmada tiene que seguir ahí tras
+// reabrir**, muera el proceso donde muera.
+// ---------------------------------------------------------------------
+
+/// Carga que deja el fichero con una cola libre que devolver: lastre
+/// escrito y borrado en `0x02`, que es lo que crea el espacio muerto, más
+/// las claves de verdad en `0x01`.
+fn ballast(db: &Db, n: u32, batch: usize) {
+    for chunk in (0..n).collect::<Vec<_>>().chunks(batch) {
+        let mut tx = db.begin_write().unwrap();
+        for &i in chunk {
+            tx.put(0x02, &i.to_be_bytes(), &[9u8; 40]).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    for chunk in (0..n).collect::<Vec<_>>().chunks(batch) {
+        let mut tx = db.begin_write().unwrap();
+        for &i in chunk {
+            tx.delete(0x02, &i.to_be_bytes()).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+}
+
+/// Deja una base con `keys` claves confirmadas en `0x01` y una cola libre
+/// bien gorda, y devuelve el fichero listo para que la llame `reclaim_tail`.
+fn seeded_with_dead_tail(s: &Arc<FaultStorage>, opts: Options, keys: u32) -> Db {
+    let db = Db::create(Box::new(Arc::clone(s)), opts).unwrap();
+    let mut tx = db.begin_write().unwrap();
+    for i in 0..keys {
+        tx.put(0x01, &i.to_be_bytes(), b"confirmado").unwrap();
+    }
+    tx.commit().unwrap();
+    ballast(&db, 400, 100);
+    db
+}
+
+/// Cuántas operaciones físicas emite un `reclaim_tail` de referencia sobre
+/// esta carga, y a partir de qué ordinal. **Medido, no supuesto**: el
+/// número de páginas de cadena que hay que reescribir, cuántas pasadas
+/// hacen falta y en qué posición cae el recorte dependen de la forma que
+/// tenga la lista de libres, y codificar cualquiera de esas cosas a mano
+/// es el error que este proyecto ya ha cometido seis veces. La corrida de
+/// referencia usa un medio aparte, sin ningún fallo armado.
+fn measure_reclaim_reference(opts: Options, keys: u32) -> (u64, u64) {
+    let s = Arc::new(FaultStorage::new(MemStorage::new(), None));
+    let db = seeded_with_dead_tail(&s, opts, keys);
+    let first = s.write_count() + 1;
+    let freed = db.reclaim_tail().unwrap();
+    assert!(freed > 0, "la carga de referencia no libera nada: no habría nada que cortar");
+    (first, s.write_count())
+}
+
+/// **El barrido de cortes del recorte.** Para CADA operación física que
+/// emite un `reclaim_tail` —páginas de lista de libres, las dos ranuras de
+/// meta y el recorte en sí—, mata el proceso justo ahí y en todas las
+/// posteriores (`Fault::AbortAt`), reabre y exige que la base siga entera.
+///
+/// Es el barrido que decide si el orden del recorte es correcto. Con el
+/// orden invertido —recortar antes de que la meta con el `n_pages`
+/// reducido esté sincronizada— el corte en el punto intermedio deja una
+/// meta superviviente que declara más páginas de las que el fichero tiene:
+/// su raíz y su cadena de libres apuntan más allá del final, y `Db::open`
+/// falla con `UnexpectedEof` (que, a diferencia de `Corrupt`, no se degrada
+/// con gracia) o `audit_pages` denuncia el desajuste. Ver el informe de
+/// esta tarea para la salida exacta de esa corrida.
+#[test]
+fn aborting_at_any_operation_of_a_reclaim_leaves_the_database_readable() {
+    const KEYS: u32 = 40;
+    let opts = Options::default();
+    let (first, last) = measure_reclaim_reference(opts, KEYS);
+    assert!(last >= first, "el recorte de referencia no emitió ninguna operación");
+
+    for n in first..=last {
+        let s = Arc::new(FaultStorage::new(MemStorage::new(), None));
+        let db = seeded_with_dead_tail(&s, opts, KEYS);
+        s.set_fault(Some(Fault::AbortAt(n)));
+        // Puede fallar o no: si el corte cae después del último recorte
+        // efectivo, `reclaim_tail` termina bien. Lo que importa es lo que
+        // queda en el medio, no lo que devuelve.
+        let _ = db.reclaim_tail();
+        drop(db);
+
+        s.set_fault(None);
+        let db = Db::open(Box::new(Arc::clone(&s)), opts)
+            .unwrap_or_else(|e| panic!("corte en la operación {n}: reabrir falló con {e:?}"));
+        let r = db.begin_read();
+        for i in 0..KEYS {
+            assert_eq!(
+                r.get(0x01, &i.to_be_bytes()).unwrap().as_deref(),
+                Some(b"confirmado".as_slice()),
+                "corte en la operación {n}: la clave {i}, confirmada mucho antes del recorte, \
+                 ya no está"
+            );
+        }
+        assert_eq!(
+            r.get(0x02, &0u32.to_be_bytes()).unwrap(),
+            None,
+            "corte en la operación {n}: reapareció lastre ya borrado"
+        );
+        drop(r);
+        assert!(
+            db.audit_pages().unwrap(),
+            "corte en la operación {n}: la contabilidad de páginas no cuadra tras reabrir"
+        );
+        // Y la base sigue siendo escribible: si el recorte hubiera dejado
+        // la lista de libres con entradas más allá del final del fichero,
+        // el primer `alloc` que las sirviera escribiría fuera.
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..20u32 {
+            tx.put(0x03, &i.to_be_bytes(), &[3u8; 60]).unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(
+            db.audit_pages().unwrap(),
+            "corte en la operación {n}: escribir tras reabrir rompe la contabilidad"
+        );
+    }
+}
+
+/// Prepara, sobre un medio que registra lo pendiente de sincronizar, una
+/// base que: confirma lastre, lo borra, DEVUELVE LA COLA con
+/// `reclaim_tail`, y después sigue confirmando claves con normalidad sobre
+/// el espacio recién recuperado. Devuelve el registro de lo reconocido.
+fn commit_reclaim_then_commit_more(
+    s: &Arc<PowerCutStorage>,
+    opts: Options,
+    before: u32,
+    after: u32,
+) -> Vec<Acked> {
+    let db = Db::create(Box::new(Arc::clone(s)), opts).unwrap();
+    let mut acked = Vec::new();
+    for key in 0..before {
+        let mut tx = db.begin_write().unwrap();
+        tx.put(0x01, &key.to_be_bytes(), b"confirmado").unwrap();
+        let txn = tx.txn_id();
+        tx.commit().unwrap();
+        acked.push(Acked { txn, key, last_write: s.writes() });
+    }
+    // Lotes de 10, no de 100: 80 commits de lastre bastan para que el
+    // motor pague por su cuenta el `fsync` de recuperación de espacio
+    // (`MAX_DURABLE_LAG`), así que la foto duradera con la que trabaja el
+    // corte es un fichero GRANDE con una meta que declara muchas páginas
+    // — el único estado desde el que un recorte mal ordenado hace daño. Con
+    // lotes grandes el retraso nunca llega a 16, la foto duradera se queda
+    // en la base recién creada, y un corte que lo tirase todo caería en un
+    // estado vacío pero coherente: la prueba pasaría sin haber mirado nada.
+    ballast(&db, 400, 10);
+    let before_pages = s.len().unwrap() / 512;
+    let freed = db.reclaim_tail().unwrap();
+    assert!(
+        freed > 0 && s.len().unwrap() / 512 < before_pages,
+        "el recorte no devolvió nada: esta prueba no estaría ejercitando nada"
+    );
+    for key in before..before + after {
+        let mut tx = db.begin_write().unwrap();
+        tx.put(0x01, &key.to_be_bytes(), b"confirmado").unwrap();
+        let txn = tx.txn_id();
+        tx.commit().unwrap();
+        acked.push(Acked { txn, key, last_write: s.writes() });
+    }
+    drop(db);
+    acked
+}
+
+/// **El corte que se lleva todo lo no sincronizado pero deja el recorte.**
+/// Es el reparto más hostil que un disco real puede hacer con esta
+/// operación: el cambio de tamaño llega al plato y las escrituras que lo
+/// preceden se quedan en la caché volátil.
+///
+/// Para el motor tal como está, `keep` no puede quitar ninguna de las
+/// escrituras del propio recorte: están sincronizadas antes de que el
+/// recorte se emita, así que ya forman parte de la foto duradera y el
+/// corte no las alcanza. Eso es exactamente lo que esta prueba comprueba —
+/// que el orden hace inalcanzable el estado malo—, y por eso NO es una
+/// tautología: si las dos sincronizaciones de `commit_maybe_shrinking`
+/// desaparecieran (o pasaran a ser `maybe_sync`, que bajo `Sync::Never` no
+/// sincroniza nada), esas escrituras seguirían pendientes, este mismo
+/// `keep` las tiraría, y lo que quedaría en el medio sería una meta con el
+/// `n_pages` de antes del recorte sobre un fichero ya recortado.
+#[test]
+fn a_power_cut_that_keeps_only_the_truncate_leaves_a_whole_snapshot() {
+    let opts = Options { sync: Sync::Never, ..Options::default() };
+    let s = Arc::new(PowerCutStorage::new());
+    // CERO commits después del recorte, y es lo que da filo a la prueba: el
+    // corte cae en la ventana que va del recorte al siguiente `fsync`. Con
+    // commits de por medio, el `fsync` de recuperación de espacio
+    // (`MAX_DURABLE_LAG`) acabaría congelando por su cuenta una foto ya
+    // recortada y coherente, y el corte no tendría nada que romper ni en un
+    // motor que recortara antes de sincronizar.
+    let acked = commit_reclaim_then_commit_more(&s, opts, 20, 0);
+    let truncations = s.truncations();
+    assert!(!truncations.is_empty(), "el arnés no registró ningún recorte");
+
+    s.cut(&mut |ordinal| truncations.contains(&ordinal));
+
+    assert_the_surviving_state_is_a_whole_snapshot(
+        &s,
+        opts,
+        &acked,
+        "corte que conserva el recorte y pierde todo lo no sincronizado",
+    );
+}
+
+/// El mismo escenario con el reparto ALEATORIO que ya usa la prueba 6:
+/// diez semillas, cada una tirando un subconjunto arbitrario de lo
+/// pendiente. Aquí sí hay commits de verdad en vuelo —los 40 posteriores
+/// al recorte, que reutilizan el espacio recuperado—, así que el corte
+/// tiene material que perder y la afirmación de "snapshot entero" trabaja.
+///
+/// Las metas se descartan siempre, por el mismo motivo que en la prueba 6
+/// (ver su comentario): bajo sincronización relajada nadie promete que una
+/// meta llegue después que las páginas que referencia, así que exigirle al
+/// motor que sobreviva a una meta sin sus páginas sería exigirle algo que
+/// el modo no promete.
+#[test]
+fn a_power_cut_after_a_reclaim_still_leaves_a_whole_snapshot() {
+    let opts = Options { sync: Sync::Never, ..Options::default() };
+    for seed in 1..=10u64 {
+        let s = Arc::new(PowerCutStorage::new());
+        let acked = commit_reclaim_then_commit_more(&s, opts, 10, 40);
+        let metas: std::collections::BTreeSet<u64> = acked.iter().map(|a| a.last_write).collect();
+        let truncations = s.truncations();
+
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        s.cut(&mut |ordinal| {
+            truncations.contains(&ordinal) || (!metas.contains(&ordinal) && rng.chance(90))
+        });
+
+        assert_the_surviving_state_is_a_whole_snapshot(
+            &s,
+            opts,
+            &acked,
+            &format!("corte aleatorio tras un recorte, semilla {seed}"),
+        );
+    }
 }

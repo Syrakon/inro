@@ -2060,10 +2060,159 @@ impl<'db> WriteTxn<'db> {
         Ok(())
     }
 
+    /// Última página del prefijo que NINGÚN recorte puede tocar jamás, más
+    /// uno: el suelo absoluto de `Db::reclaim_tail`.
+    ///
+    /// Se deriva de la geometría vigente, no de constantes:
+    ///
+    /// - **Página `0`**: la cabecera (bytes `0..64`) y su espejo
+    ///   (`HEADER_MIRROR_OFFSET..+64`, es decir `64..128`) viven las dos
+    ///   dentro de ella, porque `MIN_PAGE_SIZE` (512) es mayor que 128 —
+    ///   comprobado abajo con un `debug_assert` en vez de asumido, que es
+    ///   justo la clase de suposición que este proyecto ya ha pagado cara.
+    /// - **`meta_a_page` y `meta_b_page`**, leídas de la geometría: la B se
+    ///   MUEVE (tarea 18), así que una constante aquí valdría solo hasta la
+    ///   primera reubicación.
+    /// - **La página destino de la reubicación** (`final_meta_b_page`)
+    ///   mientras `n_pages` esté por encima de ella: en ese tramo está
+    ///   reservada aunque la reubicación todavía no haya ocurrido — ver
+    ///   `skip_meta_b_target` — así que no es libre ni puede recortarse
+    ///   "por debajo" sin cambiar el significado de ese hueco.
+    ///
+    /// **En la práctica nunca ata**, y esa es la comprobación de verdad:
+    /// ninguna de esas páginas entra jamás en la lista de libres mientras
+    /// cumple su papel (la `0` y la `1` nunca; la meta B actual tampoco; el
+    /// destino de la reubicación tampoco, porque `skip_meta_b_target` lo
+    /// retira del espacio de numeración), así que el sufijo libre que
+    /// calcula `Freelist::free_suffix_start` se detiene por encima de todas
+    /// ellas por sí solo. Este suelo es el cinturón: si alguna vez una de
+    /// esas páginas apareciera como libre por un defecto en otro sitio, el
+    /// recorte se negaría a llevársela en vez de dejar el fichero sin
+    /// cabecera.
+    fn reserved_floor(&self) -> PageNo {
+        let g = self.db.pager.geometry();
+        debug_assert!(
+            crate::header::HEADER_MIRROR_OFFSET + crate::header::HEADER_SIZE as u64
+                <= u64::from(g.page_size),
+            "el espejo de la cabecera ya no cabe en la página 0: el suelo del recorte \
+             tendría que dejar de ser una sola página"
+        );
+        let mut floor = 1;
+        floor = core::cmp::max(floor, g.meta_a_page + 1);
+        floor = core::cmp::max(floor, g.meta_b_page + 1);
+        let target = Self::final_meta_b_page(g.page_size);
+        if self.meta.n_pages > target {
+            floor = core::cmp::max(floor, target + 1);
+        }
+        floor
+    }
+
+    /// Decide hasta dónde puede recortarse el fichero, o `None` si no hay
+    /// ninguna cola libre que devolver. No escribe nada ni muta nada que
+    /// `WriteTxn::Drop` no sepa deshacer: si devuelve `None`, la
+    /// transacción se abandona sin commit y el fichero queda exactamente
+    /// como estaba.
+    ///
+    /// **Sincroniza primero, a propósito y sin condición de política.** El
+    /// suelo de reutilización cuenta la meta DURABLE como lector implícito
+    /// (ver `Db::durable` y `Db::reuse_floor`), así que bajo
+    /// `Sync::Interval`/`Never` un punto durable retrasado dejaría fuera del
+    /// recorte todo lo liberado desde entonces — hasta el fichero entero,
+    /// bajo `Sync::Never`, donde el punto durable podría no haberse movido
+    /// nunca. Pagar UN `fsync` aquí pone el punto durable al día y hace que
+    /// el recorte dependa solo de lo que de verdad está vivo, no de la
+    /// política de sincronización. Es el mismo trato que ya se da a la
+    /// recuperación de espacio en `WriteTxn::recycle` y en `commit`
+    /// (`reclaim_needs_a_sync`), solo que aquí es incondicional: quien llama
+    /// a `reclaim_tail` ha pedido explícitamente una operación de
+    /// mantenimiento, no un `put` en el camino caliente.
+    ///
+    /// Nótese lo que NO hace: bajar el suelo. Sincronizar SUBE el punto
+    /// durable pagando por él; los lectores vivos siguen contando igual.
+    fn plan_shrink(&mut self) -> Result<Option<PageNo>> {
+        let committed = self.db.committed.read().unwrap().0.txn_id;
+        self.db.sync_upto(committed)?;
+        let floor = self.db.reuse_floor();
+        let n_pages = self.meta.n_pages;
+        let reserved = self.reserved_floor();
+        let txn_id = self.meta.txn_id;
+        let pager = &self.db.pager;
+        let state = self.guard.as_mut().expect("estado presente");
+        // La lista COMPLETA, no la foto perezosa: ver `Freelist::absorb`.
+        // Los contenedores que devuelve cuentan como cola recortable aunque
+        // `pop` todavía no los sirva — ver `Freelist::free_suffix_start`,
+        // que explica por qué recortar y reutilizar no son la misma
+        // pregunta y ocurren en momentos distintos del commit.
+        let containers = state.freelist.absorb(pager, txn_id)?;
+        let cut = core::cmp::max(
+            state.freelist.free_suffix_start(n_pages, Some(floor), &containers),
+            reserved,
+        );
+        Ok(if cut < n_pages { Some(cut) } else { None })
+    }
+
     /// Escribe la lista de libres, sincroniza, escribe la meta inactiva y
     /// vuelve a sincronizar. Ese orden es lo que hace el commit atómico: la
     /// meta solo apunta a páginas que ya están en disco.
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(self) -> Result<()> {
+        self.commit_maybe_shrinking(false).map(|_| ())
+    }
+
+    /// `commit`, con la opción de devolverle al sistema de ficheros la cola
+    /// libre del fichero. Devuelve la extensión (en páginas) que el fichero
+    /// tiene al terminar — `Db::reclaim_tail` la usa para saber si esta
+    /// pasada ha progresado.
+    ///
+    /// # El orden, que es donde esto se rompe si se rompe
+    ///
+    /// 1. `plan_shrink` decide el corte (y no escribe nada).
+    /// 2. La lista de libres se purga de todo lo que va a dejar de existir
+    ///    y se serializa YA purgada.
+    /// 3. La meta con el `n_pages` reducido se escribe **y se sincroniza**.
+    /// 4. La OTRA ranura recibe esa misma meta **y se sincroniza**.
+    /// 5. Solo entonces se recorta el fichero.
+    ///
+    /// **3 y 5 no son intercambiables.** Recortar antes de que la meta
+    /// reducida sea duradera deja, si la corriente se va en medio, una meta
+    /// superviviente que declara `n_pages` páginas sobre un fichero que ya
+    /// no las tiene: su raíz, sus nodos internos y su cadena de lista de
+    /// libres pueden apuntar más allá del final, y ahí no hay recuperación
+    /// posible — es la misma forma del hallazgo 7 de
+    /// `review-final-corrupcion.md`, donde un `n_pages` manipulado en un
+    /// byte mandaba el primer `alloc` a escribir terabytes más allá. En el
+    /// orden correcto, un corte entre 4 y 5 deja lo contrario: `n_pages`
+    /// pequeño sobre un fichero todavía grande, que es exactamente el
+    /// estado que `Db::open` ya sabe reconciliar desde siempre (barre
+    /// `[meta.n_pages, file_pages)` y mete esas páginas en la lista de
+    /// libres) — no se pierde nada y la cola se puede volver a recortar
+    /// después.
+    ///
+    /// **Por qué las DOS ranuras.** El diseño de dos metas promete que si
+    /// una no decodifica se monta por la otra. Tras un recorte, esa otra —la
+    /// meta anterior, con el `n_pages` grande— describiría un fichero que ya
+    /// no existe: `Db::open` la elegiría por ser la única legible y fallaría
+    /// al leer su cadena de libres más allá del final (`UnexpectedEof` es
+    /// fatal, no se degrada con gracia como un `Corrupt`), dejando la base
+    /// inaccesible. Escribir la misma meta en las dos ranuras antes de
+    /// recortar cierra esa ventana por completo, y deja una invariante
+    /// simple de comprobar: **ninguna meta legible del fichero referencia
+    /// jamás una página más allá del final**. Cuesta una página de escritura
+    /// y un `fsync` de más en una operación de mantenimiento explícita. Las
+    /// dos ranuras quedan idénticas, que es el único caso de empate en
+    /// `txn_id` que `Meta::load` ya trataba de forma determinista (ver su
+    /// comentario) — el siguiente commit vuelve a alternar con normalidad.
+    fn commit_maybe_shrinking(mut self, shrink: bool) -> Result<PageNo> {
+        let cut = if shrink {
+            match self.plan_shrink()? {
+                Some(cut) => Some(cut),
+                // Nada que devolver: se abandona la transacción sin
+                // escribir ni una página. `Drop` restaura la lista de
+                // libres que `absorb` trajo a memoria.
+                None => return Ok(self.meta.n_pages),
+            }
+        } else {
+            None
+        };
         // Reubicación de la meta B (tarea 18), antes de tocar nada más: se
         // comprueba en TODO commit una vez el fichero pasa de 4 KB, pero
         // `relocate_meta_b` es barata de llamar de más — un campo comparado
@@ -2152,6 +2301,32 @@ impl<'db> WriteTxn<'db> {
             // de `Freelist::flush` en `freelist.rs` y el de la degradación
             // con gracia en `Db::open`, más arriba).
             let oldest = Some(self.db.reuse_floor());
+            // Purga y compacta ANTES de serializar (ver `Freelist::truncate_at`):
+            // la cadena que esta meta va a apuntar no puede mencionar ni una
+            // página que el recorte se lleva por delante, y los contenedores
+            // que `flush` saque de `pop` a continuación tienen que salir de
+            // abajo para no clavar la cola ellos mismos. `n_pages` baja aquí
+            // porque es la base desde la que extiende el cierre `alloc` de
+            // más abajo: si `flush` necesita más contenedores de los que
+            // puede reciclar, extiende desde el corte y `n_pages` vuelve a
+            // subir — el recorte final usa el valor de después, no el de
+            // ahora, así que ese caso encoge un poco menos pero nunca deja
+            // una página escrita fuera del fichero.
+            //
+            // El suelo con el que se purga es el de AQUÍ, que puede ser más
+            // alto que el que usó `plan_shrink` (un lector que muere entre
+            // medias lo sube; el `fsync` de `reclaim_needs_a_sync`, también).
+            // No importa: `[cut, n_pages)` ya era servible con el suelo más
+            // bajo, y un suelo más alto solo puede añadir páginas servibles
+            // POR DEBAJO del corte, que es donde no cambian nada.
+            if let Some(cut) = cut {
+                self.guard
+                    .as_mut()
+                    .expect("estado presente")
+                    .freelist
+                    .truncate_at(cut, oldest);
+                n_pages = cut;
+            }
             // Salta la página destino final de la meta B igual que `alloc`
             // (tarea 18, ver el comentario de `skip_meta_b_target`): una
             // página de lista de libres es tan "dato en vivo" como cualquier
@@ -2205,14 +2380,41 @@ impl<'db> WriteTxn<'db> {
         let target = self.slot.other();
         let geometry = self.db.pager.geometry();
         self.meta.store_via(&self.db.pager, &geometry, target)?;
-        // Y aquí sí: la meta de esta transacción ya está escrita, así que
-        // una sincronización que ocurra ahora la hace duradera y el punto
-        // durable puede avanzar hasta ella.
-        self.db.maybe_sync(self.meta.txn_id)?;
+        match cut {
+            None => {
+                // Y aquí sí: la meta de esta transacción ya está escrita, así
+                // que una sincronización que ocurra ahora la hace duradera y
+                // el punto durable puede avanzar hasta ella.
+                self.db.maybe_sync(self.meta.txn_id)?;
+            }
+            Some(_) => {
+                // `sync_upto`, no `maybe_sync`: bajo `Sync::Never` o un
+                // `Sync::Interval` largo, `maybe_sync` no sincroniza nada, y
+                // recortar detrás de una meta que solo está escrita —no
+                // demostrada en el medio— es precisamente el orden que
+                // convierte un corte de corriente en una base irrecuperable.
+                // Ver la cabecera de esta función.
+                self.db.sync_upto(self.meta.txn_id)?;
+                self.meta.store_via(&self.db.pager, &geometry, self.slot)?;
+                self.db.sync_upto(self.meta.txn_id)?;
+                self.db.pager.truncate(n_pages)?;
+                // El suelo de la PRÓXIMA transacción es la extensión real
+                // del fichero, que acaba de encoger. Sin esto, el
+                // `max(meta.n_pages, n_pages_floor)` de `begin_write`
+                // devolvería `n_pages` al valor de antes del recorte en la
+                // siguiente escritura: el fichero se quedaría pequeño
+                // mientras el motor cree tener páginas asignadas que ya no
+                // existen — ni siquiera en la lista de libres, porque
+                // acaban de purgarse de ella — es decir, un agujero de
+                // páginas sin dueño que `audit_pages` denunciaría de
+                // inmediato. Ver `WriterState::n_pages_floor`.
+                self.state().n_pages_floor = n_pages;
+            }
+        }
 
         *self.db.committed.write().unwrap() = (self.meta, target);
         self.committed = true;
-        Ok(())
+        Ok(n_pages)
     }
 }
 
@@ -2309,6 +2511,79 @@ impl Db {
         let committed = self.committed.read().unwrap().0.txn_id;
         let durable = self.durable.load(Ordering::SeqCst);
         committed.saturating_sub(durable) >= MAX_DURABLE_LAG
+    }
+
+    /// Devuelve al sistema de ficheros la cola libre del fichero y responde
+    /// cuántos BYTES ha devuelto (`0` si no había nada que devolver).
+    ///
+    /// # Por qué existe
+    ///
+    /// La lista de libres recicla el espacio DENTRO del fichero, así que un
+    /// borrado masivo deja de hacerlo crecer — pero no lo encoge: la
+    /// longitud del fichero es una marca de agua del pico histórico. Para
+    /// una flota de miles de bases pequeñas, una por inquilino, eso
+    /// significa que el día que un inquilino baja de un plan de retención de
+    /// 5 días a uno de 2 su fichero se queda para siempre en el tamaño del
+    /// plan que ya no paga. Esta llamada es lo que ese trabajo de cambio de
+    /// plan ejecuta después de podar.
+    ///
+    /// # Explícita, nunca automática
+    ///
+    /// No la llama `commit`, y es deliberado: una base que borra por la
+    /// mañana y vuelve a escribir por la tarde recortaría y volvería a
+    /// extender el fichero todos los días, pagando `fsync` y fragmentación
+    /// a cambio de nada. Quien sabe que el pico no va a volver es el
+    /// llamante, no el motor.
+    ///
+    /// # Qué recorta, y qué no
+    ///
+    /// Solo la COLA: el sufijo de páginas libres que hay al final del
+    /// fichero. No mueve páginas vivas hacia abajo — eso sería una
+    /// compactación, con reescritura del árbol y un coste completamente
+    /// distinto — así que una sola página viva alta puede limitar lo que se
+    /// recupera. En la práctica no lo hace, porque la operación reordena la
+    /// lista de libres de menor a mayor antes de reescribir la cadena (ver
+    /// `Freelist::truncate_at`), y la cadena de libres es lo único que suele
+    /// quedar arriba cuando el árbol se ha vaciado.
+    ///
+    /// # Repite hasta que deja de ganar
+    ///
+    /// Cada pasada libera páginas que la siguiente ya puede llevarse: los
+    /// contenedores de la cadena de libres ANTERIOR solo dejan de estar
+    /// vivos cuando la meta que los sustituye es duradera, cosa que ocurre
+    /// dentro de esta misma llamada. El bucle termina siempre: una pasada
+    /// que no reduce la extensión corta el bucle, y la extensión es un `u32`
+    /// que solo baja. La pasada final que no gana nada no escribe nada
+    /// (`plan_shrink` abandona la transacción antes de tocar el fichero).
+    ///
+    /// # Coste
+    ///
+    /// Un `fsync` para poner al día el punto durable, más dos por pasada que
+    /// recorte de verdad. Trabajo proporcional al número de páginas LIBRES
+    /// (hay que traer la lista entera a memoria), no al tamaño del árbol: no
+    /// recorre ningún dato.
+    ///
+    /// # Errores
+    ///
+    /// `Error::WriterBusy` si hay otra transacción de escritura viva — toma
+    /// el mismo candado de escritor único que `begin_write`. Los lectores
+    /// abiertos NO la bloquean, pero sí limitan lo que puede recortar: una
+    /// página que un snapshot vivo todavía podría necesitar no se toca (el
+    /// mismo suelo que gobierna el reciclado de páginas, ver
+    /// `Db::reuse_floor`).
+    pub fn reclaim_tail(&self) -> Result<u64> {
+        let page_size = u64::from(self.pager.geometry().page_size);
+        let before = self.pager.file_pages()?;
+        let mut extent = before;
+        loop {
+            let tx = self.begin_write()?;
+            let after = tx.commit_maybe_shrinking(true)?;
+            if after >= extent {
+                break;
+            }
+            extent = after;
+        }
+        Ok(u64::from(before - extent) * page_size)
     }
 }
 
@@ -2625,6 +2900,7 @@ mod tests {
         fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
         fn sync(&self) -> Result<()> { self.0.sync() }
         fn len(&self) -> Result<u64> { self.0.len() }
+        fn truncate(&self, len: u64) -> Result<()> { self.0.truncate(len) }
     }
 
 
@@ -2650,7 +2926,11 @@ mod tests {
         }
         for i in 0..40u32 {
             let mut tx = db.begin_write().unwrap();
-            tx.delete(0x01, &i.to_be_bytes()).unwrap();
+            let ts = 1_760_000_000_000u64 + i as u64 * 520;
+            let mut key = alloc::vec::Vec::with_capacity(10);
+            key.extend_from_slice(&ts.to_be_bytes());
+            key.extend_from_slice(&((i % 8) as u16).to_be_bytes());
+            tx.delete(0x01, &key).unwrap();
             tx.commit().unwrap();
             assert!(db.audit_pages().unwrap(), "audit_pages falló tras el delete {i}");
         }
@@ -2947,6 +3227,9 @@ mod tests {
         fn len(&self) -> Result<u64> {
             self.inner.len()
         }
+        fn truncate(&self, len: u64) -> Result<()> {
+            self.inner.truncate(len)
+        }
     }
 
     struct ArcPowerLoss(Arc<PowerLossStorage>);
@@ -2962,6 +3245,9 @@ mod tests {
         }
         fn len(&self) -> Result<u64> {
             self.0.len()
+        }
+        fn truncate(&self, len: u64) -> Result<()> {
+            self.0.truncate(len)
         }
     }
 
@@ -3353,6 +3639,392 @@ mod tests {
         );
     }
 
+    /// Recuperación de la cola libre del fichero (`Db::reclaim_tail`).
+    mod reclaim_tests {
+        use super::*;
+        use crate::meta::{Meta, MetaSlot};
+
+        /// Un registro con la forma del `request_logs` del edge de quota,
+        /// que es la carga real de este motor y la que midió el eje de
+        /// espacio de la revisión final: clave de 10 B (marca de tiempo de
+        /// 8 B en big-endian, para que el orden de clave sea el orden
+        /// temporal, más 2 B de identificador) y valor de 24 B.
+        fn log_key(i: u32) -> alloc::vec::Vec<u8> {
+            let ts = 1_760_000_000_000u64 + u64::from(i) * 520;
+            let mut key = alloc::vec::Vec::with_capacity(10);
+            key.extend_from_slice(&ts.to_be_bytes());
+            key.extend_from_slice(&((i % 8) as u16).to_be_bytes());
+            key
+        }
+
+        /// Escribe `[from, to)` en lotes de 100, como el escritor agrupado
+        /// del edge.
+        fn fill(db: &Db, from: u32, to: u32) {
+            for chunk in (from..to).collect::<alloc::vec::Vec<_>>().chunks(100) {
+                let mut tx = db.begin_write().unwrap();
+                for &i in chunk {
+                    tx.put(0x01, &log_key(i), &[7u8; 24]).unwrap();
+                }
+                tx.commit().unwrap();
+            }
+        }
+
+        /// Borra `[from, to)` una a una, como la poda por retención.
+        fn prune(db: &Db, from: u32, to: u32) {
+            for i in from..to {
+                let mut tx = db.begin_write().unwrap();
+                tx.delete(0x01, &log_key(i)).unwrap();
+                tx.commit().unwrap();
+            }
+        }
+
+        fn file_pages(s: &Arc<MemStorage>) -> u64 {
+            s.len().unwrap() / 512
+        }
+
+        /// Páginas realmente vivas: las que `audit_pages` reconoce como de
+        /// alguien (prefijo reservado, árbol, contenedores de la cadena de
+        /// libres), es decir todo lo que NO está en la lista de libres.
+        /// Medido desde el fichero, no desde el estado en memoria.
+        fn live_pages(db: &Db) -> u32 {
+            let (meta, _) = *db.committed.read().unwrap();
+            let mut free = 0u32;
+            if meta.freelist_head != 0 {
+                Freelist::walk_chain(&db.pager, meta.freelist_head, |_, entries| {
+                    free += entries.len() as u32;
+                })
+                .unwrap();
+            }
+            meta.n_pages - free
+        }
+
+        /// **Ninguna meta LEGIBLE del fichero puede referenciar una página
+        /// más allá del final.** Es la invariante que hace seguro el
+        /// recorte, y se comprueba sobre las DOS ranuras leídas del medio —
+        /// no sobre el estado en memoria — porque el peligro es justamente
+        /// la ranura que el motor ya no usa: si `Meta::load` tuviera que
+        /// caer en ella (la activa ilegible por un sector dañado), una meta
+        /// con el `n_pages` de antes del recorte mandaría a `Db::open` a
+        /// leer más allá del final del fichero, donde `UnexpectedEof` es
+        /// fatal y no se degrada con gracia.
+        fn assert_no_meta_points_past_the_end(s: &Arc<MemStorage>) {
+            let geometry = Geometry::read(s.as_ref()).unwrap();
+            let pages = (s.len().unwrap() / u64::from(geometry.page_size)) as u32;
+            let mut legible = 0;
+            for slot in [MetaSlot::A, MetaSlot::B] {
+                let mut buf = alloc::vec![0u8; geometry.page_size as usize];
+                let offset = u64::from(slot.page(&geometry)) * u64::from(geometry.page_size);
+                if s.read_at(offset, &mut buf).is_err() {
+                    continue;
+                }
+                let Ok(meta) = Meta::decode(&buf) else { continue };
+                legible += 1;
+                assert!(
+                    meta.n_pages <= pages,
+                    "la ranura {slot:?} declara {} páginas sobre un fichero de {pages}",
+                    meta.n_pages
+                );
+                for (name, p) in [
+                    ("root", meta.root),
+                    ("catalog_root", meta.catalog_root),
+                    ("freelist_head", meta.freelist_head),
+                    ("freelist_tail", meta.freelist_tail),
+                ] {
+                    assert!(p < pages, "la ranura {slot:?} apunta con {name} a la página {p} de un fichero de {pages}");
+                }
+            }
+            assert_eq!(legible, 2, "las dos ranuras deben quedar legibles tras un recorte");
+        }
+
+        /// **La prueba que motiva toda la operación.** Carga la base con
+        /// 2 000 registros con la forma del edge, borra los 2 000, y
+        /// comprueba con números que el fichero VUELVE.
+        ///
+        /// Sin `reclaim_tail`, el eje de espacio de la revisión final midió
+        /// aquí un fichero clavado en su pico con el 95 % de espacio muerto
+        /// para siempre: la lista de libres recicla dentro del fichero pero
+        /// la longitud es una marca de agua que solo sube. Los números
+        /// exactos dependen de la forma del registro (aquella medida daba
+        /// 267 páginas con 13 en uso; esta carga da las que afirme el
+        /// `assert` de abajo), así que lo que se fija aquí no es una cifra
+        /// mágica sino la RELACIÓN: tras el recorte el fichero no puede ser
+        /// más que un puñado de páginas por encima de lo que de verdad está
+        /// vivo.
+        #[test]
+        fn deleting_everything_and_reclaiming_gives_the_file_back() {
+            let (s, db) = fresh();
+            fill(&db, 0, 2000);
+            let peak = file_pages(&s);
+            prune(&db, 0, 2000);
+            let before = file_pages(&s);
+            let live = live_pages(&db);
+            assert_eq!(before, peak, "sin recorte, el fichero se queda en su pico historico");
+            assert!(
+                u64::from(live) * 8 < before,
+                "la premisa de esta prueba es que el fichero quede casi vacio: {live} paginas \
+                 vivas de {before}"
+            );
+
+            let txn_before = db.begin_read().txn_id();
+            let freed = db.reclaim_tail().unwrap();
+            let after = file_pages(&s);
+            // Cada pasada que recorta es un commit, y cada commit son dos
+            // `fsync`. El bucle termina por construcción (la extensión es un
+            // `u32` que solo baja), pero "termina" no es lo mismo que
+            // "converge rápido": esta cota fija que el número de pasadas es
+            // un puñado y no proporcional al tamaño del fichero, que es lo
+            // que de verdad haría inaceptable la operación en una base
+            // grande. Se cumple porque cada pasada empaqueta la cadena de
+            // libres abajo del todo, así que la primera ya deja el fichero
+            // en su suelo y la segunda solo lo confirma.
+            let passes = db.begin_read().txn_id() - txn_before;
+            assert!(
+                passes <= 4,
+                "el recorte necesito {passes} pasadas (commits) para converger"
+            );
+            assert!(
+                after <= u64::from(live) + 4,
+                "tras el recorte el fichero tiene {after} paginas con solo {live} vivas: \
+                 la cola no se ha devuelto"
+            );
+            assert_eq!(freed, (before - after) * 512, "los bytes devueltos deben ser los que faltan");
+            assert!(
+                freed * 100 / (before * 512) >= 90,
+                "solo se devolvio el {} % del fichero",
+                freed * 100 / (before * 512)
+            );
+
+            assert!(db.audit_pages().unwrap(), "la contabilidad de paginas no cuadra tras recortar");
+            assert_no_meta_points_past_the_end(&s);
+            assert_eq!(db.reclaim_tail().unwrap(), 0, "una segunda pasada no tiene nada que devolver");
+
+            // Y la base sigue siendo una base: reabre y admite escritura.
+            drop(db);
+            let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), Options::default()).unwrap();
+            assert!(db.audit_pages().unwrap());
+            assert_eq!(db.begin_read().get(0x01, &log_key(0)).unwrap(), None);
+            fill(&db, 0, 100);
+            assert_eq!(
+                db.begin_read().get(0x01, &log_key(0)).unwrap().as_deref(),
+                Some(&[7u8; 24][..])
+            );
+            assert!(db.audit_pages().unwrap());
+        }
+
+        /// El caso de uso literal del encargo: un inquilino baja de plan, su
+        /// ventana de retención se estrecha y la poda borra el excedente. Lo
+        /// que queda tiene que seguir ahí, entero, tras devolver la cola.
+        #[test]
+        fn pruning_to_a_shorter_retention_window_returns_the_surplus() {
+            let (s, db) = fresh();
+            fill(&db, 0, 1500);
+            let before = file_pages(&s);
+            // La ventana nueva se queda con los 200 registros más recientes.
+            prune(&db, 0, 1300);
+
+            let freed = db.reclaim_tail().unwrap();
+            let after = file_pages(&s);
+            assert!(freed > 0 && after < before, "{before} -> {after} paginas");
+
+            let r = db.begin_read();
+            for i in 1300..1500u32 {
+                assert_eq!(
+                    r.get(0x01, &log_key(i)).unwrap().as_deref(),
+                    Some(&[7u8; 24][..]),
+                    "el registro {i} de la ventana viva desaparecio con el recorte"
+                );
+            }
+            for i in [0u32, 1, 700, 1299] {
+                assert_eq!(r.get(0x01, &log_key(i)).unwrap(), None);
+            }
+            drop(r);
+            assert!(db.audit_pages().unwrap());
+            assert_no_meta_points_past_the_end(&s);
+
+            // Y sobrevive a un cierre: lo que se recortó no era de nadie.
+            drop(db);
+            let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), Options::default()).unwrap();
+            let r = db.begin_read();
+            for i in 1300..1500u32 {
+                assert_eq!(r.get(0x01, &log_key(i)).unwrap().as_deref(), Some(&[7u8; 24][..]));
+            }
+            assert!(!s.snapshot().is_empty());
+        }
+
+        /// **El guardián de lectores, que es la mitad del contrato.** Un
+        /// lector abierto sostiene un snapshot cuyas páginas siguen vivas
+        /// para él aunque el árbol confirmado ya no las use: recortarlas no
+        /// le devolvería un dato viejo, le devolvería `UnexpectedEof`.
+        ///
+        /// La prueba lo comprueba en los dos sentidos, que es lo que la hace
+        /// decisiva: con el lector vivo el recorte no se lleva NADA, y en
+        /// cuanto el lector muere el mismo recorte se lleva casi todo.
+        #[test]
+        fn a_live_reader_keeps_the_tail_until_it_goes_away() {
+            let (s, db) = fresh();
+            fill(&db, 0, 800);
+            let reader = db.begin_read();
+            prune(&db, 0, 800);
+            let before = file_pages(&s);
+
+            let freed = db.reclaim_tail().unwrap();
+            // El DAÑO primero, la política después: si el recorte se lleva
+            // páginas del snapshot del lector, lo que este bucle encuentra
+            // no es un dato viejo sino un `UnexpectedEof` — el fichero ya no
+            // llega hasta ahí. Comprobarlo antes que el conteo de bytes hace
+            // que un motor sin guardián de lectores falle señalando el
+            // registro que ha perdido, no un número.
+            for i in 0..800u32 {
+                assert_eq!(
+                    reader.get(0x01, &log_key(i)).unwrap().as_deref(),
+                    Some(&[7u8; 24][..]),
+                    "el snapshot del lector perdio el registro {i} por culpa del recorte"
+                );
+            }
+            assert_eq!(freed, 0, "el lector abierto todavia puede necesitar esas paginas");
+            assert_eq!(file_pages(&s), before);
+            drop(reader);
+
+            let freed = db.reclaim_tail().unwrap();
+            assert!(freed > 0, "sin lectores, la misma cola si se devuelve");
+            assert!(file_pages(&s) * 4 < before, "{} paginas de {before}", file_pages(&s));
+            assert!(db.audit_pages().unwrap());
+        }
+
+        /// El recorte no puede depender de la política de sincronización.
+        /// Bajo `Sync::Never` el punto durable puede llevar decenas de
+        /// transacciones sin moverse, y como cuenta como lector implícito
+        /// (ver `Db::durable`) un recorte ingenuo no encontraría nada
+        /// reutilizable que devolver. `plan_shrink` paga un `fsync` para
+        /// ponerlo al día — subir el suelo pagando por él, nunca bajarlo.
+        #[test]
+        fn it_returns_the_tail_under_every_sync_policy() {
+            for sync in [Sync::Commit, Sync::Never, Sync::Interval(Duration::from_secs(3600))] {
+                let s = Arc::new(MemStorage::new());
+                let opts = Options { sync, ..Options::default() };
+                let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), opts).unwrap();
+                fill(&db, 0, 600);
+                prune(&db, 0, 600);
+                let before = file_pages(&s);
+                let freed = db.reclaim_tail().unwrap();
+                assert!(
+                    freed > 0 && file_pages(&s) * 4 < before,
+                    "{sync:?}: {before} -> {} paginas",
+                    file_pages(&s)
+                );
+                assert!(db.audit_pages().unwrap(), "{sync:?}");
+                assert_no_meta_points_past_the_end(&s);
+                drop(db);
+                let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts).unwrap();
+                assert!(db.audit_pages().unwrap(), "{sync:?}: tras reabrir");
+            }
+        }
+
+        /// El suelo reservado no se toca ni cuando no queda nada más: la
+        /// cabecera, su espejo y las dos ranuras de meta siguen ahí, y una
+        /// base recién creada —donde no hay ninguna cola que devolver— no
+        /// pierde ni un byte.
+        #[test]
+        fn it_never_truncates_into_the_reserved_prefix() {
+            let (s, db) = fresh();
+            let fresh_len = s.len().unwrap();
+            assert_eq!(db.reclaim_tail().unwrap(), 0, "una base recien creada no tiene cola");
+            assert_eq!(s.len().unwrap(), fresh_len);
+
+            fill(&db, 0, 400);
+            prune(&db, 0, 400);
+            db.reclaim_tail().unwrap();
+
+            let geometry = Geometry::read(s.as_ref()).unwrap();
+            let pages = (s.len().unwrap() / u64::from(geometry.page_size)) as u32;
+            assert!(pages > geometry.meta_a_page, "la meta A tiene que seguir dentro del fichero");
+            assert!(pages > geometry.meta_b_page, "la meta B tiene que seguir dentro del fichero");
+            // La cabecera y su espejo viven los dos en la página 0.
+            let mut mirror = [0u8; crate::header::HEADER_SIZE];
+            s.read_at(crate::header::HEADER_MIRROR_OFFSET, &mut mirror).unwrap();
+            assert_eq!(Geometry::read(s.as_ref()).unwrap(), geometry);
+            assert_no_meta_points_past_the_end(&s);
+        }
+
+        /// Tras recortar, la siguiente escritura tiene que partir de la
+        /// extensión NUEVA. Sin bajar `WriterState::n_pages_floor`, el
+        /// `max(meta.n_pages, floor)` de `begin_write` devolvería el
+        /// `n_pages` de antes del recorte y el motor creería tener asignadas
+        /// páginas que ya no existen en el fichero ni en la lista de libres:
+        /// un agujero sin dueño que `audit_pages` denuncia de inmediato.
+        #[test]
+        fn writing_after_a_reclaim_starts_from_the_new_extent() {
+            let (s, db) = fresh();
+            fill(&db, 0, 700);
+            prune(&db, 0, 700);
+            db.reclaim_tail().unwrap();
+            let after_reclaim = file_pages(&s);
+
+            fill(&db, 5000, 5100);
+            assert!(db.audit_pages().unwrap(), "hueco de paginas sin dueno tras escribir");
+            let grown = file_pages(&s);
+            assert!(
+                grown < after_reclaim + 60,
+                "el fichero salto de {after_reclaim} a {grown} paginas para 100 registros: \
+                 la escritura no esta partiendo de la extension nueva"
+            );
+            let r = db.begin_read();
+            for i in 5000..5100u32 {
+                assert_eq!(r.get(0x01, &log_key(i)).unwrap().as_deref(), Some(&[7u8; 24][..]));
+            }
+        }
+
+        /// Toma el mismo candado de escritor único que `begin_write`, y lo
+        /// dice con un error propio en vez de bloquear.
+        #[test]
+        fn it_refuses_while_another_writer_is_live() {
+            let (_s, db) = fresh();
+            let tx = db.begin_write().unwrap();
+            assert_eq!(db.reclaim_tail(), Err(Error::WriterBusy));
+            drop(tx);
+            assert!(db.reclaim_tail().is_ok());
+        }
+
+        /// Una base CIFRADA se recorta igual: nada del camino de cifrado
+        /// depende de la longitud del fichero ni de las páginas que
+        /// desaparecen — el nonce es aleatorio por apertura y viaja dentro
+        /// de cada página, y la clave envuelta vive en la meta, que las dos
+        /// ranuras conservan.
+        #[cfg(feature = "encryption")]
+        #[test]
+        fn an_encrypted_database_returns_its_tail_too() {
+            use crate::crypto::{Algorithm, Encryption};
+            let s = Arc::new(MemStorage::new());
+            let opts = Options {
+                encryption: Some(Encryption { key: [3u8; 32], algorithm: Algorithm::XChaCha20Poly1305 }),
+                ..Options::default()
+            };
+            let db = Db::create(Box::new(ArcStorage(Arc::clone(&s))), opts).unwrap();
+            fill(&db, 0, 500);
+            prune(&db, 0, 400);
+            let before = file_pages(&s);
+            let freed = db.reclaim_tail().unwrap();
+            assert!(freed > 0 && file_pages(&s) < before);
+            assert!(db.audit_pages().unwrap());
+
+            drop(db);
+            let db = Db::open(Box::new(ArcStorage(Arc::clone(&s))), opts).unwrap();
+            let r = db.begin_read();
+            for i in 400..500u32 {
+                assert_eq!(
+                    r.get(0x01, &log_key(i)).unwrap().as_deref(),
+                    Some(&[7u8; 24][..]),
+                    "el registro cifrado {i} no sobrevivio al recorte"
+                );
+            }
+            drop(r);
+            // Y sigue escribiendo con nonces nuevos sobre las páginas
+            // recicladas del tramo recortado.
+            fill(&db, 500, 560);
+            assert!(db.audit_pages().unwrap());
+        }
+    }
+
     /// Tarea 18: reubicación de la meta B y suelo de 1,5 KB.
     mod relocation_tests {
         use super::*;
@@ -3429,6 +4101,9 @@ mod tests {
             fn len(&self) -> Result<u64> {
                 self.inner.len()
             }
+            fn truncate(&self, len: u64) -> Result<()> {
+                self.inner.truncate(len)
+            }
         }
 
         /// Corte de corriente ENTRE las dos escrituras de `relocate_meta_b`:
@@ -3501,6 +4176,7 @@ mod tests {
             fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
             fn sync(&self) -> Result<()> { self.0.sync() }
             fn len(&self) -> Result<u64> { self.0.len() }
+            fn truncate(&self, len: u64) -> Result<()> { self.0.truncate(len) }
         }
 
         /// BLOCKER hallado en revisión: `Db::open`'s orphan-page recovery
@@ -3616,6 +4292,9 @@ mod tests {
             fn len(&self) -> Result<u64> {
                 self.inner.len()
             }
+            fn truncate(&self, len: u64) -> Result<()> {
+                self.inner.truncate(len)
+            }
         }
         struct ArcCrash2(Arc<CrashAfterSecondHeaderWrite>);
         impl Storage for ArcCrash2 {
@@ -3623,6 +4302,7 @@ mod tests {
             fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
             fn sync(&self) -> Result<()> { self.0.sync() }
             fn len(&self) -> Result<u64> { self.0.len() }
+            fn truncate(&self, len: u64) -> Result<()> { self.0.truncate(len) }
         }
 
         /// Self-review (interacción con la tarea 9): un corte justo DESPUÉS
@@ -3714,6 +4394,9 @@ mod tests {
             fn len(&self) -> Result<u64> {
                 self.inner.len()
             }
+            fn truncate(&self, len: u64) -> Result<()> {
+                self.inner.truncate(len)
+            }
         }
         struct ArcTearHeader(Arc<TearSecondHeaderWrite>);
         impl Storage for ArcTearHeader {
@@ -3721,6 +4404,7 @@ mod tests {
             fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
             fn sync(&self) -> Result<()> { self.0.sync() }
             fn len(&self) -> Result<u64> { self.0.len() }
+            fn truncate(&self, len: u64) -> Result<()> { self.0.truncate(len) }
         }
 
         /// HIGH hallado en revisión: la reescritura de cabecera de
@@ -3856,6 +4540,11 @@ mod tests {
                 self.0.read_at(o, b)
             }
             fn write_at(&self, _o: u64, _b: &[u8]) -> Result<()> {
+                Err(Error::Io(crate::IoError::PermissionDenied))
+            }
+            /// Recortar es modificar: un medio de solo lectura lo rechaza
+            /// igual que una escritura, no en silencio.
+            fn truncate(&self, _len: u64) -> Result<()> {
                 Err(Error::Io(crate::IoError::PermissionDenied))
             }
             fn sync(&self) -> Result<()> {

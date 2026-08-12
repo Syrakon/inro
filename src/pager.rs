@@ -302,19 +302,29 @@ impl Pager {
         self.storage.sync()
     }
 
-    /// Sin llamador todavía (era parte del API público que pedía el brief
-    /// de la tarea 7; queda invisible al análisis de código muerto desde
-    /// que `pager` pasó a `pub(crate)` en la ronda 3 de revisión de la
-    /// tarea 16). Se conserva para cuando haga falta invalidar un lote de
-    /// páginas sin pasar por `write` una a una — p. ej. tras una
-    /// recuperación que descubre varias páginas huérfanas a la vez (ver
-    /// `Db::open`).
-    #[allow(dead_code)]
-    pub fn invalidate(&self, pages: &[PageNo]) {
-        let mut c = self.cache.lock().unwrap();
-        for &p in pages {
-            c.remove(p);
-        }
+    /// Recorta el fichero a `pages` páginas y descarta de la caché todo lo
+    /// que quede fuera. Único llamador: `Db::reclaim_tail` (`tx.rs`), con
+    /// el candado de escritor tomado y con la meta que declara ese
+    /// `n_pages` ya sincronizada — ver allí el orden completo.
+    ///
+    /// **La caché se limpia ANTES de recortar, no después.** Una entrada
+    /// cacheada de una página que ya no existe no puede servirse a nadie
+    /// mientras el escritor tiene el candado, pero si el `truncate` falla a
+    /// mitad y el llamante reintenta, o si la página vuelve a existir tras
+    /// una extensión posterior, servir el contenido viejo bajo el mismo
+    /// número sería exactamente la corrupción silenciosa que `write` evita
+    /// invalidando en vez de actualizar (ver su comentario).
+    ///
+    /// Ocupa el sitio del antiguo `invalidate(&[PageNo])`, que se conservaba
+    /// sin llamador "para cuando haga falta invalidar un lote de páginas sin
+    /// pasar por `write` una a una": ese caso ha llegado, y su forma real no
+    /// es una lista de números —que en un recorte podría tener millones de
+    /// entradas— sino un corte por encima del cual no queda nada. Esto
+    /// cuesta O(entradas en caché), no O(páginas recortadas).
+    pub fn truncate(&self, pages: PageNo) -> Result<()> {
+        let len = pages as u64 * self.geometry().page_size as u64;
+        self.cache.lock().unwrap().entries.retain(|e| e.page_no < pages);
+        self.storage.truncate(len)
     }
 
     /// Páginas que caben en el fichero actual. Se usa al abrir para detectar

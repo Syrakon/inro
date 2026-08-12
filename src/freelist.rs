@@ -291,6 +291,230 @@ impl Freelist {
         }
     }
 
+    /// Trae a memoria TODO lo que la carga perezosa dejó en disco y
+    /// reincorpora los contenedores físicos ya consumidos, dejando
+    /// `self.groups` como la única y completa descripción de qué páginas
+    /// están libres. Idempotente: una segunda llamada seguida no hace nada
+    /// (`next_on_disk` ya es `0`, `written_head` ya es `0` y `reclaimed`
+    /// está vacío).
+    ///
+    /// Extraído del principio de `flush` (que sigue siendo su llamador
+    /// principal) porque `Db::reclaim_tail` (`tx.rs`) necesita exactamente
+    /// esta mitad y NADA más: para decidir hasta dónde se puede recortar el
+    /// fichero hay que conocer el conjunto COMPLETO de páginas libres, y
+    /// esa decisión tiene que tomarse ANTES de que `flush` serialice — si
+    /// se tomara sobre la foto parcial que deja la carga perezosa, las
+    /// páginas del tramo intermedio no traído contarían como ocupadas y el
+    /// recorte se quedaría corto sin ningún motivo real. Ver
+    /// `WriteTxn::plan_shrink`.
+    ///
+    /// `txn` es la transacción que absorbe: es la etiqueta que reciben los
+    /// contenedores reciclados (ver `reclaimed` y `written_head`), nunca
+    /// una más antigua — esa página solo se vuelve basura AHORA, y hasta
+    /// que esta transacción sea duradera la meta anterior la sigue
+    /// declarando suya.
+    ///
+    /// Devuelve esos contenedores reciclados. Para `flush` no significan
+    /// nada (ya están donde tienen que estar, dentro de `groups`); para
+    /// `Db::reclaim_tail` son la diferencia entre recortar y no recortar —
+    /// ver `free_suffix_start`.
+    pub(crate) fn absorb(
+        &mut self,
+        pager: &Pager,
+        txn: TxnId,
+    ) -> Result<alloc::vec::Vec<PageNo>> {
+        // Antes de serializar hay que absorber TODO lo que `load` dejó sin
+        // traer (el tramo intermedio entre `head` y `tail`): si no, esas
+        // páginas quedarían huérfanas, porque el `tail` que las cierra va
+        // a reescribirse con una página nueva y nada más las referenciaría.
+        // Es trabajo proporcional al tamaño de la lista, pero ocurre solo
+        // una vez por commit, no durante toda la transacción — la garantía
+        // de RAM acotada es sobre esto último, no sobre este cierre puntual.
+        while self.fill_from_disk(pager)? {}
+
+        // Recicla la cadena física que el `flush` ANTERIOR de este mismo
+        // `Freelist` escribió (`written_head`, ver su comentario): sin
+        // esto, esas páginas se pierden para siempre en cuanto ESTA llamada
+        // escribe una cadena nueva que las reemplaza — es la fuga que
+        // encontró la tarea 19. Solo recorre sus NÚMEROS de página vía
+        // `next` (`decode_freelist_page` también devuelve las entradas que
+        // listaba, aquí descartadas con `_`): ese contenido nunca dejó de
+        // vivir en `groups`, así que reincorporarlo aquí lo duplicaría —
+        // dos copias de la misma página ofreciéndose a `alloc`, un doble
+        // reparto silencioso. Solo el CONTENEDOR físico es basura nueva.
+        //
+        // Mismo guardián de ciclos que `fill_from_disk`: esta cadena la
+        // escribió este mismo `Freelist` en un `flush` anterior, así que un
+        // ciclo aquí sería un defecto de esta misma función, no corrupción
+        // externa — pero la comprobación es tan barata como la de
+        // `fill_from_disk` y sigue el mismo patrón del resto del fichero.
+        if self.written_head != 0 {
+            let mut p = self.written_head;
+            let mut hops: u32 = 0;
+            loop {
+                self.reclaimed.push_back(p);
+                hops += 1;
+                if u64::from(hops) > u64::from(pager.file_pages()?) {
+                    return Err(Error::Corrupt { page: p, kind: CorruptKind::FreelistLoop });
+                }
+                let bytes = pager.read(p)?;
+                let (_max_txn, _pages, next) = decode_freelist_page(&bytes, p)?;
+                if next == p {
+                    return Err(Error::Corrupt { page: p, kind: CorruptKind::FreelistLoop });
+                }
+                if next == 0 {
+                    break;
+                }
+                p = next;
+            }
+            self.written_head = 0;
+        }
+
+        // Las páginas de lista de libres consumidas (por `load`, por el
+        // drenaje de arriba, o por el reciclado de la cadena propia justo
+        // encima) se incorporan aquí, antes de serializar: es la única vía
+        // por la que vuelven a quedar disponibles para `pop`, y hacerlo
+        // antes de fijar `capacity`/escribir asegura que este `flush` ya
+        // las cuenta.
+        let mut recycled = alloc::vec::Vec::new();
+        while let Some(page) = self.reclaimed.pop_front() {
+            recycled.push(page);
+            self.push(page, txn);
+        }
+        Ok(recycled)
+    }
+
+    /// La menor página `k` tal que TODA página de `[k, n_pages)` está libre
+    /// y es ya reutilizable bajo `oldest_reader` — es decir, el punto por
+    /// encima del cual el fichero no contiene nada que nadie pueda
+    /// necesitar. Devuelve `n_pages` si la última página está ocupada, que
+    /// es el caso de "no hay nada que recortar".
+    ///
+    /// Exige `absorb` previo: sobre una lista cargada a medias diría que
+    /// están ocupadas las páginas que el tramo intermedio todavía no
+    /// traído declara libres. `Db::reclaim_tail` lo garantiza llamando a
+    /// las dos en orden.
+    ///
+    /// **El guardián de reutilización es el mismo que el de `pop`, y tiene
+    /// que serlo.** Una página liberada por una transacción POSTERIOR al
+    /// suelo sigue viva para el snapshot que un lector abierto —o la meta
+    /// durable, que es el lector que montaría tras un corte— todavía puede
+    /// estar recorriendo. Reciclarla la sobrescribiría; recortarla la hace
+    /// desaparecer del fichero, que es estrictamente peor: la lectura ya no
+    /// devuelve un contenido equivocado sino `UnexpectedEof`. Por eso aquí
+    /// cuentan como OCUPADAS, exactamente igual que en `pop`.
+    ///
+    /// # `containers`: lo que se puede RECORTAR pero no REUTILIZAR
+    ///
+    /// Las páginas que `absorb` acaba de reciclar —los contenedores
+    /// físicos de la cadena que la meta anterior declara suya— entran aquí
+    /// como libres aunque `pop` se niegue a servirlas, y la asimetría es
+    /// deliberada:
+    ///
+    /// - **Reutilizarlas** significa escribirles encima DURANTE el commit,
+    ///   cuando la meta que las referencia sigue siendo la durable. Un
+    ///   corte ahí deja esa meta con una cadena de libres pisada — el
+    ///   defecto que cerró `53a746d`. Por eso `pop` no las sirve hasta que
+    ///   el commit que las libera sea duradero.
+    /// - **Recortarlas** ocurre en otro momento: `commit_maybe_shrinking`
+    ///   (`tx.rs`) recorta DESPUÉS de que la meta nueva —que ya no las
+    ///   menciona— esté sincronizada en LAS DOS ranuras. En ese instante no
+    ///   queda ninguna meta legible que las referencie, y ningún lector
+    ///   puede alcanzarlas nunca (un `ReadTxn` recorre el árbol desde su
+    ///   raíz; la cadena de libres no cuelga de él por ningún sitio).
+    ///
+    /// Sin esta distinción el recorte se queda casi siempre en nada: basta
+    /// UN contenedor arriba para clavar la cola entera, y los contenedores
+    /// son justo lo que sobrevive cuando el árbol se ha vaciado. Medido
+    /// sobre 800 registros borrados enteros: sin contarlos, cero páginas
+    /// devueltas; contándolos, el fichero baja a su suelo.
+    pub(crate) fn free_suffix_start(
+        &self,
+        n_pages: PageNo,
+        oldest_reader: Option<TxnId>,
+        containers: &[PageNo],
+    ) -> PageNo {
+        let mut servable = alloc::collections::BTreeSet::new();
+        for g in &self.groups {
+            if oldest_reader.is_none_or(|m| g.max_txn <= m) {
+                servable.extend(g.pages.iter().copied());
+            }
+        }
+        servable.extend(containers.iter().copied());
+        let mut k = n_pages;
+        while k > 0 && servable.contains(&(k - 1)) {
+            k -= 1;
+        }
+        k
+    }
+
+    /// Saca de la lista toda página reutilizable `>= cut` —dejan de existir
+    /// con el recorte del fichero— y deja las que quedan ordenadas de menor
+    /// a mayor en un único grupo.
+    ///
+    /// **Lo primero es obligatorio**: una entrada de la lista de libres por
+    /// encima del final del fichero es una página que `alloc` repartiría
+    /// tan tranquilamente como cualquier otra, y el primer `write_page` que
+    /// la recibiera escribiría más allá del final — extendiendo el fichero
+    /// otra vez, y dejando un hueco de páginas sin escribir por debajo que
+    /// nadie ha inicializado. Por eso la purga viaja DENTRO del mismo
+    /// commit que reduce `n_pages`: la lista serializada que la meta
+    /// recortada apunta ya no las menciona.
+    ///
+    /// **Lo segundo es lo que hace que el recorte valga la pena.** Los
+    /// contenedores físicos que `flush` necesita salen de `pop`, es decir
+    /// del frente de esta misma lista; sin ordenar, ese frente es el orden
+    /// FIFO de liberación, que reparte páginas por todo el fichero y deja
+    /// una cadena de lista de libres salpicada — y basta UN contenedor alto
+    /// para clavar la cola entera. Medido sobre el caso que motiva esta
+    /// operación (2 000 registros borrados): sin ordenar, las tres páginas
+    /// de cadena caían en la 12, la 44 y la 108 de 139, así que el sufijo
+    /// libre empezaba en la 109 y el recorte se quedaba en un 22 %. Ordenar
+    /// las empaqueta abajo del todo. Es seguro por la misma razón que la
+    /// fusión de `flush`: todas las páginas reutilizables comparten
+    /// etiqueta tras fusionarse, así que reordenarlas entre sí no puede
+    /// adelantar la reutilización de ninguna — y los grupos todavía no
+    /// servibles no se tocan ni cambian de sitio (siguen detrás, que es
+    /// donde los deja el orden cronológico).
+    pub(crate) fn truncate_at(&mut self, cut: PageNo, oldest_reader: Option<TxnId>) {
+        let mut ready: alloc::vec::Vec<PageNo> = alloc::vec::Vec::new();
+        let mut ready_txn: TxnId = 0;
+        let mut held: VecDeque<Group> = VecDeque::new();
+        for mut g in core::mem::take(&mut self.groups) {
+            if oldest_reader.is_none_or(|m| g.max_txn <= m) {
+                ready_txn = core::cmp::max(ready_txn, g.max_txn);
+                ready.extend(g.pages.iter().copied().filter(|&p| p < cut));
+            } else {
+                // También de los grupos todavía NO servibles, no solo de
+                // los reutilizables: ahí viven los contenedores que
+                // `absorb` acaba de reciclar (ver `free_suffix_start`), que
+                // sí pueden quedar por encima del corte. Dejar uno dentro
+                // sería dejar una entrada de la lista de libres apuntando
+                // más allá del final del fichero — la forma más directa que
+                // existe de que el siguiente `alloc` escriba fuera. Por
+                // construcción del sufijo, toda página `>= cut` de
+                // CUALQUIER grupo entró en el conjunto con el que se
+                // calculó el corte, así que esta purga no se lleva jamás
+                // nada que siga vivo para alguien.
+                g.pages.retain(|&p| p < cut);
+                if g.pages.is_empty() {
+                    continue;
+                }
+                held.push_back(g);
+            }
+        }
+        ready.sort_unstable();
+        self.groups = held;
+        if !ready.is_empty() {
+            self.groups.push_front(Group {
+                max_txn: ready_txn,
+                pages: ready.into(),
+                is_preloaded_tail: false,
+            });
+        }
+        self.dirty = true;
+    }
+
     /// Escribe la cola a disco y devuelve `(head, tail)` para la
     /// meta-página. `alloc` asigna páginas nuevas; se le pide una por cada
     /// página física que hace falta para serializar los grupos actuales.
@@ -347,62 +571,11 @@ impl Freelist {
         oldest_reader: Option<TxnId>,
         mut nonce_stream: Option<&mut crate::crypto::NonceStream>,
     ) -> Result<(PageNo, PageNo)> {
-        // Antes de serializar hay que absorber TODO lo que `load` dejó sin
-        // traer (el tramo intermedio entre `head` y `tail`): si no, esas
-        // páginas quedarían huérfanas, porque el `tail` que las cierra va
-        // a reescribirse con una página nueva y nada más las referenciaría.
-        // Es trabajo proporcional al tamaño de la lista, pero ocurre solo
-        // una vez por commit, no durante toda la transacción — la garantía
-        // de RAM acotada es sobre esto último, no sobre este cierre puntual.
-        while self.fill_from_disk(pager)? {}
-
-        // Recicla la cadena física que el `flush` ANTERIOR de este mismo
-        // `Freelist` escribió (`written_head`, ver su comentario): sin
-        // esto, esas páginas se pierden para siempre en cuanto ESTA llamada
-        // escribe una cadena nueva que las reemplaza — es la fuga que
-        // encontró la tarea 19. Solo recorre sus NÚMEROS de página vía
-        // `next` (`decode_freelist_page` también devuelve las entradas que
-        // listaba, aquí descartadas con `_`): ese contenido nunca dejó de
-        // vivir en `groups`, así que reincorporarlo aquí lo duplicaría —
-        // dos copias de la misma página ofreciéndose a `alloc`, un doble
-        // reparto silencioso. Solo el CONTENEDOR físico es basura nueva.
-        //
-        // Mismo guardián de ciclos que `fill_from_disk`: esta cadena la
-        // escribió este mismo `Freelist` en un `flush` anterior, así que un
-        // ciclo aquí sería un defecto de esta misma función, no corrupción
-        // externa — pero la comprobación es tan barata como la de
-        // `fill_from_disk` y sigue el mismo patrón del resto del fichero.
-        if self.written_head != 0 {
-            let mut p = self.written_head;
-            let mut hops: u32 = 0;
-            loop {
-                self.reclaimed.push_back(p);
-                hops += 1;
-                if u64::from(hops) > u64::from(pager.file_pages()?) {
-                    return Err(Error::Corrupt { page: p, kind: CorruptKind::FreelistLoop });
-                }
-                let bytes = pager.read(p)?;
-                let (_max_txn, _pages, next) = decode_freelist_page(&bytes, p)?;
-                if next == p {
-                    return Err(Error::Corrupt { page: p, kind: CorruptKind::FreelistLoop });
-                }
-                if next == 0 {
-                    break;
-                }
-                p = next;
-            }
-            self.written_head = 0;
-        }
-
-        // Las páginas de lista de libres consumidas (por `load`, por el
-        // drenaje de arriba, o por el reciclado de la cadena propia justo
-        // encima) se incorporan aquí, antes de serializar: es la única vía
-        // por la que vuelven a quedar disponibles para `pop`, y hacerlo
-        // antes de fijar `capacity`/escribir asegura que este `flush` ya
-        // las cuenta.
-        while let Some(page) = self.reclaimed.pop_front() {
-            self.push(page, txn);
-        }
+        // La lista de contenedores reciclados se descarta a propósito: para
+        // `flush` ya están donde tienen que estar (dentro de `groups`, que
+        // es lo que va a serializar). Solo le interesan a `Db::reclaim_tail`
+        // — ver `absorb`.
+        let _recycled = self.absorb(pager, txn)?;
 
         // Fusiona los grupos en, como mucho, DOS: los que el suelo de
         // reutilización ya deja servir, y los que todavía no. Cada grupo

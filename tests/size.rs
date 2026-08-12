@@ -364,6 +364,10 @@ impl<S: Storage> Storage for CountingStorage<S> {
     fn len(&self) -> inro::Result<u64> {
         self.inner.len()
     }
+
+    fn truncate(&self, len: u64) -> inro::Result<()> {
+        self.inner.truncate(len)
+    }
 }
 
 /// Confirma que el coste de `Db::open` (medido en lecturas físicas al

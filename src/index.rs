@@ -175,6 +175,7 @@ mod tests {
         fn write_at(&self, o: u64, b: &[u8]) -> Result<()> { self.0.write_at(o, b) }
         fn sync(&self) -> Result<()> { self.0.sync() }
         fn len(&self) -> Result<u64> { self.0.len() }
+        fn truncate(&self, len: u64) -> Result<()> { self.0.truncate(len) }
     }
 
     #[test]
