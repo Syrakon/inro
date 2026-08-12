@@ -274,3 +274,99 @@ proptest! {
         }
     }
 }
+
+/// **Cobertura de cifrado de este fichero.**
+///
+/// Hasta el cambio de diseño a nonces aleatorios, `tests/props.rs` no tocaba
+/// el cifrado en absoluto: las cuatro propiedades de arriba corren sobre
+/// `Options::default()`, sin clave. Eso dejaba sin cubrir justo lo que este
+/// motor tiene de particular bajo cifrado — que el tamaño de página LÓGICA
+/// (`page_size` menos `crypto::CIPHER_PREFIX`) es el que gobierna cuántas
+/// entradas caben en una hoja, el umbral de overflow y el límite de tamaño
+/// de clave. Un descuido ahí no se manifiesta como un fallo de descifrado,
+/// que sería obvio, sino como un árbol que diverge del modelo en cargas
+/// concretas: exactamente lo que una propiedad contra un oráculo
+/// `BTreeMap` está para encontrar y una prueba escrita a mano no.
+///
+/// Cubre los DOS algoritmos, no solo el de por defecto: el prefijo de
+/// cifrado mide 40 bytes para ambos, así que los dos tienen la misma
+/// geometría lógica y ninguno merece menos cobertura que el otro.
+///
+/// Casos reducidos frente a las propiedades de arriba (`cases() / 2`,
+/// secuencias de hasta 120 operaciones en vez de 300): cada operación paga
+/// aquí un sellado y un descifrado reales por página tocada, y el objetivo
+/// es cubrir la geometría lógica en las dos vías criptográficas sin
+/// convertir `cargo test --features encryption` en un banco de minutos.
+#[cfg(feature = "encryption")]
+mod encrypted {
+    use super::*;
+    use inro::{Algorithm, Encryption};
+
+    /// Los algoritmos que este build compila. `Vec` y no un `const`
+    /// array, porque su longitud depende de la feature `aes`.
+    fn algorithms() -> Vec<Algorithm> {
+        // `unused_mut` sin la feature `aes`: ahí el `push` de abajo no se
+        // compila y el vector nace ya completo. El `allow` es más honesto
+        // que construir el vector de dos formas distintas según la feature.
+        #[allow(unused_mut)]
+        let mut v = vec![Algorithm::XChaCha20Poly1305];
+        #[cfg(feature = "aes")]
+        v.push(Algorithm::Aes256GcmSiv);
+        v
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: std::cmp::max(1, cases() / 2),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn an_encrypted_tree_always_matches_a_btreemap(
+            ops in proptest::collection::vec(op_strategy(), 1..120)
+        ) {
+            for algorithm in algorithms() {
+                let opts = Options {
+                    encryption: Some(Encryption { key: [0x5c; 32], algorithm }),
+                    ..Options::default()
+                };
+                let db = Db::create(Box::new(MemStorage::new()), opts).unwrap();
+                let mut model = BTreeMap::new();
+
+                for op in &ops {
+                    let mut tx = db.begin_write().unwrap();
+                    match op {
+                        Op::Put(k, v) => tx.put(0x01, k, v).unwrap(),
+                        Op::Delete(k) => { tx.delete(0x01, k).unwrap(); }
+                        Op::DeleteRange(a, b) => tx.delete_range(0x01, a, b).unwrap(),
+                    }
+                    tx.commit().unwrap();
+                    apply(&mut model, op);
+
+                    let r = db.begin_read();
+                    let mut cursor =
+                        r.scan(0x01, b"", b"\xff\xff\xff\xff\xff\xff\xff").unwrap();
+                    let mut actual = Vec::new();
+                    while let Some(entry) = cursor.next().unwrap() {
+                        actual.push(entry);
+                    }
+                    let expected: Vec<_> =
+                        model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    prop_assert_eq!(
+                        actual, expected,
+                        "{:?}: divergencia tras {:?}", algorithm, op
+                    );
+                }
+
+                // Y ninguna página perdida ni contada dos veces: el
+                // reciclado de páginas es donde el cifrado y la lista de
+                // libres se cruzan (`Freelist::flush` sella sus propias
+                // páginas con el mismo flujo de nonces que el árbol).
+                prop_assert!(
+                    db.audit_pages().unwrap(),
+                    "{:?}: pagina perdida o contada dos veces", algorithm
+                );
+            }
+        }
+    }
+}
