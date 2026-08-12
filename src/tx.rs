@@ -566,12 +566,24 @@ impl Db {
         self.readers.lock().unwrap().keys().next().copied()
     }
 
-    /// Páginas leídas por el `Pager` desde que se abrió esta base. Solo
-    /// para pruebas: expone `Pager::pages_read` (ver su comentario) para la
-    /// prueba de coste de la tarea 15
+    /// Páginas leídas por el `Pager` desde que se abrió esta base. Pensado
+    /// para pruebas y bancos: expone `Pager::pages_read` (ver su
+    /// comentario) para la prueba de coste de la tarea 15
     /// (`it_reads_far_fewer_pages_than_it_frees`), que necesita contar
-    /// páginas, no medir tiempo.
-    #[cfg(test)]
+    /// páginas, no medir tiempo, y para `tests/size.rs` (tarea 21), que
+    /// mide lecturas de apertura y de poda desde fuera del crate.
+    ///
+    /// **Sin `#[cfg(test)]`, a diferencia de `root`/`read_page`, más abajo
+    /// en `impl<'db> ReadTxn`.** Esos dos solo los llaman pruebas unitarias
+    /// DENTRO de este crate (`tree.rs`), compiladas con `--cfg test`, así
+    /// que ese atributo sí las oculta correctamente fuera de una
+    /// compilación de pruebas. `tests/size.rs`, en cambio, es un binario de
+    /// integración: enlaza `libinro` compilada normalmente, SIN
+    /// `--cfg test` — así compila cualquier dependencia externa del crate,
+    /// también durante `cargo test` — así que un método marcado
+    /// `#[cfg(test)]` aquí sería invisible para él aunque la orden que lo
+    /// ejecuta sea `cargo test`. `pages_in_use` (`WriteTxn`, más abajo)
+    /// tiene la misma nota y el mismo motivo.
     pub fn pages_read(&self) -> u64 {
         self.pager.pages_read()
     }
@@ -591,8 +603,11 @@ impl<'db> ReadTxn<'db> {
     /// simplemente leer estructura interna que no forma parte del
     /// contrato — el contrato es `get`/`scan`/`scan_index`. Su único
     /// llamador hoy son las pruebas de bajo nivel de `tree.rs` que montan
-    /// árboles a mano; de ahí el `#[cfg(test)]`, igual que `pages_read` más
-    /// arriba en este mismo `impl Db`.
+    /// árboles a mano, compiladas dentro de este crate con `--cfg test`; de
+    /// ahí el `#[cfg(test)]`. A diferencia de `pages_read`, arriba en este
+    /// mismo `impl Db` (que la tarea 21 destapó para un binario de
+    /// integración, ver su comentario), este método sigue sin llamador
+    /// fuera de `tree.rs`, así que se queda gateado.
     #[cfg(test)]
     pub(crate) fn root(&self) -> PageNo {
         self.meta.root
@@ -1261,7 +1276,11 @@ impl<'db> WriteTxn<'db> {
     /// 4 KB o más: ahí el destino ya ES la página `2` desde la creación —
     /// ver `final_meta_b_page` — y jamás hay salto que descontar, porque
     /// `alloc` nunca extiende el fichero hacia atrás, hasta la `2`.
-    #[cfg(test)]
+    ///
+    /// **Sin `#[cfg(test)]`** (tarea 21): lo necesita `tests/size.rs`, un
+    /// binario de integración que enlaza `libinro` compilada sin
+    /// `--cfg test` — ver la nota de `Db::pages_read`, arriba, mismo motivo
+    /// exacto.
     pub fn pages_in_use(&mut self) -> u32 {
         let n = self.meta.n_pages;
         let free = self.state().freelist.len() as u32 + self.own_free.len() as u32;

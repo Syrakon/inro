@@ -331,8 +331,14 @@ impl Pager {
 
     /// Cuenta de páginas leídas expuesta a `Db::pages_read` (`tx.rs`), para
     /// la prueba de coste de la tarea 15
-    /// (`it_reads_far_fewer_pages_than_it_frees`).
-    #[cfg(test)]
+    /// (`it_reads_far_fewer_pages_than_it_frees`) y para los bancos de la
+    /// tarea 21 (`tests/size.rs`), que miden lecturas de apertura y de poda
+    /// desde un binario de integración — de ahí que NO lleve `#[cfg(test)]`
+    /// como `cached_pages`, justo arriba: ese binario enlaza la biblioteca
+    /// compilada normalmente (sin `--cfg test`), así que un atributo
+    /// `#[cfg(test)]` aquí lo dejaría invisible fuera del crate por mucho
+    /// que `cargo test` esté ejecutando la prueba — la propia
+    /// `pages_in_use` de `tx.rs` tiene la misma nota, con el mismo motivo.
     pub fn pages_read(&self) -> u64 {
         self.reads.load(Ordering::Relaxed)
     }

@@ -35,9 +35,34 @@ unsafe_code = "forbid"
 # defecto son `["aes", "alloc", "getrandom"]`; aquí se activa solo `aes` +
 # `alloc`, sin `getrandom` (no hace falta: este crate no genera nonces con
 # esa dependencia, ver `crypto::generate_nonce`).
+#
+# `rusqlite` (tarea 21) es la comparativa de la sección 17.1 de la
+# especificación: SQLite real, no una reimplementación de su formato. El
+# brief la pedía en `[dev-dependencies]`, pero Cargo rechaza el manifiesto
+# con "dev-dependencies are not allowed to be optional" — una dependencia
+# de desarrollo se resuelve siempre, para cualquier `cargo test`, sin
+# importar qué *features* estén activas; no hay forma de condicionarla ahí.
+# Se declara aquí, en `[dependencies]`, exactamente con el mismo patrón que
+# las dos de cifrado — `optional = true` tras su propia *feature*
+# (`bench-sqlite`, más abajo) — que es la única forma que Cargo ofrece de
+# hacer una dependencia condicional. La diferencia con las de cifrado: esas
+# SÍ las usa `src/`, así que activarlas cambia el binario publicado; a
+# `rusqlite` solo la usa `tests/size.rs`, que el `include` de arriba deja
+# fuera del paquete de crates.io — así que activar `bench-sqlite` en una
+# instalación de `inro` como dependencia de otro proyecto no compila ni
+# enlaza nada de más, solo declara una *feature* sin código alcanzable que
+# la use. `cargo tree --edges normal` (sin pasar `--features`, como hacen
+# los cinco comandos de verificación de este proyecto) no la ve: un
+# opcional sin activar no entra en el árbol resuelto, igual que ya pasa hoy
+# con `chacha20poly1305`/`aes-gcm` bajo esos mismos cinco comandos.
+# `features = ["bundled"]` compila su propio SQLite en vez de enlazar el
+# del sistema: sin eso, la comparativa dependería de qué versión de SQLite
+# tenga instalada quien ejecute el banco, y dos máquinas darían números
+# distintos para la misma prueba.
 [dependencies]
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
 aes-gcm = { version = "0.10", default-features = false, features = ["alloc", "aes"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 # Solo para pruebas (tarea 19): las dependencias de desarrollo no cuentan
 # contra la regla de cero dependencias de runtime — no viajan al binario del
@@ -52,6 +77,11 @@ default = ["std", "audit"]
 std = []
 encryption = ["dep:chacha20poly1305"]
 aes = ["encryption", "dep:aes-gcm"]
+# Comparativa de la tarea 21 contra SQLite (`tests/size.rs`,
+# `compare_against_sqlite_on_the_same_workload`). Ver el comentario de
+# `rusqlite`, arriba en `[dependencies]`, sobre por qué vive ahí y no en
+# `[dev-dependencies]` como pedía el brief literalmente.
+bench-sqlite = ["dep:rusqlite"]
 # `Db::audit_pages` (tarea 19): recorre TODO el fichero — árbol, cadenas de
 # overflow y lista de libres — para comprobar que cada página tiene
 # exactamente un dueño. Coste O(n_pages), nada que ver con el camino

@@ -602,10 +602,16 @@ impl Freelist {
 
     /// Páginas libres materializadas en memoria ahora mismo (no cuenta lo
     /// que sigue sin cargar en disco, referenciado por `next_on_disk`).
-    /// Solo tiene llamador en pruebas (`WriteTxn::pages_in_use`, también
-    /// `#[cfg(test)]`), así que se gatea igual para no quedar en el binario
-    /// de producción.
-    #[cfg(test)]
+    /// Único llamador: `WriteTxn::pages_in_use` (`tx.rs`). Ese método dejó
+    /// de llevar `#[cfg(test)]` en la tarea 21 — lo necesita `tests/size.rs`,
+    /// un binario de integración que enlaza `libinro` compilada sin
+    /// `--cfg test` — y al ser ahora parte incondicional del binario
+    /// normal, cualquier función que llama SIN ese `cfg` no puede depender
+    /// de una que sí lo lleve: `cargo build` (sin pruebas) dejaría de
+    /// compilar en cuanto `pages_in_use` intentara llamar a un `len` que no
+    /// existe fuera de una compilación de pruebas. Este `len` pierde el
+    /// `cfg(test)` por la misma razón, no porque haya ganado ningún
+    /// llamador nuevo.
     pub fn len(&self) -> usize {
         self.groups.iter().map(|g| g.pages.len()).sum()
     }
@@ -614,7 +620,9 @@ impl Freelist {
     /// usa `WriteTxn::pages_in_use`. Se conserva por la pareja natural
     /// `len`/`is_empty` (era parte del API público que pedía el brief de la
     /// tarea 8) y porque clippy la pediría en cuanto alguien llamara a
-    /// `len() == 0` en vez de a esta.
+    /// `len() == 0` en vez de a esta. Sigue tras `#[cfg(test)]`: a
+    /// diferencia de `len`, no la llama nada fuera de una compilación de
+    /// pruebas, así que no tiene el mismo problema.
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
