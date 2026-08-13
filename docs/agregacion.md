@@ -45,7 +45,7 @@ ahorro de disco sin pagar precisión. `Config::minimal()` baja `K` a 4 y ahorra
 `Config::realtime()` añade la resolución de minuto para el zoom del panel.
 
 ```rust
-use inro::rollup::{Config, Observation, Rollup, RAW_NS_RECOMMENDED};
+use inro::rollup::{Config, Observation, Rollup};
 
 let mut rollup = Rollup::new(Config::default());   // Profile::Reports
 // let mut rollup = Rollup::new(Config::minimal());  // 2,1 GB menos, sin top-K util
@@ -53,7 +53,7 @@ let mut rollup = Rollup::new(Config::default());   // Profile::Reports
 
 let mut tx = db.begin_write()?;
 for r in lote {
-    tx.put(RAW_NS_RECOMMENDED, &clave_cruda(r), &valor_crudo(r))?;
+    tx.put(0x01, &clave_cruda(r), &valor_crudo(r))?;   // el ns de tu esquema
     rollup.observe(&mut tx, &Observation {
         ts: r.ts_segundos,
         latency_ms: r.latencia,
@@ -118,35 +118,42 @@ veces al leer.
 
 ---
 
-## 3. El espacio de claves del crudo importa, y mucho
+## 3. El espacio de claves del crudo: ya no importa, y por qué lo contamos
 
-**Pon los registros crudos en un espacio de claves POR ENCIMA del de los
-agregados.** `RAW_NS_RECOMMENDED` (`0x7f`) es el valor sugerido.
+**Usa el `ns` que diga tu esquema** — `0x01` para el crudo en el mapa de la
+sección 10 de la especificación. No hay ninguna razón de rendimiento para
+preferir uno u otro.
+
+Esto merece contarse porque durante un tiempo sí importaba, y la trampa era de
+las que ninguna prueba de integración continua puede ver.
 
 `tree.rs` reparte una hoja desbordada por el punto medio **salvo** cuando la
-clave que entra es la mayor de TODO el árbol y la hoja es la de más a la
-derecha (`SplitBias::Append`). Ese sesgo es lo que bajó el crudo de 67,72 a
-34,14 bytes por entrada, porque un log se inserta siempre por el final. El
-motor antepone el byte de espacio de claves a cada clave, así que **el orden
-de los espacios es el orden del árbol**: con el crudo en `0x01` y los
-agregados en `0x02`, basta UNA fila de agregado para que ninguna clave cruda
-vuelva a ser la mayor del árbol.
+clave que entra va al final (`SplitBias::Append`). Ese sesgo es lo que bajó el
+crudo de 67,72 a 34,14 bytes por entrada, porque un log se inserta siempre por
+el final. La condición **antigua** exigía que la clave fuera la mayor de TODO
+el árbol. Y como el motor antepone el byte de espacio de claves, **el orden de
+los espacios es el orden del árbol**: con el crudo en `0x01` y los agregados
+en `0x02`, bastaba UNA fila de agregado para que ninguna clave cruda volviera a
+ser la mayor. El sesgo dejaba de dispararse y el llenado de hoja volvía al ~50%.
 
-Medido (`tests/rollup_size.rs`,
-`one_aggregate_row_costs_the_raw_path_its_append_split_bias`; 20.000 entradas,
-páginas de 4 KB):
+| Disposición | Antes | Después |
+|---|---|---|
+| Crudo en `0x01`, nada en `0x02` | 33,77 | 33,77 |
+| Crudo en `0x01`, **una** fila en `0x02` | **78,83** (+133%) | **33,96** |
+| Crudo en `0x01`, capa de agregación corriendo | 76,80 | 35,96 |
+| Crudo en `0x7f`, una fila en `0x02` | 33,87 | 33,87 |
 
-| Disposición | B/entrada |
-|---|---|
-| Crudo en `0x01`, nada en `0x02` | 39,94 |
-| Crudo en `0x01`, **una** fila en `0x02` | **84,99** (+112,8%) |
-| Crudo en `0x7f`, una fila en `0x02` | 38,91 (−2,6%) |
+Por qué la CI no podía atraparlo: `tests/size.rs` escribe **un solo espacio de
+claves**. El motor habría salido a producción a 78,83 B/entrada, casi el doble
+de su umbral de 40, con los cuatro bancos en verde.
 
-Es una desviación deliberada del mapa de espacios de la sección 10 de la
-especificación, que pone el crudo en `0x01`. El arreglo de fondo sería que
-`SplitBias` razonara por espacio de claves y no por «mayor clave del árbol»,
-pero cambiar la política de partición de nodos es una tarea propia con su
-propia revisión — la propia sección 12.2 lo dice.
+La mitigación fue poner el crudo por encima de todo (`RAW_NS_RECOMMENDED` valía
+`0x7f`). El arreglo de fondo llegó después: hoy `tree::put` recibe una **cota
+superior exclusiva** y `put_raw` le pasa `[ns+1]`, así que el sesgo se dispara
+dentro de cada espacio con independencia de lo que exista por encima —y
+`tree.rs` sigue sin saber nada de espacios de claves, solo recibe una cota
+sobre claves opacas. `RAW_NS_RECOMMENDED` se conserva por compatibilidad y hoy
+vale `0x01`.
 
 ---
 
@@ -355,7 +362,8 @@ diga otra cosa; las del de tiempo real se dan al lado para poder comparar.
 ### 8.1 Amplificación de escritura
 
 20.000 registros, lotes de mil, 150 rps (el escenario de la sección 12.4),
-páginas de 4 KB, crudo en `0x7f`:
+páginas de 4 KB (crudo en `0x7f`, que antes del arreglo del sesgo de anexado
+era la única disposición sin penalización; hoy `0x01` da lo mismo):
 
 | | Crecimiento del fichero | B/entrada | Amplificación |
 |---|---|---|---|
