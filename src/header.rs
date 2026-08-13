@@ -4,26 +4,38 @@ pub const HEADER_SIZE: usize = 64;
 pub const MAGIC: &[u8; 8] = b"INRO\0DB\x01";
 /// Versión de formato que este binario ESCRIBE.
 ///
-/// **2 desde el cambio de diseño a nonces aleatorios**, que rompe el formato
+/// **3 desde la meta autenticada.** Una meta-ranura pasa de 112 a 152 bytes
+/// (`meta::META_SIZE`): entre el fin de la región con contenido y el CRC32
+/// aparecen el nonce y el tag del sellado (`meta::MetaSeal`, bytes
+/// 108..148), y el CRC se mueve de 108..112 a 148..152. Una ranura del
+/// formato 2 leída con esta disposición falla el CRC —lo leería de unos
+/// bytes que ahí son relleno a cero— así que un fichero viejo no se
+/// malinterpretaría; pero fallaría como "corrupto", que es el diagnóstico
+/// equivocado para un fichero perfectamente sano de otra versión. Por eso
+/// se sube el número.
+///
+/// **2 fue el cambio de diseño a nonces aleatorios**, que rompió el formato
 /// en dos sitios a la vez: la disposición de una página cifrada pasó de
 /// `contador (8) || tag (16) || texto cifrado` a `nonce (24) || tag (16) ||
 /// texto cifrado` (`crypto::CIPHER_PREFIX`, 24 → 40 bytes, con el tamaño de
 /// página lógica bajando otros 16), y la meta dejó de llevar el techo de
 /// contador de nonce en los bytes 100..108 (`Meta::write_counter`,
-/// eliminado). Ninguno de los dos cambios es detectable por CRC —los dos
-/// producen ficheros perfectamente bien formados— así que el número de
+/// eliminado). Ninguno de los dos cambios era detectable por CRC —los dos
+/// producían ficheros perfectamente bien formados— así que el número de
 /// versión es la única señal que distingue un formato del otro.
-pub const FORMAT_MAJOR: u16 = 2;
+pub const FORMAT_MAJOR: u16 = 3;
 
 /// Versión de formato más antigua que este binario sabe LEER. Igual a
 /// `FORMAT_MAJOR`: ruptura limpia, sin compatibilidad hacia atrás. El crate
-/// está en 0.1.0 y sin publicar, así que no hay ningún fichero del formato 1
-/// en el mundo que merezca cargar con una vía de lectura aparte — y
-/// mantenerla habría significado conservar en `crypto.rs`/`meta.rs` el
-/// esquema entero de contador persistido que este cambio existe para
-/// borrar. Ver `Error::VersionTooOld` para por qué se rechaza en vez de
-/// intentar leerlo.
-pub const FORMAT_MIN_SUPPORTED: u16 = 2;
+/// está en 0.1.0 y sin publicar, así que no hay ningún fichero de los
+/// formatos 1 o 2 en el mundo que merezca cargar con una vía de lectura
+/// aparte — y mantenerla, en el caso del 2, habría significado conservar en
+/// `meta.rs` una segunda disposición de ranura Y una vía de apertura SIN
+/// autenticar, que es exactamente el agujero que el formato 3 cierra: un
+/// atacante bajaría el `format_major` de la cabecera (que no está
+/// autenticada, ni puede estarlo — ver `crypto::verify_meta`) y volvería a
+/// tener metas aceptadas con solo un CRC32. Ver `Error::VersionTooOld`.
+pub const FORMAT_MIN_SUPPORTED: u16 = 3;
 
 pub const MIN_PAGE_SIZE: u32 = 512;
 /// 32 KB, no 64 KB. El campo `cell_start` de la cabecera de página es `u16` y no

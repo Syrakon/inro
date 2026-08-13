@@ -134,6 +134,18 @@ impl Pager {
         self.encryption.is_some()
     }
 
+    /// La clave de datos de esta apertura, para quien tenga que sellar algo
+    /// que NO es una página: la meta (`WriteTxn::seal_meta`, desde el
+    /// formato 3). Las páginas no la necesitan — `write_encrypted`/`read`
+    /// sellan y abren aquí dentro, sin que la clave salga del `Pager`.
+    ///
+    /// Devuelve una referencia y no una copia: `Encryption` es `Copy` (32
+    /// bytes de clave), y repartir copias de material de clave por la pila
+    /// es justo lo que su `Debug` a mano existe para desalentar.
+    pub fn encryption(&self) -> Option<&Encryption> {
+        self.encryption.as_ref()
+    }
+
     fn offset(&self, page_no: PageNo) -> u64 {
         page_no as u64 * self.geometry().page_size as u64
     }

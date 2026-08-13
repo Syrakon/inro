@@ -188,7 +188,14 @@ pub const NONCE_PREFIX_LEN: usize = 16;
 /// doce bytes que AES desaprovecha se pagan una vez por página y entran en
 /// los datos asociados, así que tampoco quedan sin autenticar (ver el
 /// comentario del módulo).
-#[cfg(any(feature = "std", feature = "encryption"))]
+///
+/// **Sin `cfg` alguno desde el formato 3**, a diferencia de
+/// `NONCE_PREFIX_LEN`/`CIPHER_PREFIX`, que siguen tras `any(std,
+/// encryption)`: una meta-ranura reserva un campo de nonce de este tamaño
+/// SIEMPRE (bytes 108..132, a cero en una base sin cifrar), así que es
+/// parte del formato de fichero puro y `meta.rs` lo necesita en cualquier
+/// compilación — exactamente el mismo motivo por el que `WRAPPED_KEY_LEN`
+/// nunca estuvo gateado. Ver el comentario de `crypto` en `lib.rs`.
 pub const STORED_NONCE_LEN: usize = 24;
 
 /// Nonce de AES-256-GCM-SIV: doce bytes, de los cuales ocho son prefijo
@@ -797,6 +804,199 @@ pub fn unwrap_key(master: &[u8; 32], wrapped: &[u8; WRAPPED_KEY_LEN]) -> Result<
         .decrypt_in_place_detached((&nonce_bytes).into(), &[], &mut buf, (&tag).into())
         .map_err(|_| Error::Decrypt { page: 0 })?;
     Ok(buf)
+}
+
+// ---------------------------------------------------------------------
+// Autenticación de la meta (formato 3)
+// ---------------------------------------------------------------------
+
+/// Etiqueta de dominio de los datos asociados de una meta-ranura. Separa
+/// este sellado del de una página (`associated_data`, más arriba) de forma
+/// explícita, además de por el nonce.
+///
+/// Que lleve la versión de formato dentro no es decoración: si algún día el
+/// contenido autenticado cambia de disposición sin cambiar de tamaño, un
+/// tag calculado bajo la disposición vieja deja de validar bajo la nueva
+/// aunque el `FORMAT_MAJOR` de la cabecera —que no está autenticado, ver
+/// `verify_meta`— se hubiera manipulado para mentir sobre ello.
+#[cfg(feature = "encryption")]
+const META_DOMAIN: &[u8; 12] = b"inro/meta/v3";
+
+/// Bytes de datos asociados de un sellado de meta: dominio, identidad de la
+/// base, identidad de la ranura, nonce y la región autenticada entera.
+#[cfg(feature = "encryption")]
+const META_AAD_LEN: usize =
+    META_DOMAIN.len() + 16 + 1 + STORED_NONCE_LEN + crate::meta::META_AUTH_END;
+
+/// Datos asociados de una meta-ranura sellada. **Todo va aquí y nada en el
+/// texto plano**: este sellado autentica, no cifra — la meta sigue en claro
+/// (ver `verify_meta`).
+///
+/// Las cuatro piezas, y qué ataque cierra cada una:
+///
+/// - **`META_DOMAIN`**: separa este tag del de una página. El nonce ya lo
+///   hace (los dos salen del mismo `NonceStream`, que no repite), pero un
+///   dominio explícito no depende de esa propiedad para ser correcto.
+/// - **`db_id`** (de la CABECERA, no de la meta): ata la ranura a ESTE
+///   fichero. Sin él, una meta de otra base cifrada con la MISMA clave
+///   maestra se pega tal cual en esta y valida — la clave de datos viene
+///   envuelta en la propia ranura, así que el atacante no necesita
+///   conocerla, solo mover los dos trozos juntos.
+/// - **`slot`** (0 = A, 1 = B, `MetaSlot::index`): ata la ranura a SU
+///   posición. Sin él, intercambiar el contenido de las dos ranuras
+///   produce dos ranuras que siguen validando, y con ellas el control
+///   sobre qué `txn_id` gana la selección de `Meta::load_verified`.
+/// - **`nonce`**: ya es entrada del AEAD por sí mismo; se repite aquí por
+///   simetría con `associated_data` (páginas) y para que el tag no dependa
+///   de que la implementación del AEAD lo mezcle de una forma concreta.
+///
+/// Y el `payload`: los bytes 0..`META_AUTH_END` TAL COMO ESTÁN EN EL PLATO,
+/// no una recodificación de los campos decodificados. La diferencia importa
+/// en los dos huecos reservados a cero (32..40 y 100..108): recodificar los
+/// pondría a cero antes de calcular el tag, así que un atacante podría
+/// meter lo que quisiera ahí, recalcular el CRC, y el tag seguiría
+/// validando. Sobre los bytes crudos no.
+#[cfg(feature = "encryption")]
+fn meta_associated_data(
+    db_id: &[u8; 16],
+    slot: u8,
+    nonce: &[u8; STORED_NONCE_LEN],
+    payload: &[u8; crate::meta::META_AUTH_END],
+) -> [u8; META_AAD_LEN] {
+    let mut aad = [0u8; META_AAD_LEN];
+    let mut at = 0;
+    let mut put = |src: &[u8]| {
+        aad[at..at + src.len()].copy_from_slice(src);
+        at += src.len();
+    };
+    put(META_DOMAIN);
+    put(db_id);
+    put(&[slot]);
+    put(nonce);
+    put(payload);
+    debug_assert_eq!(at, META_AAD_LEN);
+    aad
+}
+
+/// El tag de autenticación de una meta-ranura, bajo la CLAVE DE DATOS.
+///
+/// **Texto plano vacío: esto es un MAC, no un cifrado.** El AEAD se usa
+/// como generador de tags sobre datos asociados y no cifra ni un byte de la
+/// meta, que sigue viajando en claro — un observador sigue viendo `root`,
+/// `txn_id` y `n_pages`. La propiedad que se compra es autenticidad
+/// (quien no tenga la clave no puede fabricar una meta que el motor acepte),
+/// no confidencialidad, y el informe de esta tarea lo dice con esas
+/// palabras.
+///
+/// **El nonce sale del `NonceStream` de la apertura, el mismo que sella las
+/// páginas.** No es un atajo: con XChaCha20-Poly1305, reutilizar un nonce
+/// bajo la misma clave para dos mensajes DISTINTOS revienta Poly1305 — deja
+/// recuperar la clave de un solo uso y falsificar tags a voluntad — y la
+/// meta se reescribe en cada commit, así que un nonce fijo (o derivado de
+/// `txn_id`, que tras un corte puede repetirse con contenido distinto) sería
+/// exactamente ese caso. Compartir el flujo con las páginas da unicidad por
+/// construcción, dentro de la apertura por el contador y entre aperturas por
+/// los 16 bytes de prefijo aleatorio, sin una sola llamada al sistema por
+/// commit.
+#[cfg(feature = "encryption")]
+pub fn seal_meta(
+    enc: &Encryption,
+    stream: &mut NonceStream,
+    db_id: &[u8; 16],
+    slot: u8,
+    payload: &[u8; crate::meta::META_AUTH_END],
+) -> Result<crate::meta::MetaSeal> {
+    use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+
+    let nonce = stream.next(enc.algorithm)?;
+    let aad = meta_associated_data(db_id, slot, &nonce, payload);
+    let tag = match enc.algorithm {
+        Algorithm::XChaCha20Poly1305 => {
+            let cipher = chacha20poly1305::XChaCha20Poly1305::new((&enc.key).into());
+            cipher
+                .encrypt_in_place_detached((&nonce).into(), &aad, &mut [])
+                .map_err(|_| Error::Decrypt { page: 0 })?
+        }
+        #[cfg(feature = "aes")]
+        Algorithm::Aes256GcmSiv => {
+            use aes_gcm_siv::aead::{AeadInPlace as _, KeyInit as _};
+            let cipher = aes_gcm_siv::Aes256GcmSiv::new((&enc.key).into());
+            cipher
+                .encrypt_in_place_detached((&aes_nonce(&nonce)).into(), &aad, &mut [])
+                .map_err(|_| Error::Decrypt { page: 0 })?
+        }
+        #[cfg(not(feature = "aes"))]
+        Algorithm::Aes256GcmSiv => return Err(Error::BadFormat),
+    };
+    let mut seal = crate::meta::MetaSeal { nonce, tag: [0u8; TAG_LEN] };
+    seal.tag.copy_from_slice(&tag);
+    Ok(seal)
+}
+
+/// La otra mitad de `seal_meta`. `Err(Corrupt { kind: MetaAuth })`, no
+/// `Err(Decrypt)`, cuando el tag no cuadra: quien llama ya ha desenvuelto la
+/// clave con éxito unas líneas antes, así que "la clave es incorrecta" está
+/// descartado y lo único que queda es que la ranura no la escribió quien
+/// tiene la clave. Ver `CorruptKind::MetaAuth`.
+///
+/// # Lo que este tag NO puede cubrir
+///
+/// - **La cabecera** (página 0 y su espejo): `page_size`, `db_id`,
+///   `meta_a_page`/`meta_b_page`, `FLAG_ENCRYPTED` y el número de formato.
+///   Es huevo-y-gallina puro: hay que leerla para saber dónde viven las
+///   ranuras y de qué tamaño son, es decir ANTES de poder leer la clave
+///   envuelta que haría falta para autenticarla. Lo que sí se hace es atar
+///   la meta a ella por los dos lados: `db_id` entra en los datos asociados
+///   (arriba), y `page_size_log2`/`flags`/`format_major` viajan DENTRO de la
+///   región autenticada de la propia meta, donde `Meta::load_verified` los
+///   contrasta contra la cabecera. Una cabecera manipulada no consigue que
+///   se acepte una meta que no le corresponde: consigue, como mucho, que no
+///   se acepte ninguna.
+/// - **El propio tag y el CRC32 de la ranura.** El tag es la salida, y el
+///   CRC es función del resto: tocar cualquiera de los dos solo hace la
+///   ranura ilegible, nunca aceptable.
+/// - **El resto de la página física** más allá de `META_SIZE`: relleno a
+///   cero que el motor no lee jamás.
+#[cfg(feature = "encryption")]
+pub fn verify_meta(
+    enc: &Encryption,
+    db_id: &[u8; 16],
+    slot: u8,
+    payload: &[u8; crate::meta::META_AUTH_END],
+    seal: &crate::meta::MetaSeal,
+) -> Result<()> {
+    use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+
+    let bad = Error::Corrupt { page: 0, kind: crate::CorruptKind::MetaAuth };
+    let aad = meta_associated_data(db_id, slot, &seal.nonce, payload);
+    match enc.algorithm {
+        Algorithm::XChaCha20Poly1305 => {
+            let cipher = chacha20poly1305::XChaCha20Poly1305::new((&enc.key).into());
+            cipher
+                .decrypt_in_place_detached(
+                    (&seal.nonce).into(),
+                    &aad,
+                    &mut [],
+                    (&seal.tag).into(),
+                )
+                .map_err(|_| bad)
+        }
+        #[cfg(feature = "aes")]
+        Algorithm::Aes256GcmSiv => {
+            use aes_gcm_siv::aead::{AeadInPlace as _, KeyInit as _};
+            let cipher = aes_gcm_siv::Aes256GcmSiv::new((&enc.key).into());
+            cipher
+                .decrypt_in_place_detached(
+                    (&aes_nonce(&seal.nonce)).into(),
+                    &aad,
+                    &mut [],
+                    (&seal.tag).into(),
+                )
+                .map_err(|_| bad)
+        }
+        #[cfg(not(feature = "aes"))]
+        Algorithm::Aes256GcmSiv => Err(Error::BadFormat),
+    }
 }
 #[cfg(all(test, feature = "encryption"))]
 mod tests {
@@ -1638,6 +1838,18 @@ mod tests {
     /// PAREJA —`two_opens_of_the_same_file_draw_different_prefixes`— y esta
     /// juntas fijan las dos mitades del contrato: prefijo nuevo, contador
     /// desde cero.
+    ///
+    /// **`Db::create` gasta los DOS primeros nonces del flujo antes de
+    /// sellar ninguna página** (`METAS_SEALED_AT_CREATE`), desde la meta
+    /// autenticada: escribe las ranuras A y B, y cada sellado de meta saca
+    /// su nonce del mismo `NonceStream` que las páginas — deliberadamente,
+    /// porque es lo que garantiza que un tag de meta y un tag de página
+    /// nunca compartan nonce bajo la misma clave (ver `seal_meta`). La
+    /// captura de `probe` solo registra sellados de PÁGINA, así que el
+    /// primero de una base recién creada se ve con el contador ya en 2. Una
+    /// reapertura no escribe ninguna meta, así que ahí el primer sellado de
+    /// página sí cae en el cero — que es exactamente la mitad del contrato
+    /// que esta prueba existe para fijar.
     #[test]
     fn the_nonce_counter_restarts_at_zero_on_every_open() {
         let capture = probe::Capture::start();
@@ -1659,16 +1871,26 @@ mod tests {
         }
         let second = capture.take();
 
+        // Las dos ranuras de meta que `Db::create` sella antes de que
+        // ninguna página pase por `seal`. Ver el comentario de la prueba.
+        const METAS_SEALED_AT_CREATE: u64 = 2;
+
         // Los 8 últimos bytes del nonce de XChaCha20 son el contador.
         let counter_of = |s: &probe::Sealed| u64::from_le_bytes(s.nonce[NONCE_PREFIX_LEN..].try_into().unwrap());
-        assert_eq!(counter_of(&first[0]), 0, "la primera apertura arranca en cero");
+        assert_eq!(
+            counter_of(&first[0]),
+            METAS_SEALED_AT_CREATE,
+            "la primera apertura arranca en cero, y para cuando sella su primera PAGINA \
+             ya se ha gastado un nonce por cada ranura de meta que `Db::create` escribio"
+        );
         assert_eq!(
             counter_of(&second[0]),
             0,
-            "la SEGUNDA apertura tambien arranca en cero: no queda ningun contador persistido"
+            "la SEGUNDA apertura tambien arranca en cero: no queda ningun contador persistido, \
+             y `Db::open` no escribe ninguna meta antes de la primera pagina"
         );
         assert!(
-            first.len() > 1 && counter_of(&first[1]) == 1,
+            first.len() > 1 && counter_of(&first[1]) == METAS_SEALED_AT_CREATE + 1,
             "y avanza de uno en uno dentro de la apertura"
         );
     }
@@ -1817,7 +2039,8 @@ mod tests {
     const HEADER_OFFSETS: [u64; 2] = [0, crate::header::HEADER_MIRROR_OFFSET];
 
     /// Cuántos bytes de una escritura de meta desgarrada llegan al plato.
-    /// 104 no es arbitrario: cae por debajo del CRC (108..112) y por encima
+    /// 104 no es arbitrario: cae por debajo del sellado y del CRC (108..152
+    /// desde el formato 3, 108..112 cuando se eligió este valor) y por encima
     /// de todos los campos que un commit cambia (`txn_id` los primeros
     /// ocho, y de ahí a `n_pages`), así que la ranura queda siempre con un
     /// contenido mezclado y un CRC viejo — ilegible, pase lo que pase.

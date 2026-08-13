@@ -212,7 +212,7 @@ mod imp_std {
         /// **Digno de registrar, no de corregir** (ronda de revisión de la
         /// tarea 20): si `bytes` es mayor o igual que el contenido ÚTIL de
         /// lo que se estaba escribiendo — para una ranura de meta,
-        /// `meta::META_SIZE` = 112, el resto de la página ya es relleno a
+        /// `meta::META_SIZE` = 152, el resto de la página ya es relleno a
         /// cero en ambos lados — el desgarro no desgarra NADA de contenido
         /// real: lo que llega al plato es indistinguible de una escritura
         /// completa. `write_at` sigue devolviendo `Err` de todos modos (así

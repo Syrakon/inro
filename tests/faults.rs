@@ -436,7 +436,8 @@ fn sweep_tear_at_every_write(opts: Options, puts: u32, prefixes: &[usize], label
 /// prefijo" — lo que el nombre de la tarea promete.
 ///
 /// **Por qué 40 y 104, no cualquier par de prefijos**: los dos están por
-/// DEBAJO de `meta::META_SIZE` (112) — deliberado. Un prefijo `>= 112`
+/// DEBAJO de `meta::META_SIZE` (152 desde el formato 3, 112 cuando se
+/// eligieron) — deliberado. Un prefijo `>= META_SIZE`
 /// deposita una ranura de meta COMPLETA y válida (el resto de la página es
 /// relleno a cero en ambos lados, ver el comentario de `TearAt` en
 /// `storage.rs`), así que el commit queda DURADERO de verdad aunque
@@ -555,8 +556,8 @@ fn a_torn_write_of_the_meta_page_falls_back_to_the_other_slot() {
     // seguir llevando tras el desgarro.
     let expected_txn_id = db.begin_read().txn_id();
     // `TORN_PREFIX` bytes: dentro de `txn_id` (0..8, que SIEMPRE cambia de
-    // un commit a otro) y muy por debajo del CRC (108..112,
-    // `meta::META_SIZE` = 112), así que el contenido mezclado que queda en
+    // un commit a otro) y muy por debajo del CRC (148..152,
+    // `meta::META_SIZE` = 152), así que el contenido mezclado que queda en
     // el plato jamás puede coincidir por casualidad con lo que el CRC
     // viejo certificaba.
     s.set_fault(Some(Fault::TearAt { write: meta_write, bytes: TORN_PREFIX }));
@@ -638,7 +639,7 @@ fn the_meta_tear_guard_is_not_satisfied_by_an_ordinary_healthy_database_past_rel
 
 /// Documenta el comportamiento "digno de registrar, no de corregir" que
 /// señaló la ronda de revisión: un `Fault::TearAt` cuyo `bytes` es `>=
-/// meta::META_SIZE` (112) deposita una ranura de meta COMPLETA y VÁLIDA —
+/// meta::META_SIZE` (152) deposita una ranura de meta COMPLETA y VÁLIDA —
 /// el resto de la página física ya era relleno a cero en ambos lados, así
 /// que un prefijo así de largo no desgarra nada de contenido real — pero
 /// `write_at` sigue devolviendo `Err` (así lo define `Fault::TearAt`: "falla
@@ -678,7 +679,7 @@ fn a_torn_write_of_the_meta_page_with_a_prefix_at_or_above_meta_size_lands_a_ful
     // más" de aquella no aplica.
     assert_seed_is_intact(&db);
     // A diferencia de un desgarro real (prefijo < META_SIZE): la clave SÍ
-    // sobrevive, porque el prefijo de 256 bytes ya cubría los 112 bytes
+    // sobrevive, porque el prefijo de 256 bytes ya cubría los 152 bytes
     // utiles de la meta — el commit quedo duradero pese al `Err`.
     assert_eq!(
         db.begin_read().get(0x01, b"perdida").unwrap().as_deref(),
@@ -1654,13 +1655,23 @@ fn a_power_cut_after_a_reclaim_still_leaves_a_whole_snapshot() {
 // vuelven a medir con las `Options` de cada algoritmo (ver
 // `sweep_abort_at_every_write`/`sweep_tear_at_every_write`, compartidos).
 //
-// **Qué NO cambia**: las ranuras de meta y la cabecera siguen en claro con
-// solo un CRC32 (`Meta::store`/`store_via` escriben por `Pager::write`, no
-// por `write_encrypted`), así que los guardianes de esta suite que leen
-// `Meta::decode` sobre los bytes crudos siguen valiendo tal cual sobre una
-// base cifrada — y eso es una afirmación comprobable, no una suposición:
+// **Qué NO cambia**: las ranuras de meta y la cabecera siguen en CLARO
+// (`Meta::store`/`store_via` escriben por `Pager::write`, no por
+// `write_encrypted`) y siguen llevando su CRC32 como último campo, así que
+// los guardianes de esta suite que leen `Meta::decode` sobre los bytes
+// crudos siguen valiendo tal cual sobre una base cifrada.
+//
+// **Qué SÍ cambió con el formato 3**: una base cifrada añade a esa meta en
+// claro un nonce y un tag (`meta::MetaSeal`, bytes 108..148) calculados con
+// la clave de datos. El CRC no desaparece ni se subordina al tag — al
+// contrario, lo cubre — y sigue siendo lo que decide si una ranura está
+// DESGARRADA, sin necesitar ninguna clave. Esa separación es justamente lo
+// que deja que esta suite siga funcionando igual, y no es una suposición:
 // `a_torn_meta_write_on_an_encrypted_database_falls_back_and_the_tree_still_decrypts`
-// falla si algún día la meta pasa a sellarse.
+// falla si algún día el desgarro dejara de verse en el CRC, y
+// `a_torn_meta_slot_fails_as_a_checksum_not_as_an_authentication_failure`
+// (más abajo) fija el distingo entre los dos modos de fallo, que es de lo
+// que depende que un corte de corriente se recupere y una falsificación no.
 // ---------------------------------------------------------------------
 
 #[cfg(feature = "encryption")]
@@ -1706,7 +1717,7 @@ mod encrypted {
     /// - `CIPHER_PREFIX + 64` (104): el corte cae ya DENTRO del texto
     ///   cifrado, con nonce y tag nuevos sobre un contenido mitad y mitad.
     ///
-    /// Los dos siguen por debajo de `meta::META_SIZE` (112) — condición que
+    /// Los dos siguen por debajo de `meta::META_SIZE` (152) — condición que
     /// la sección sin cifrar documenta en detalle y que aquí sigue haciendo
     /// falta por lo mismo: un desgarro más largo depositaría una ranura de
     /// meta completa y el commit quedaría duradero pese al `Err`, un caso
@@ -1800,13 +1811,18 @@ mod encrypted {
     /// una base cifrada, y con dos afirmaciones que la versión sin cifrar no
     /// puede hacer:
     ///
-    /// 1. **La ranura de meta sigue siendo texto plano con CRC32.** El
-    ///    guardián `assert_meta_tear_left_the_previous_commit_recoverable`
-    ///    lee los bytes crudos del medio y los pasa por `Meta::decode`; si
-    ///    algún día la meta pasara a sellarse, ninguna de las dos ranuras
-    ///    decodificaría y el guardián lo diría en el acto ("deberia dejar
-    ///    EXACTAMENTE una ranura ilegible... no 2"). Es decir: esta prueba
-    ///    FIJA esa decisión de formato en vez de suponerla.
+    /// 1. **La ranura de meta sigue siendo texto plano con CRC32**, también
+    ///    ahora que además lleva un tag. El guardián
+    ///    `assert_meta_tear_left_the_previous_commit_recoverable` lee los
+    ///    bytes crudos del medio y los pasa por `Meta::decode` —que
+    ///    comprueba el CRC y NADA más, sin clave— y exige exactamente una
+    ///    ranura ilegible y la otra con el último commit confirmado. Si
+    ///    algún día el desgarro dejara de verse en el CRC (porque el CRC
+    ///    desapareciera del formato, o dejara de cubrir lo que un commit
+    ///    cambia), ninguna de las dos decodificaría y el guardián lo diría
+    ///    en el acto ("deberia dejar EXACTAMENTE una ranura ilegible... no
+    ///    2"). Es decir: esta prueba FIJA esa decisión de formato en vez de
+    ///    suponerla.
     /// 2. **El árbol superviviente descifra entero, y la base sigue viva.**
     ///    Tras reabrir se leen las diez claves, se recorre el espacio con
     ///    `scan`, se audita cada página —las tres cosas descifran de verdad,
@@ -1882,6 +1898,164 @@ mod encrypted {
             assert!(
                 db.audit_pages().unwrap(),
                 "{algorithm:?}: escribir tras la recuperacion rompe la contabilidad"
+            );
+        }
+    }
+
+    /// **El distingo del que depende todo lo anterior**, comprobado sobre
+    /// el desgarro real que produce el arnés y no sobre bytes cocinados: una
+    /// ranura DESGARRADA falla el CRC32 (`CorruptKind::Checksum`), no la
+    /// autenticación.
+    ///
+    /// No es una sutileza de diagnóstico, es lo que decide si un corte de
+    /// corriente se recupera. `Meta::load_verified` descarta en silencio lo
+    /// que no supera el CRC —está incompleto, para eso existen dos
+    /// ranuras— y en cambio se DETIENE ante una ranura completa que no
+    /// autentica, porque eso solo lo escribe alguien que calculó un CRC
+    /// sobre contenido que la clave no avala. Si un desgarro llegara a
+    /// presentarse como fallo de autenticación, la segunda regla se tragaría
+    /// a la primera y un corte a media escritura de meta dejaría la base
+    /// sin abrir en vez de caer a la otra ranura.
+    ///
+    /// El desgarro llega hasta `tear_depths()[1]` (104), por debajo del
+    /// campo de CRC (148..152) y por encima de todo lo que un commit
+    /// cambia, así que la mezcla que queda en el plato no puede cuadrar el
+    /// CRC viejo por casualidad.
+    #[test]
+    fn a_torn_meta_slot_fails_as_a_checksum_not_as_an_authentication_failure() {
+        for (algorithm, opts) in matrix() {
+            let meta_write = {
+                let s = Arc::new(FaultStorage::new(MemStorage::new(), None));
+                let db = Db::create(Box::new(s.clone()), opts).unwrap();
+                seed(&db);
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, b"perdida", b"x").unwrap();
+                tx.commit().unwrap();
+                s.write_count()
+            };
+
+            let s = Arc::new(FaultStorage::new(MemStorage::new(), None));
+            let db = Db::create(Box::new(s.clone()), opts).unwrap();
+            seed(&db);
+            let expected_txn_id = db.begin_read().txn_id();
+            s.set_fault(Some(Fault::TearAt { write: meta_write, bytes: tear_depths()[1] }));
+            let mut tx = db.begin_write().unwrap();
+            tx.put(0x01, b"perdida", b"x").unwrap();
+            assert!(tx.commit().is_err(), "{algorithm:?}: el commit desgarrado reporta el fallo");
+            drop(db);
+            s.set_fault(None);
+
+            // La ranura rota lo está por CRC, no por tag. `Meta::decode` no
+            // conoce ninguna clave: si dice `Checksum`, el desgarro se ve
+            // sin desenvolver nada.
+            let g = geometry(&s);
+            let mut torn = 0;
+            for slot_page in [g.meta_a_page, g.meta_b_page] {
+                let mut buf = vec![0u8; g.page_size as usize];
+                s.read_at(slot_page as u64 * g.page_size as u64, &mut buf).unwrap();
+                if let Err(e) = Meta::decode(&buf) {
+                    assert!(
+                        matches!(e, inro::Error::Corrupt { kind: inro::CorruptKind::Checksum, .. }),
+                        "{algorithm:?}: la ranura desgarrada deberia fallar el CRC32, no otra \
+                         cosa; se obtuvo {e:?}"
+                    );
+                    torn += 1;
+                }
+            }
+            assert_eq!(torn, 1, "{algorithm:?}: exactamente una ranura desgarrada");
+
+            // Y la apertura se recupera por la otra, sin que la
+            // autenticación se meta por medio.
+            let db = Db::open(Box::new(s.clone()), opts).unwrap();
+            assert_eq!(
+                db.begin_read().txn_id(),
+                expected_txn_id,
+                "{algorithm:?}: deberia montar por la ranura superviviente"
+            );
+            assert_is_the_committed_state(&db);
+        }
+    }
+
+    /// **La otra mitad del distingo, y el defecto que esta ronda cierra**:
+    /// una ranura COMPLETA cuyo CRC cuadra pero cuyo tag no —lo que produce
+    /// un atacante, nunca un corte de corriente— NO se salta para caer a la
+    /// otra. `Db::open` se para.
+    ///
+    /// Se conduce desde el API público, sobre una base recuperada de un
+    /// desgarro real: la falsificación cae sobre la ranura que sobrevivió
+    /// al corte, que es el estado en el que un atacante encontraría un
+    /// fichero tras una caída. La ranura que se falsifica es la VIVA y solo
+    /// esa; la otra sigue siendo genuina, así que un motor que cayera a ella
+    /// devolvería `Ok` con una base más vieja y esta prueba lo atraparía.
+    ///
+    /// **Sin autenticación:** `Ok(Db)` con la raíz que eligió el atacante —
+    /// medido en `tx.rs`
+    /// (`a_meta_forged_at_every_field_is_rejected_on_open`): catorce de
+    /// veinte claves confirmadas devuelven `None` sin un solo error.
+    #[test]
+    fn a_forged_meta_slot_stops_the_open_instead_of_falling_back() {
+        for (algorithm, opts) in matrix() {
+            let s = Arc::new(FaultStorage::new(MemStorage::new(), None));
+            let db = Db::create(Box::new(s.clone()), opts).unwrap();
+            seed(&db);
+            for i in 0..10u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x02, &i.to_be_bytes(), &[7u8; 60]).unwrap();
+                tx.commit().unwrap();
+            }
+            let live_txn = db.begin_read().txn_id();
+            drop(db);
+
+            // La ranura viva: la que decodifica con el `txn_id` mayor. Se
+            // busca leyendo el medio, sin preguntarle al motor.
+            let g = geometry(&s);
+            let page_size = g.page_size as u64;
+            let mut live = None;
+            for slot_page in [g.meta_a_page, g.meta_b_page] {
+                let mut buf = vec![0u8; g.page_size as usize];
+                s.read_at(slot_page as u64 * page_size, &mut buf).unwrap();
+                if let Ok(m) = Meta::decode(&buf)
+                    && m.txn_id == live_txn
+                {
+                    live = Some((slot_page, buf));
+                }
+            }
+            let (live_page, bytes) = live.expect("alguna ranura lleva el ultimo commit");
+
+            // Repunta `root` a una página que EXISTE —un valor plausible,
+            // que la frontera contra la longitud del fichero no puede ver—
+            // conservando el sellado original y recalculando el CRC32, que
+            // es todo lo que un atacante sin la clave puede hacer. El CRC lo
+            // pone `Meta::encode`, el codificador del propio motor: así la
+            // falsificación es exactamente tan buena como la que produciría
+            // el motor si el valor fuese legítimo.
+            let seal = Meta::seal_of(&bytes);
+            let mut forged = Meta::decode(&bytes).unwrap();
+            forged.root = 3;
+            s.write_at(
+                live_page as u64 * page_size,
+                &forged.encode(g.page_size, Some(&seal)),
+            )
+            .unwrap();
+            // Premisa: el CRC recalculado deja la ranura COMPLETA, así que
+            // esto no es un desgarro disfrazado.
+            let mut check = vec![0u8; g.page_size as usize];
+            s.read_at(live_page as u64 * page_size, &mut check).unwrap();
+            assert!(
+                Meta::decode(&check).is_ok(),
+                "{algorithm:?}: la falsificacion tiene que dejar una ranura que decodifique, o \
+                 esta prueba estaria probando un desgarro"
+            );
+
+            let result = Db::open(Box::new(s.clone()), opts);
+            assert!(
+                matches!(
+                    result.as_ref(),
+                    Err(inro::Error::Corrupt { kind: inro::CorruptKind::MetaAuth, .. })
+                ),
+                "{algorithm:?}: una ranura completa que no autentica debe parar la apertura, no \
+                 caer en silencio a la ranura anterior; se obtuvo {:?}",
+                result.map(|_| "Ok(Db)")
             );
         }
     }
@@ -2343,20 +2517,50 @@ mod encrypted {
             // bytes 16..24; AES-256-GCM-SIV, con 12 bytes de nonce útiles,
             // en los 8..12), solo de que el contador de la primera
             // escritura valga lo mismo que el de un flujo recién creado.
-            let counter_zero_of = |first: &[u8]| {
+            //
+            // **`Db::create` gasta dos nonces antes de la primera página**
+            // (`METAS_SEALED_AT_CREATE`), desde la meta autenticada: sella
+            // las ranuras A y B, y el tag de una meta sale del MISMO flujo
+            // que el de una página — es lo que garantiza que los dos no
+            // compartan nonce nunca bajo la misma clave (ver
+            // `crypto::seal_meta`). `Db::open` no escribe ninguna meta, así
+            // que la apertura de después de la caída sí arranca su primera
+            // página en el contador cero. La cifra no se escribe a ojo: se
+            // usa para RECONSTRUIR el nonce esperado con el generador del
+            // motor, así que si algún día `create` sellara otra cosa más,
+            // esto lo dice.
+            const METAS_SEALED_AT_CREATE: u32 = 2;
+            let nonce_after_skipping = |first: &[u8], skip: u32| {
                 let mut prefix = [0u8; NONCE_PREFIX_LEN];
                 prefix.copy_from_slice(&first[..NONCE_PREFIX_LEN]);
-                NonceStream::from_prefix(prefix).next(algorithm).unwrap()[..nonce_len].to_vec()
+                let mut stream = NonceStream::from_prefix(prefix);
+                for _ in 0..skip {
+                    stream.next(algorithm).unwrap();
+                }
+                stream.next(algorithm).unwrap()[..nonce_len].to_vec()
             };
-            for (label, first) in [("antes", &before[0]), ("despues", &after[0])] {
+            for (label, first, burned) in [
+                ("antes", &before[0], METAS_SEALED_AT_CREATE),
+                ("despues", &after[0], 0),
+            ] {
                 assert_eq!(
                     first,
-                    &counter_zero_of(first),
+                    &nonce_after_skipping(first, burned),
                     "{algorithm:?}: la primera pagina sellada {label} de la caida no usa el nonce \
-                     de contador CERO de su propio prefijo, asi que el contador no arranca de \
-                     cero en cada apertura y esta prueba no esta comprobando lo que dice"
+                     que le tocaria a un flujo RECIEN creado con su propio prefijo tras {burned} \
+                     sellados de meta, asi que el contador no arranca de cero en cada apertura y \
+                     esta prueba no esta comprobando lo que dice"
                 );
             }
+            // Y el contador SÍ rebobina de verdad: el flujo de la segunda
+            // apertura vuelve a repartir valores que la primera ya gastó
+            // —de hecho arranca por debajo de donde la primera empezó a
+            // sellar páginas— y aun así (1) no hay ni un nonce repetido.
+            assert_eq!(
+                after[0],
+                nonce_after_skipping(&after[0], 0),
+                "{algorithm:?}: la segunda apertura no arranca en el contador cero"
+            );
             assert_ne!(
                 before[0], after[0],
                 "{algorithm:?}: las dos aperturas arrancan con el MISMO nonce — el prefijo \

@@ -415,24 +415,41 @@ impl Db {
         // para que las dos ranuras se escriban con él.
         let encryption = Self::init_data_key(&opts, &mut meta)?;
 
-        // Ambas ranuras se inicializan para que la primera apertura encuentre
-        // una meta válida pase lo que pase.
-        meta.store(storage.as_ref(), &geometry, MetaSlot::A)?;
-        meta.store(storage.as_ref(), &geometry, MetaSlot::B)?;
-        storage.sync()?;
-
         // El prefijo de nonce se sortea aquí, una vez, exactamente igual
         // que en `Db::open`: una base recién creada y una reabierta son la
         // misma situación desde el punto de vista del cifrado — cada
         // apertura estrena su propio espacio de nonces y arranca el
         // contador en cero. Ver `WriterState::nonce_stream`.
-        let writer_state = WriterState {
+        //
+        // **Antes de escribir las metas, no después** (lo era hasta la meta
+        // autenticada): el sellado de cada ranura saca su nonce de este
+        // mismo flujo, así que tiene que existir ya. Los dos primeros
+        // nonces de la vida del fichero se van en las dos ranuras de aquí
+        // abajo; la primera página sellada estrena el tercero.
+        let mut writer_state = WriterState {
             freelist: Freelist::empty(),
             nonce_stream: Self::new_nonce_stream(encryption.is_some())?,
             // Fichero recién creado: no hay ninguna página más allá de lo
             // que la meta ya declara, así que el suelo coincide con ella.
             n_pages_floor: meta.n_pages,
         };
+
+        // Ambas ranuras se inicializan para que la primera apertura encuentre
+        // una meta válida pase lo que pase. Con el MISMO contenido pero
+        // sellados DISTINTOS: cada tag ata su ranura a su letra (ver
+        // `MetaSlot::index`), así que las dos son idénticas byte a byte en
+        // 0..108 y distintas en 108..152.
+        for slot in [MetaSlot::A, MetaSlot::B] {
+            let seal = Self::seal_meta_for(
+                encryption.as_ref(),
+                writer_state.nonce_stream.as_mut(),
+                &geometry,
+                &meta,
+                slot,
+            )?;
+            meta.store(storage.as_ref(), &geometry, slot, seal.as_ref())?;
+        }
+        storage.sync()?;
         Ok(Self::assemble(storage, geometry, meta, MetaSlot::A, opts, writer_state, encryption))
     }
 
@@ -494,14 +511,34 @@ impl Db {
         if used_mirror {
             let _ = geometry.write(storage.as_ref()).and_then(|()| storage.sync());
         }
-        let (mut meta, slot) = Meta::load(storage.as_ref(), &geometry)?;
-        // Se desenvuelve ANTES de construir el `Pager` provisional que lee
-        // la lista de libres, no solo el definitivo de `assemble`: si la
-        // base está cifrada, sus páginas de lista de libres también lo
-        // están (`Freelist::flush` usa `Pager::write_encrypted`, ver
-        // `freelist.rs`), así que ese `Pager` provisional necesita la
-        // misma clave para poder leerlas.
-        let encryption = Self::open_data_key(&opts, &meta)?;
+        // **La selección de ranura y el desenvolvimiento de la clave son el
+        // MISMO paso desde la meta autenticada**, y tienen que serlo: una
+        // ranura no es aceptable hasta que su tag valida, y su tag no se
+        // puede comprobar sin la clave que ella misma lleva envuelta. Ver
+        // `Meta::load_verified` para el orden completo y para por qué eso no
+        // es un círculo vicioso.
+        //
+        // La clave se desenvuelve además ANTES de construir el `Pager`
+        // provisional que lee la lista de libres, no solo el definitivo de
+        // `assemble`: si la base está cifrada, sus páginas de lista de
+        // libres también lo están (`Freelist::flush` usa
+        // `Pager::write_encrypted`, ver `freelist.rs`), así que ese `Pager`
+        // provisional necesita la misma clave para poder leerlas.
+        //
+        // Coste: se desenvuelve UNA vez —exactamente las mismas que antes
+        // de este cambio, porque `accept` corre sobre la ranura ganadora y
+        // sobre ninguna otra— y se verifica UN tag sobre 108 bytes de datos
+        // asociados. Ni una lectura de más: `load_verified` lee las dos
+        // ranuras, que es lo que `Meta::load` ya leía. El criterio de
+        // `open_costs_the_same_on_a_small_and_a_large_file` no se mueve.
+        let mut encryption = None;
+        let (mut meta, slot) =
+            Meta::load_verified(storage.as_ref(), &geometry, &mut |meta, raw, slot| {
+                let enc = Self::open_data_key(&opts, meta)?;
+                Self::verify_meta_slot(enc.as_ref(), &geometry, raw, slot)?;
+                encryption = enc;
+                Ok(())
+            })?;
         let pager = Pager::new(storage, geometry, opts.cache_pages).with_encryption(encryption);
 
         // **LA FRONTERA DE VALIDACIÓN DE LA META.** Se toma la extensión
@@ -698,9 +735,15 @@ impl Db {
     ///   DISPERSO que el commit acepta sin quejarse y que ya no se puede
     ///   reabrir); y `audit_pages` reservaba `vec![false; n_pages]`, 4,29 GB
     ///   de golpe con `n_pages = u32::MAX`. La comprobación vale para
-    ///   bases CIFRADAS igual que para las demás: las metas viajan en claro
-    ///   con solo un CRC32 (`Meta::store`), así que este es el único sitio
-    ///   donde una `n_pages` manipulada de una base cifrada se puede parar.
+    ///   bases CIFRADAS igual que para las demás, y sigue haciendo falta en
+    ///   las dos aunque desde el formato 3 la meta de una base cifrada esté
+    ///   autenticada: **esta frontera es la ÚNICA defensa de una base sin
+    ///   cifrar**, donde no hay clave y por tanto no hay nada que
+    ///   autenticar. En una base cifrada pasa a ser la segunda línea —el tag
+    ///   rechaza la ranura antes de llegar aquí— pero cada una atrapa lo que
+    ///   la otra no puede: el tag no sabe si un valor es plausible, y esta
+    ///   comprobación no sabe si un valor plausible es auténtico. Ver
+    ///   `tampering_tests::authenticated_meta`.
     ///
     /// - **`root` / `catalog_root` fuera del fichero**: una raíz que no
     ///   direcciona ninguna página real. Hoy degradan solas (leerla da
@@ -861,6 +904,103 @@ impl Db {
     #[cfg(not(feature = "encryption"))]
     fn new_nonce_stream(_encrypted: bool) -> Result<Option<crate::crypto::NonceStream>> {
         Ok(None)
+    }
+
+    /// El sellado que le toca a `slot` con el contenido de `meta`, o `None`
+    /// si la base no está cifrada.
+    ///
+    /// **Un único sitio para las CINCO escrituras de meta que existen**
+    /// (las dos de `Db::create`, la del commit, la del segundo `store_via`
+    /// del recorte y la de `relocate_meta_b`): un sellado olvidado en
+    /// cualquiera de ellas produce una ranura que la apertura siguiente
+    /// rechaza como manipulada, así que la forma de no olvidarlo es que
+    /// escribir una meta sin pasar por aquí no compile — `Meta::store`/
+    /// `store_via` exigen el parámetro.
+    ///
+    /// `Err` si la base está cifrada pero no hay flujo de nonces: sería un
+    /// fallo interno (los dos campos nacen juntos en `WriterState`), y
+    /// sellar con un nonce inventado es exactamente lo que no se puede
+    /// hacer — ver `crypto::seal_meta`.
+    #[cfg(feature = "encryption")]
+    fn seal_meta_for(
+        encryption: Option<&Encryption>,
+        stream: Option<&mut crate::crypto::NonceStream>,
+        geometry: &Geometry,
+        meta: &Meta,
+        slot: MetaSlot,
+    ) -> Result<Option<crate::meta::MetaSeal>> {
+        match (encryption, stream) {
+            (None, _) => Ok(None),
+            (Some(enc), Some(stream)) => Ok(Some(crate::crypto::seal_meta(
+                enc,
+                stream,
+                &geometry.db_id,
+                slot.index(),
+                &meta.payload(),
+            )?)),
+            (Some(_), None) => Err(Error::BadFormat),
+        }
+    }
+
+    /// Sin la feature no hay nada que sellar: `init_data_key`/
+    /// `open_data_key` ya han fallado alto si alguien pidió cifrado o si el
+    /// fichero dice estarlo, así que `encryption` solo puede ser `None`.
+    #[cfg(not(feature = "encryption"))]
+    fn seal_meta_for(
+        encryption: Option<&Encryption>,
+        _stream: Option<&mut crate::crypto::NonceStream>,
+        _geometry: &Geometry,
+        _meta: &Meta,
+        _slot: MetaSlot,
+    ) -> Result<Option<crate::meta::MetaSeal>> {
+        match encryption {
+            None => Ok(None),
+            Some(_) => Err(Error::BadFormat),
+        }
+    }
+
+    /// La otra mitad de `seal_meta_for`, sobre los bytes CRUDOS de la
+    /// ranura tal como están en el plato — no sobre una recodificación de
+    /// los campos decodificados, que dejaría los dos huecos reservados
+    /// (32..40 y 100..108) fuera de la autenticación de hecho. Ver
+    /// `crypto::meta_associated_data`.
+    #[cfg(feature = "encryption")]
+    fn verify_meta_slot(
+        encryption: Option<&Encryption>,
+        geometry: &Geometry,
+        raw: &[u8],
+        slot: MetaSlot,
+    ) -> Result<()> {
+        let Some(enc) = encryption else { return Ok(()) };
+        let mut payload = [0u8; crate::meta::META_AUTH_END];
+        payload.copy_from_slice(&raw[..crate::meta::META_AUTH_END]);
+        crate::crypto::verify_meta(
+            enc,
+            &geometry.db_id,
+            slot.index(),
+            &payload,
+            &Meta::seal_of(raw),
+        )
+        .map_err(|_| Error::Corrupt {
+            page: slot.page(geometry),
+            kind: crate::CorruptKind::MetaAuth,
+        })
+    }
+
+    /// Sin la feature, `encryption` solo puede ser `None` (ver
+    /// `seal_meta_for`) y no hay nada que verificar. **Una base cifrada no
+    /// llega aquí**: `open_data_key` la ha rechazado ya con `BadFormat`.
+    #[cfg(not(feature = "encryption"))]
+    fn verify_meta_slot(
+        encryption: Option<&Encryption>,
+        _geometry: &Geometry,
+        _raw: &[u8],
+        _slot: MetaSlot,
+    ) -> Result<()> {
+        match encryption {
+            None => Ok(()),
+            Some(_) => Err(Error::BadFormat),
+        }
     }
 }
 
@@ -1367,6 +1507,35 @@ impl<'db> WriteTxn<'db> {
 
     fn state(&mut self) -> &mut WriterState {
         self.guard.as_mut().expect("el estado del escritor siempre está presente")
+    }
+
+    /// El sellado de `meta` para `slot` con la clave y el flujo de nonces
+    /// de ESTA apertura, o `None` si la base no está cifrada.
+    ///
+    /// Toma `meta` por valor (es `Copy`) en vez de leer `self.meta`: las
+    /// tres escrituras de meta de una transacción no siempre sellan la
+    /// misma — `relocate_meta_b` sella la meta CONFIRMADA
+    /// (`Db::committed`), que puede no ser la que esta transacción está
+    /// construyendo.
+    ///
+    /// El flujo de nonces sale de `WriterState`, no de la transacción: es
+    /// estado de la BASE, y no rebobina ni cuando una transacción se
+    /// descarta sin confirmar (ver `WriterState::nonce_stream`). Es lo que
+    /// impide que un aborto haga sellar dos metas distintas con el mismo
+    /// nonce.
+    fn seal_meta(
+        &mut self,
+        geometry: &Geometry,
+        meta: Meta,
+        slot: MetaSlot,
+    ) -> Result<Option<crate::meta::MetaSeal>> {
+        // `db` se copia fuera (es `&Db`, `Copy`) para que el préstamo de la
+        // clave no compita con el préstamo mutable del flujo de nonces, que
+        // vive en `self.guard`.
+        let db = self.db;
+        let encryption = db.pager.encryption();
+        let stream = self.state().nonce_stream.as_mut();
+        Db::seal_meta_for(encryption, stream, geometry, &meta, slot)
     }
 
     /// Tamaño FÍSICO de página fijado al crear la base. Nadie en `tree.rs`
@@ -2175,7 +2344,13 @@ impl<'db> WriteTxn<'db> {
         // hasta ella sin pagar ningún `fsync` que no se fuera a pagar de
         // todos modos.
         let durable_txn = current.0.txn_id;
-        current.0.store_via(&self.db.pager, &new_geometry, MetaSlot::B)?;
+        // Sellada como ranura B, igual que en su posición vieja: el tag ata
+        // la LETRA de la ranura, no su número de página, precisamente para
+        // que una reubicación no invalide lo que ya estaba escrito — ver
+        // `MetaSlot::index`. De `new_geometry` el sellado solo usa `db_id`,
+        // que es el mismo en las dos; `meta_b_page` no entra en el tag.
+        let seal = self.seal_meta(&new_geometry, current.0, MetaSlot::B)?;
+        current.0.store_via(&self.db.pager, &new_geometry, MetaSlot::B, seal.as_ref())?;
         self.db.sync_upto(durable_txn)?;
 
         new_geometry.write_mirror(self.db.pager.storage())?;
@@ -2569,7 +2744,11 @@ impl<'db> WriteTxn<'db> {
 
         let target = self.slot.other();
         let geometry = self.db.pager.geometry();
-        self.meta.store_via(&self.db.pager, &geometry, target)?;
+        // Un sellado por ranura ESCRITA, no por commit: el camino del
+        // recorte (`Some(cut)`, más abajo) escribe las dos, y cada una
+        // necesita el suyo — mismo contenido, otra letra, otro nonce.
+        let seal = self.seal_meta(&geometry, self.meta, target)?;
+        self.meta.store_via(&self.db.pager, &geometry, target, seal.as_ref())?;
         match cut {
             None => {
                 // Y aquí sí: la meta de esta transacción ya está escrita, así
@@ -2585,7 +2764,8 @@ impl<'db> WriteTxn<'db> {
                 // convierte un corte de corriente en una base irrecuperable.
                 // Ver la cabecera de esta función.
                 self.db.sync_upto(self.meta.txn_id)?;
-                self.meta.store_via(&self.db.pager, &geometry, self.slot)?;
+                let seal = self.seal_meta(&geometry, self.meta, self.slot)?;
+                self.meta.store_via(&self.db.pager, &geometry, self.slot, seal.as_ref())?;
                 self.db.sync_upto(self.meta.txn_id)?;
                 self.db.pager.truncate(n_pages)?;
                 // El suelo de la PRÓXIMA transacción es la extensión real
@@ -5036,11 +5216,20 @@ mod tampering_tests {
 
     /// Reescribe un campo de la meta ganadora con el propio codificador del
     /// crate (CRC de meta incluido), igual que la sonda de la revisión.
+    ///
+    /// **Conserva el sellado ORIGINAL de la ranura** (nonce y tag, bytes
+    /// 108..148) en vez de ponerlo a cero: es el atacante más fuerte que se
+    /// puede modelar sin la clave — cambia lo que quiere, recalcula el CRC
+    /// y deja intacto todo lo que no sabe fabricar. Sobre una base SIN
+    /// cifrar esos 40 bytes son cero de todos modos y esto no cambia nada;
+    /// sobre una cifrada es la diferencia entre probar la autenticación de
+    /// verdad y probar que un tag a cero no vale.
     fn tamper_meta(s: &Arc<MemStorage>, meta_page: PageNo, f: impl FnOnce(&mut Meta)) {
         let b = read_page(s, meta_page);
         let mut meta = Meta::decode(&b).unwrap();
+        let seal = Meta::seal_of(&b);
         f(&mut meta);
-        s.write_at(meta_page as u64 * PS, &meta.encode(PS as u32)).unwrap();
+        s.write_at(meta_page as u64 * PS, &meta.encode(PS as u32, Some(&seal))).unwrap();
     }
 
     /// Cuántas entradas dice tener la página de lista de libres `page`.
@@ -5109,14 +5298,26 @@ mod tampering_tests {
         );
     }
 
-    /// La misma manipulación sobre una base CIFRADA. Las metas viajan en
-    /// claro con solo un CRC32 (`Meta::store` escribe por `pager.write`, no
-    /// por `write_encrypted`), así que los hallazgos 6 y 7 son alcanzables
-    /// sin conocer la clave — a diferencia del resto de la clase, que el
-    /// cifrado por página cierra por accidente. Autenticar la meta es un
-    /// cambio de formato aparte; lo que esta prueba fija es que la frontera
-    /// de `Db::open` cubre ese caso igual, porque se comprueba ANTES de
-    /// tocar ninguna página cifrada.
+    /// La misma manipulación sobre una base CIFRADA, y **ahora se detiene
+    /// una capa antes**.
+    ///
+    /// Cuando se escribió esta prueba, la meta viajaba en claro con solo un
+    /// CRC32, así que los hallazgos 6 y 7 eran alcanzables sin conocer la
+    /// clave — a diferencia del resto de la clase, que el cifrado por
+    /// página cerraba por accidente — y lo único que los paraba era la
+    /// frontera de `Db::open` contra la longitud real del fichero
+    /// (`check_meta_against_file`, `CorruptKind::MetaMismatch`). Esa
+    /// frontera sigue ahí y sigue siendo la única defensa de una base SIN
+    /// cifrar, pero en una cifrada ya no llega a ejecutarse para este caso:
+    /// la ranura no autentica (`CorruptKind::MetaAuth`) y la apertura se
+    /// para en `Meta::load_verified`.
+    ///
+    /// La diferencia no es cosmética. `MetaMismatch` solo atrapa valores
+    /// IMPOSIBLES —una `n_pages` mayor que el fichero, una raíz que no
+    /// direcciona nada—, así que un atacante que se quede dentro de lo
+    /// plausible (repuntar `root` a una página que SÍ existe) lo esquivaba
+    /// entero. `MetaAuth` no depende de que el valor falsificado sea
+    /// absurdo: ver `a_meta_forged_at_every_field_is_rejected_on_open`.
     #[cfg(feature = "encryption")]
     #[test]
     fn a_tampered_page_count_is_rejected_on_an_encrypted_database_too() {
@@ -5140,9 +5341,9 @@ mod tampering_tests {
 
         let result = Db::open(Box::new(Arc::clone(&s)), opts());
         assert!(
-            matches!(result.as_ref(), Err(Error::Corrupt { kind: CorruptKind::MetaMismatch, .. })),
-            "una base cifrada no protege su meta: la frontera tiene que \
-             rechazarla igual; se obtuvo {:?}",
+            matches!(result.as_ref(), Err(Error::Corrupt { kind: CorruptKind::MetaAuth, .. })),
+            "una base cifrada tiene que rechazar su meta manipulada por el TAG, antes de \
+             llegar a la frontera contra la longitud del fichero; se obtuvo {:?}",
             result.map(|_| "Ok(Db)")
         );
     }
@@ -5385,5 +5586,467 @@ mod tampering_tests {
              a la profundidad máxima; se obtuvo {result:?}",
             chain.len()
         );
+    }
+
+    // ---- La meta autenticada (formato 3) -------------------------------
+    //
+    // El octavo hallazgo de la ronda de manipulación, el único que quedó
+    // abierto entonces por ser un cambio de formato: **una base cifrada no
+    // detectaba una meta falsificada**. Los hallazgos 6 y 7 se cerraron
+    // contrastando la meta contra la longitud real del fichero, que atrapa
+    // valores IMPOSIBLES; lo que sigue ataca con valores PLAUSIBLES, que
+    // aquella frontera no puede ver.
+    //
+    // Todo se conduce desde `Db::open` con el API público, nunca llamando a
+    // un validador interno: la pregunta es si la PUERTA rechaza el fichero,
+    // no si existe una función que sepa decir que no.
+
+    #[cfg(feature = "encryption")]
+    mod authenticated_meta {
+        use super::*;
+        use crate::crypto::{Algorithm, Encryption};
+        use crate::meta::META_AUTH_END;
+
+        const MASTER: [u8; 32] = [0xa7; 32];
+
+        fn algorithms() -> Vec<Algorithm> {
+            #[allow(unused_mut)]
+            let mut v = vec![Algorithm::XChaCha20Poly1305];
+            #[cfg(feature = "aes")]
+            v.push(Algorithm::Aes256GcmSiv);
+            v
+        }
+
+        fn opts_for(key: [u8; 32], algorithm: Algorithm) -> Options {
+            Options {
+                encryption: Some(Encryption { key, algorithm }),
+                ..Options::default()
+            }
+        }
+
+        /// Base cifrada con datos reales y varios commits detrás, de modo
+        /// que las dos ranuras lleven metas DISTINTAS (`txn_id` consecutivos
+        /// y raíces distintas) — sin eso, un fallo de "cae a la otra ranura"
+        /// pasaría inadvertido porque las dos dirían lo mismo.
+        ///
+        /// Devuelve `(página de la ranura viva, página de la otra)`.
+        fn seeded_encrypted(s: &Arc<MemStorage>, opts: Options) -> (PageNo, PageNo) {
+            let db = Db::create(Box::new(Arc::clone(s)), opts).unwrap();
+            for i in 0..20u32 {
+                let mut tx = db.begin_write().unwrap();
+                tx.put(0x01, &i.to_be_bytes(), &[7u8; 60]).unwrap();
+                tx.commit().unwrap();
+            }
+            let (live_meta, slot) = *db.committed.read().unwrap();
+            let geometry = db.pager.geometry();
+            let live = slot.page(&geometry);
+            let stale = slot.other().page(&geometry);
+            assert_ne!(live, stale);
+            // Premisa: las dos ranuras difieren de verdad.
+            let mut other = vec![0u8; PS as usize];
+            s.read_at(stale as u64 * PS, &mut other).unwrap();
+            let other = Meta::decode(&other).expect("la ranura vieja tambien decodifica");
+            assert_ne!(
+                other.txn_id, live_meta.txn_id,
+                "el fixture necesita dos ranuras con contenido distinto"
+            );
+            (live, stale)
+        }
+
+        /// Reescribe la ranura de `page` conservando su sellado original
+        /// (nonce y tag) y recalculando el CRC32 — el atacante más fuerte
+        /// que se puede modelar sin la clave.
+        fn forge(s: &Arc<MemStorage>, page: PageNo, f: impl FnOnce(&mut Meta)) {
+            let b = read_page(s, page);
+            let seal = Meta::seal_of(&b);
+            let mut meta = Meta::decode(&b).unwrap();
+            f(&mut meta);
+            s.write_at(page as u64 * PS, &meta.encode(PS as u32, Some(&seal))).unwrap();
+        }
+
+        /// Igual, pero tocando bytes CRUDOS: sirve para las regiones que
+        /// `Meta` no modela (los dos huecos reservados a cero).
+        fn forge_raw(s: &Arc<MemStorage>, page: PageNo, at: usize, value: u8) {
+            let mut b = read_page(s, page);
+            b[at] = value;
+            let crc = crate::crc32::checksum(&b[..crate::meta::META_SIZE - 4]);
+            b[crate::meta::META_SIZE - 4..crate::meta::META_SIZE]
+                .copy_from_slice(&crc.to_le_bytes());
+            s.write_at(page as u64 * PS, &b).unwrap();
+        }
+
+        /// **La prueba central.** Un campo cada vez, con el CRC recalculado
+        /// y el sellado original intacto: `Db::open` tiene que negarse.
+        ///
+        /// **Comportamiento sin este cambio, MEDIDO** (autenticación
+        /// desactivada, formato y sellado intactos): ocho de las nueve
+        /// falsificaciones de campo y las CUATRO de byte reservado abrían la
+        /// base con `Ok(Db)` y sin una sola queja.
+        ///
+        /// - `root = 3`: `Db::open` devuelve `Ok`, y de las veinte claves
+        ///   confirmadas **catorce desaparecen** (`get` → `Ok(None)`,
+        ///   ni un `Err` en ninguna) mientras seis siguen contestando. Es
+        ///   el caso que da nombre a todo esto: acepta una meta falsificada
+        ///   y devuelve datos equivocados, en silencio.
+        /// - `txn_id += 1000`: `Ok(Db)` montando por la ranura falsificada,
+        ///   que a partir de ahí gana la selección para siempre — la
+        ///   genuina no vuelve a montar por muchos commits que se hagan.
+        /// - `n_pages -= 1`, `flags`, `format_major`, `catalog_root`,
+        ///   `freelist_head`/`tail` y los cuatro bytes reservados: `Ok(Db)`.
+        ///
+        /// La única que ya fallaba era `wrapped_key`, y no por
+        /// autenticación de la meta sino porque esos 60 bytes son un AEAD
+        /// bajo la clave MAESTRA desde la tarea 17: `Err(Decrypt)`. Se
+        /// mantiene en la lista precisamente para dejar constancia de qué
+        /// parte del hueco ya estaba tapada y cuál no.
+        ///
+        /// Y el límite de la única defensa que había: `n_pages = u32::MAX`
+        /// sí fallaba con `MetaMismatch` (hallazgo 7,
+        /// `check_meta_against_file` contra la longitud real), pero
+        /// `n_pages -= 1` —igual de falso, y plausible— pasaba. Por eso la
+        /// lista de arriba usa el valor plausible y no el absurdo.
+        #[test]
+        fn a_meta_forged_at_every_field_is_rejected_on_open() {
+            type Forgery = (&'static str, fn(&mut Meta));
+            // `root` y `catalog_root` apuntan a una página que EXISTE (el
+            // fixture tiene decenas): un valor plausible, invisible para
+            // `check_meta_against_file`, que es lo que hace que esta prueba
+            // diga algo nuevo.
+            const FORGERIES: &[Forgery] = &[
+                ("txn_id", |m| m.txn_id += 1_000),
+                ("root", |m| m.root = 3),
+                ("catalog_root", |m| m.catalog_root = 3),
+                ("freelist_head", |m| m.freelist_head = 3),
+                ("freelist_tail", |m| m.freelist_tail = 3),
+                ("n_pages", |m| m.n_pages -= 1),
+                ("flags", |m| m.flags ^= crate::header::FLAG_PREFIX_COMPRESSION),
+                ("format_major", |m| m.format_major = 99),
+                ("wrapped_key", |m| {
+                    let mut w = m.wrapped_key.expect("base cifrada");
+                    w[0] ^= 0xff;
+                    m.wrapped_key = Some(w);
+                }),
+            ];
+
+            for algorithm in algorithms() {
+                let opts = opts_for(MASTER, algorithm);
+                for (name, forgery) in FORGERIES {
+                    let s = medium();
+                    let (live, _) = seeded_encrypted(&s, opts);
+                    forge(&s, live, *forgery);
+
+                    let result = Db::open(Box::new(Arc::clone(&s)), opts);
+                    assert!(
+                        result.is_err(),
+                        "{algorithm:?}/{name}: una meta falsificada con el CRC recalculado \
+                         abrio la base; sin autenticacion esto devuelve Ok(Db) y el motor \
+                         sirve el estado que eligio el atacante"
+                    );
+                }
+
+                // Los dos huecos reservados a cero, byte a byte crudo: no
+                // los modela `Meta`, así que `decode`/`encode` los
+                // normalizaría y una autenticación calculada sobre los
+                // campos RECODIFICADOS (en vez de sobre los bytes del
+                // plato) los dejaría fuera de cobertura sin que se note.
+                for at in [32usize, 39, 100, 107] {
+                    let s = medium();
+                    let (live, _) = seeded_encrypted(&s, opts);
+                    forge_raw(&s, live, at, 0xff);
+
+                    let result = Db::open(Box::new(Arc::clone(&s)), opts);
+                    assert!(
+                        matches!(
+                            result.as_ref(),
+                            Err(Error::Corrupt { kind: CorruptKind::MetaAuth, .. })
+                        ),
+                        "{algorithm:?}: el byte reservado {at} no esta autenticado; se obtuvo {:?}",
+                        result.map(|_| "Ok(Db)")
+                    );
+                }
+            }
+        }
+
+        /// `page_size_log2` se queda fuera de la lista de arriba porque su
+        /// desenlace es OTRO, no porque no esté autenticado: la ranura se
+        /// descarta antes de llegar a la autenticación, en la comprobación
+        /// de geometría contra la cabecera que `Meta::load_verified` hereda
+        /// del formato 1. Con la ranura viva descartada, la base monta por
+        /// la vieja — que es lo correcto para el caso que esa comprobación
+        /// modela (leer con el tamaño de página equivocado), y sigue sin
+        /// darle al atacante lo que buscaba: lo único que consigue es una
+        /// vuelta atrás, que es el límite conocido de este diseño.
+        ///
+        /// Falsificando las DOS ranuras no queda candidata ninguna y la
+        /// apertura falla.
+        #[test]
+        fn a_forged_page_size_is_discarded_by_the_geometry_check_not_by_the_tag() {
+            for algorithm in algorithms() {
+                let opts = opts_for(MASTER, algorithm);
+                let s = medium();
+                let (live, stale) = seeded_encrypted(&s, opts);
+                let live_txn = Meta::decode(&read_page(&s, live)).unwrap().txn_id;
+                forge(&s, live, |m| m.page_size_log2 = 12);
+
+                let db = Db::open(Box::new(Arc::clone(&s)), opts)
+                    .expect("con una ranura sana la base sigue abriendo");
+                assert!(
+                    db.committed.read().unwrap().0.txn_id < live_txn,
+                    "{algorithm:?}: deberia haber montado por la ranura vieja"
+                );
+                drop(db);
+
+                forge(&s, stale, |m| m.page_size_log2 = 12);
+                assert!(
+                    Db::open(Box::new(Arc::clone(&s)), opts).is_err(),
+                    "{algorithm:?}: sin ninguna ranura de geometria coherente no hay base"
+                );
+            }
+        }
+
+        /// Falsificar SOLO la ranura viva no debe caer a la vieja en
+        /// silencio: eso convertiría un ataque detectado en una vuelta atrás
+        /// sin señal. Ver `Meta::load_verified`.
+        ///
+        /// **Sin este cambio, medido:** `Ok(Db)`, y catorce de las veinte
+        /// claves confirmadas devuelven `Ok(None)` — desaparecidas, sin un
+        /// solo error por ninguna parte. Ver
+        /// `a_meta_forged_at_every_field_is_rejected_on_open`.
+        #[test]
+        fn forging_only_the_live_slot_does_not_silently_fall_back_to_the_older_one() {
+            for algorithm in algorithms() {
+                let opts = opts_for(MASTER, algorithm);
+                let s = medium();
+                let (live, _) = seeded_encrypted(&s, opts);
+                forge(&s, live, |m| m.root = 3);
+
+                let result = Db::open(Box::new(Arc::clone(&s)), opts);
+                assert!(
+                    matches!(
+                        result.as_ref(),
+                        Err(Error::Corrupt { kind: CorruptKind::MetaAuth, .. })
+                    ),
+                    "{algorithm:?}: se esperaba Err(Corrupt{{MetaAuth}}) y NO una vuelta atrás \
+                     silenciosa a la otra ranura; se obtuvo {:?}",
+                    result.map(|_| "Ok(Db)")
+                );
+            }
+        }
+
+        /// Intercambiar el contenido de las dos ranuras. Las dos son metas
+        /// genuinas de esta misma base, con su CRC y su tag de verdad: lo
+        /// único que cambia es dónde vive cada una.
+        ///
+        /// **Sin la identidad de la ranura en los datos asociados esto
+        /// pasaría desapercibido** aunque el tag existiera, y no sería un
+        /// ataque menor: quien controla qué ranura ocupa cada `txn_id`
+        /// controla cuál gana la selección de `Meta::load_verified`, es
+        /// decir con qué versión del árbol monta la base.
+        ///
+        /// **Sin este cambio, medido:** `Ok(Db)`, montando tan campante por
+        /// la ranura que el atacante colocó donde quiso.
+        #[test]
+        fn swapping_the_two_meta_slots_is_rejected() {
+            for algorithm in algorithms() {
+                let opts = opts_for(MASTER, algorithm);
+                let s = medium();
+                let (live, stale) = seeded_encrypted(&s, opts);
+
+                let (a, b) = (read_page(&s, live), read_page(&s, stale));
+                s.write_at(live as u64 * PS, &b).unwrap();
+                s.write_at(stale as u64 * PS, &a).unwrap();
+
+                let result = Db::open(Box::new(Arc::clone(&s)), opts);
+                assert!(
+                    matches!(
+                        result.as_ref(),
+                        Err(Error::Corrupt { kind: CorruptKind::MetaAuth, .. })
+                    ),
+                    "{algorithm:?}: intercambiar las ranuras debe fallar la autenticacion; \
+                     se obtuvo {:?}",
+                    result.map(|_| "Ok(Db)")
+                );
+            }
+        }
+
+        /// Una meta de OTRA base, en sus dos variantes, que se paran en dos
+        /// capas distintas del orden de apertura:
+        ///
+        /// - **Otra clave maestra**: el envoltorio de los bytes 40..100 no
+        ///   abre con la maestra de esta base, así que ni siquiera se llega
+        ///   a tener una clave de datos con la que comprobar el tag.
+        ///   `Err(Decrypt)`.
+        /// - **La MISMA clave maestra, otro fichero**: el envoltorio SÍ
+        ///   abre, y da la clave de datos de la otra base — con la que su
+        ///   tag es perfectamente válido. Lo que no cuadra es el `db_id`,
+        ///   que viaja en los datos asociados y sale de la CABECERA de este
+        ///   fichero. `Err(Corrupt{MetaAuth})`.
+        ///
+        /// El segundo caso es el que justifica meter `db_id` en los datos
+        /// asociados: sin él, un atacante que gestione dos bases con la
+        /// misma clave maestra —el caso normal de un servidor con miles de
+        /// bases por inquilino, que es justo el escenario de este motor—
+        /// puede trasplantar metas entre ellas sin conocer ninguna clave de
+        /// datos.
+        ///
+        /// **Sin este cambio, medido:** el primer caso ya fallaba
+        /// (`Err(Decrypt)`, el AEAD del envoltorio bajo la maestra, que
+        /// existe desde la tarea 17). El segundo NO se rechazaba por nada
+        /// que se pareciese a una comprobación de identidad: daba
+        /// `Err(Decrypt { page: 10 })` — la meta ajena se aceptaba entera y
+        /// el fallo aparecía después, al intentar descifrar una página del
+        /// árbol con la clave de datos de otra base, con un diagnóstico que
+        /// dice "tus datos están corruptos" en vez de "esta meta no es de
+        /// este fichero".
+        ///
+        /// Y ese rechazo era ACCIDENTAL, no una garantía: depende de que
+        /// las páginas que la meta ajena referencia no se dejen descifrar
+        /// aquí. Variando la forma de la base donante, el mismo trasplante
+        /// daba `Err(Corrupt{MetaMismatch})` (por `n_pages` contra la
+        /// longitud del fichero) o directamente `Ok(Db)` — tres desenlaces
+        /// distintos por tres razones que no tienen nada que ver entre sí ni
+        /// con la autenticidad de la meta. Con el `db_id` en los datos
+        /// asociados hay una sola razón y siempre la misma.
+        #[test]
+        fn a_meta_from_another_database_is_rejected() {
+            for algorithm in algorithms() {
+                for (label, other_master, expected_auth) in [
+                    ("otra clave maestra", [0x11u8; 32], false),
+                    ("misma clave, otro fichero", MASTER, true),
+                ] {
+                    let victim = medium();
+                    let (live, _) = seeded_encrypted(&victim, opts_for(MASTER, algorithm));
+
+                    let donor = medium();
+                    let (donor_live, _) =
+                        seeded_encrypted(&donor, opts_for(other_master, algorithm));
+
+                    // La ranura donante se copia a la MISMA letra de ranura
+                    // que ocupaba en su base, para que el intercambio de
+                    // ranuras no sea lo que la delate: lo único distinto es
+                    // el fichero.
+                    assert_eq!(
+                        live % PS as u32,
+                        donor_live % PS as u32,
+                        "las dos bases deberian tener la misma geometria"
+                    );
+                    let bytes = read_page(&donor, donor_live);
+                    victim.write_at(live as u64 * PS, &bytes).unwrap();
+
+                    let result = Db::open(Box::new(Arc::clone(&victim)), opts_for(MASTER, algorithm));
+                    if expected_auth {
+                        assert!(
+                            matches!(
+                                result.as_ref(),
+                                Err(Error::Corrupt { kind: CorruptKind::MetaAuth, .. })
+                            ),
+                            "{algorithm:?}/{label}: se esperaba fallo de autenticacion por db_id; \
+                             se obtuvo {:?}",
+                            result.map(|_| "Ok(Db)")
+                        );
+                    } else {
+                        assert!(
+                            matches!(result.as_ref(), Err(Error::Decrypt { .. })),
+                            "{algorithm:?}/{label}: se esperaba Err(Decrypt) al desenvolver; \
+                             se obtuvo {:?}",
+                            result.map(|_| "Ok(Db)")
+                        );
+                    }
+                }
+            }
+        }
+
+        /// El límite que este diseño NO cierra, escrito como prueba para
+        /// que quede documentado y no como una frase optimista en un
+        /// comentario: **una meta ANTIGUA y genuina de esta misma base se
+        /// acepta**. Está firmada con la clave correcta, con el `db_id`
+        /// correcto y en la ranura correcta; nada dentro del fichero puede
+        /// distinguirla de la actual salvo su `txn_id`, y el `txn_id` lo
+        /// eligió quien escribió la copia.
+        ///
+        /// Defenderse de esto exige un ancla de confianza FUERA del
+        /// fichero — un contador monótono en hardware, o el `txn_id`
+        /// esperado guardado en otro sitio — que este motor no tiene y que
+        /// esta tarea no promete. Ver el informe.
+        #[test]
+        fn an_older_genuine_meta_of_the_same_database_still_replays() {
+            for algorithm in algorithms() {
+                let opts = opts_for(MASTER, algorithm);
+                let s = medium();
+                let (live, stale) = seeded_encrypted(&s, opts);
+
+                // La copia de seguridad que un atacante haría: los bytes de
+                // la ranura vieja, guardados y vueltos a poner encima de la
+                // nueva. Sigue siendo la ranura de la letra equivocada, así
+                // que se pone en SU sitio (la vieja) y se destruye la nueva
+                // — que es todo lo que hace falta para retroceder.
+                let old = read_page(&s, stale);
+                s.write_at(stale as u64 * PS, &old).unwrap();
+                s.write_at(live as u64 * PS, &[0u8; PS as usize]).unwrap();
+
+                let db = Db::open(Box::new(Arc::clone(&s)), opts)
+                    .expect("una meta genuina y vieja autentica perfectamente");
+                let rolled_back = db.committed.read().unwrap().0.txn_id;
+                let current = Meta::decode(&old).unwrap().txn_id;
+                assert_eq!(
+                    rolled_back, current,
+                    "{algorithm:?}: la meta vieja monta, y eso es un limite conocido del \
+                     diseño, no un defecto abierto"
+                );
+            }
+        }
+
+        /// La región autenticada cubre exactamente `0..META_AUTH_END` y ni
+        /// un byte más: cambiar el nonce o el tag hace la ranura ilegible
+        /// (fallan el CRC, que va después), no "aceptable de otra forma".
+        /// Fija que el CRC sigue cubriendo el sellado.
+        #[test]
+        fn the_checksum_covers_the_seal_too() {
+            let opts = opts_for(MASTER, Algorithm::XChaCha20Poly1305);
+            for at in [META_AUTH_END, crate::meta::META_TAG_OFF] {
+                let s = medium();
+                let (live, _) = seeded_encrypted(&s, opts);
+                let mut b = read_page(&s, live);
+                b[at] ^= 0xff;
+                // SIN recalcular el CRC: el sellado está dentro de lo que
+                // cubre, así que tocarlo ya rompe el CRC.
+                s.write_at(live as u64 * PS, &b).unwrap();
+
+                let mut probe = vec![0u8; PS as usize];
+                s.read_at(live as u64 * PS, &mut probe).unwrap();
+                assert!(
+                    matches!(
+                        Meta::decode(&probe),
+                        Err(Error::Corrupt { kind: CorruptKind::Checksum, .. })
+                    ),
+                    "el byte {at} del sellado deberia entrar en el CRC32 de la ranura"
+                );
+            }
+        }
+
+        /// Una base SIN cifrar deja el sellado a cero y `Db::open` no
+        /// comprueba nada más que el CRC. **No es un descuido: es lo que el
+        /// formato sin cifrado garantiza**, y decirlo con una prueba impide
+        /// que alguien lea el resto de este módulo y suponga que la
+        /// autenticación protege también ahí.
+        #[test]
+        fn without_encryption_there_is_no_key_and_therefore_no_authentication() {
+            let s = medium();
+            let (live, _) = seeded(&s);
+            let bytes = read_page(&s, live);
+            assert_eq!(
+                &bytes[META_AUTH_END..crate::meta::META_SIZE - 4],
+                &[0u8; crate::crypto::STORED_NONCE_LEN + crate::crypto::TAG_LEN][..],
+                "sin cifrado el sellado se escribe a cero"
+            );
+
+            // Y la misma falsificación que una base cifrada rechaza, aquí
+            // se acepta: `root` a una página existente, CRC recalculado.
+            forge(&s, live, |m| m.root = 3);
+            assert!(
+                Db::open(Box::new(Arc::clone(&s)), Options::default()).is_ok(),
+                "sin clave no hay nada con lo que rechazarla, y el formato no promete otra cosa"
+            );
+        }
     }
 }

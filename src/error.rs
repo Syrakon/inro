@@ -31,6 +31,19 @@ pub enum Error {
     /// que el descifrado falla como si la clave fuera incorrecta o la
     /// página estuviera manipulada. Rechazar por versión, una sola regla
     /// para todos, dice exactamente lo que pasa.
+    ///
+    /// **El formato 3 (meta autenticada) añade un motivo que el 2 no
+    /// tenía, y es de seguridad, no de comodidad.** Una ranura de meta pasó
+    /// de 112 a 152 bytes, con el CRC32 mudándose de 108..112 a 148..152:
+    /// leída con la disposición vieja, una ranura nueva falla el CRC, así
+    /// que un fichero del formato 3 nunca se malinterpretaría por un
+    /// binario del 2. Al revés sí importaría: si este binario aceptara
+    /// ficheros del formato 2, existiría una vía de apertura SIN
+    /// autenticar, y bastaría bajar el `format_major` de la cabecera —que
+    /// no está autenticada, ni puede estarlo: hay que leerla para saber
+    /// dónde vive la meta que lleva la clave— para volver a colar metas
+    /// falsificadas con solo un CRC32 recalculado. Un rechazo limpio por
+    /// versión cierra esa puerta sin tener que autenticar la cabecera.
     VersionTooOld { found: u16, supported: u16 },
     /// Este proceso ya tiene abierto ese mismo fichero (`FileStorage::open`,
     /// comparando rutas CANONICALIZADAS: `./base` y `/abs/base` son la
@@ -161,6 +174,23 @@ pub enum CorruptKind {
     /// recorrido acotado.
     OverflowLoop,
     MetaMismatch,
+    /// Una meta-ranura COMPLETA (su CRC32 cuadra con sus propios bytes) que
+    /// no lleva el tag de autenticación que le corresponde bajo la clave de
+    /// datos de esta base. Solo alcanzable en una base CIFRADA: sin clave no
+    /// hay nada con lo que autenticar (ver `meta::MetaSeal`).
+    ///
+    /// **Distinto de `Checksum`, y el distingo es toda la señal.** Una
+    /// ranura desgarrada por un corte de corriente falla el CRC —los bytes
+    /// que hay en el plato son mitad de una meta y mitad de otra, y ningún
+    /// CRC certifica esa mezcla— y el motor la descarta en silencio para
+    /// montar por la otra ranura: es exactamente el fallo que el diseño de
+    /// dos ranuras existe para absorber. Una ranura que SÍ cuadra su CRC es,
+    /// por construcción, una ranura entera: nadie la desgarró. Que además no
+    /// autentique significa que alguien calculó ese CRC sobre un contenido
+    /// que la clave no avala — manipulación, no un fallo del medio — y por
+    /// eso `Db::open` se detiene aquí en vez de caer a la otra ranura. Ver
+    /// `Meta::load_verified`.
+    MetaAuth,
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
