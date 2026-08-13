@@ -6,8 +6,15 @@ respaldan. Implementa la sección 12.3 de la especificación de diseño.
 El motor guarda **34,14 bytes por registro crudo**, medidos, y eso está cerca
 del suelo de una fila. Lo que queda por ganar no es guardar menos bytes por
 fila: es **dejar de guardar casi todas las filas**. Con los crudos viviendo 6
-horas y los agregados sobreviviéndolos, un informe de dos años se sirve sin
-que exista ni uno solo de los registros que lo respaldan.
+horas y los agregados sobreviviéndolos, un informe de noventa días se sirve sin
+que exista ni uno solo de los registros que lo respaldan (de dos años, con el
+perfil `Realtime`).
+
+**El perfil por defecto ya no es el de la sección 12.3**: es el mínimo —sin
+resolución de minuto y con `K = 4`—, porque el de la especificación le costaba
+disco a un nodo pequeño en vez de ahorrárselo. La elección tiene un coste de
+precisión que está medido en §8.4 y que conviene leer antes de aceptar el
+valor por defecto. Los tres perfiles están en §7.
 
 Tras la *feature* `rollup`, activada por defecto.
 
@@ -31,10 +38,16 @@ agregado, o ninguno de los dos.
 
 ## 2. Uso
 
+**Lo primero es el perfil** (§7): `Config::default()` es el mínimo —sin
+resolución de minuto y con `K = 4`—, y esa elección tiene un coste de precisión
+medido que conviene leer antes de aceptarla.
+
 ```rust
 use inro::rollup::{Config, Observation, Rollup, RAW_NS_RECOMMENDED};
 
-let mut rollup = Rollup::new(Config::default());
+let mut rollup = Rollup::new(Config::default());   // Profile::Minimal
+// let mut rollup = Rollup::new(Config::reports());  // top-K utilizable
+// let mut rollup = Rollup::new(Config::realtime()); // + zoom de minuto
 
 let mut tx = db.begin_write()?;
 for r in lote {
@@ -78,11 +91,17 @@ let serie = read_range(&rd, Resolution::Hour, desde, hasta, 10_000)?;
 Poda (la política —cuándo— es del llamante):
 
 ```rust
-let corte = Resolution::Hour.cutoff_bucket(ahora, Resolution::Hour.default_retention_secs());
+let corte = rollup.config().cutoff_bucket(Resolution::Hour, ahora).unwrap();
 let mut tx = db.begin_write()?;
-inro::rollup::prune_before(&mut tx, Resolution::Hour, corte.unwrap())?;
+inro::rollup::prune_before(&mut tx, Resolution::Hour, corte)?;
 tx.commit()?;
 ```
+
+**La retención se le pregunta a la configuración, no a la resolución.** Una
+versión anterior tenía `Resolution::default_retention_secs()`: con dos perfiles
+que retienen la hora 7 y 30 días, una función que no sabe cuál está en uso
+devuelve la retención del perfil equivocado sin decirlo, y podar de más borra
+informes que nadie puede reconstruir.
 
 ### Contrato de error, y no es opcional
 
@@ -265,7 +284,11 @@ sin cota: un `/health` con cuatro peticiones puede heredar los 4 GB de un
 - **Cuánto se queda corto.** `verdadero − informado <= debt <= N/K`. Lo que
   falta está en el cajón, visible.
 - **Ningún pesado se pierde.** Todo valor con frecuencia `> N/K` está en la
-  tabla al final.
+  tabla al final. Al revés también hay que leerlo: **lo que no llega a `N/K` no
+  tiene ninguna garantía de quedarse**, y con el `K = 4` del perfil por defecto
+  ese umbral es el 25% del tráfico de la celda, que en una dimensión de 200
+  endpoints no alcanza ninguno. Está medido en §8.4 y es la razón de que exista
+  `Config::reports()`.
 
 Lo que esta variante NO da y el Space-Saving literal sí: la cuenta total de un
 valor pesado sin mirar el cajón. Se paga a cambio de que ninguna cifra
@@ -276,10 +299,11 @@ cifra inventada, no.
 ### RAM
 
 `K` entradas exactas por `(resolución, celda, dimensión)`, **independiente por
-completo del número de valores distintos**. Medido con 10.000 valores
-distintos por dimensión, `K = 32`, las tres resoluciones activas: **66.572
-bytes de pico**. Con 50.000 rutas distintas seguidas, la tabla se queda en 32
-entradas y su tamaño no se mueve.
+completo del número de valores distintos**. Medido con 10.000 valores distintos
+por dimensión: **18.668 bytes de pico con el perfil por defecto** (`K = 4`, dos
+resoluciones) y **66.596 con el de tiempo real** (`K = 32`, tres). Con 50.000
+rutas distintas seguidas, la tabla se queda en `K` entradas y su tamaño no se
+mueve.
 
 `Config::max_open_cells` (2 por defecto) es el otro tope duro: al abrir una
 celda de más, la más antigua se escribe en la transacción en curso y se
@@ -287,22 +311,46 @@ suelta.
 
 ---
 
-## 7. Retenciones
+## 7. Perfiles y retenciones
 
-| Resolución | Dimensiones | Retención por defecto |
-|---|---|---|
-| Minuto | totales y códigos de estado | 48 horas |
-| Hora | todas | 30 días |
-| Día | todas | dos años |
+**El perfil es la palanca de disco de esta capa y la única decisión que le
+cambia el orden de magnitud.** Hay tres, y la elección se lee en el sitio donde
+se construye el `Rollup`:
 
-`Resolution::default_retention_secs` y `cutoff_bucket` son valores por defecto
-y aritmética, no política. **Quién poda y cuándo es del llamante.**
+| | `Minimal` — `Config::default()` | `Reports` — `Config::reports()` | `Realtime` — `Config::realtime()` |
+|---|---|---|---|
+| `top_k` | **4** | 32 | 32 |
+| Minuto (totales y estados) | **apagada** | apagada | 48 horas |
+| Hora (todas las dimensiones) | **7 días** | 7 días | 30 días |
+| Día (todas) | **90 días** | 90 días | 2 años |
+| Filas por celda horaria (medidas) | **21** | 112 | 112 |
+| Disco de un nodo micro | **268 KB** | 1.052 KB | 6.056 KB |
+| Flota de 2.700 nodos | **3,20 GB** | 5,32 GB | 19,28 GB |
+| Pico de RAM del agregador | **18.668 B** | ~66 KB | 66.596 B |
+| Top-4 por endpoint acertado | **0,5%** | 97,5-100% | 97,5-100% |
+| Zoom en tiempo real del panel | no | no | **sí** |
+
+`Minimal` es el de por defecto porque **el coste de esta capa no lo pone el
+tráfico sino el número de celdas × filas por celda**, que es casi el mismo para
+un micro y para un enterprise: con el perfil de la sección 12.3, un micro gasta
+6 MB de agregados para resumir 445 KB de crudo.
+
+**Lo que `Minimal` cuesta está medido y es grande** (§8.4): con `K = 4` el
+informe por endpoint deja de servir. Quien lo necesite tiene `Config::reports()`
+—mismas retenciones, `K = 32`, 784 KB más por nodo micro— y quien necesite
+además el zoom de minuto, `Config::realtime()`.
+
+`Config::retention` y `Config::cutoff_bucket` son valores por defecto y
+aritmética, no política. **Quién poda y cuándo es del llamante.**
 
 ---
 
 ## 8. Coste medido
 
-### Amplificación de escritura
+Todas las cifras de esta sección son **del perfil por defecto** salvo donde se
+diga otra cosa; las del de tiempo real se dan al lado para poder comparar.
+
+### 8.1 Amplificación de escritura
 
 20.000 registros, lotes de mil, 150 rps (el escenario de la sección 12.4),
 páginas de 4 KB, crudo en `0x7f`:
@@ -310,15 +358,15 @@ páginas de 4 KB, crudo en `0x7f`:
 | | Crecimiento del fichero | B/entrada | Amplificación |
 |---|---|---|---|
 | Solo crudo | 39.936 B/commit | 39,94 | 1,16× |
-| **Crudo + agregado (esta capa)** | **49.971 B/commit** | **49,97** | **1,45×** |
-| Agregado cada 10 commits (fase 2, no implementado) | 40.960 B/commit | 40,96 | 1,19× |
+| **Crudo + agregado, perfil por defecto** | **43.212 B/commit** | **43,21** | **1,26×** |
+| Crudo + agregado, perfil de tiempo real | 49.971 B/commit | 49,97 | 1,45× |
+| Por defecto, volcando cada 10 commits (fase 2, no implementado) | 40.345 B/commit | 40,35 | 1,17× |
 
-**La capa añade 10.035 B por commit de mil registros: 0,29× sobre los bytes
-útiles, un +25,1% sobre el crudo solo.** La sección 12.4 estimaba 32 KB por
-commit para los agregados y una amplificación total de 3,3×; medido, los
-agregados cuestan 10 KB y el total sale **1,45×**, por debajo de la
-estimación — el crudo mejoró más (de 66 a 40 KB por commit, gracias a
-`SplitBias`) de lo que empeoró el agregado.
+**El perfil por defecto añade 3.276 B por commit de mil registros: 0,10× sobre
+los bytes útiles, un +8,2% sobre el crudo solo** (el de tiempo real añadía
+10.035 B y un +25,1%). La razón es directa: 42 filas de agregado por commit en
+vez de 237, porque la celda tiene 21 filas en vez de 112 y no hay resolución de
+minuto rotando sesenta veces más deprisa.
 
 Tráfico físico de escritura, que la sección 12.4 no separaba del crecimiento
 del fichero y que es lo que decide la vida de una tarjeta SD:
@@ -326,66 +374,123 @@ del fichero y que es lo que decide la vida de una tarjeta SD:
 | | Bytes al `Storage` por commit |
 |---|---|
 | Solo crudo | 8.203.878 |
-| Crudo + agregado | 11.640.422 (**+41,9%**) |
-| Agregado cada 10 commits | 8.488.140 (+3,5%) |
+| **Crudo + agregado, por defecto** | **8.781.619 (+7,0%)** |
+| Crudo + agregado, tiempo real | 11.640.422 (+41,9%) |
+| Por defecto, volcando cada 10 | 8.250.777 (+0,6%) |
 
-Son 14.500 bytes de escritura física por cada fila de agregado escrita: el
+Son **13.755 bytes de escritura física por cada fila de agregado escrita**: el
 copy-on-write reescribe el camino raíz-hoja en **cada** `put`, así que cada
-fila arrastra su propio descenso. Es exactamente el aviso de la sección 12.4,
-ahora con número.
+fila arrastra su propio descenso. El coste por fila no ha cambiado con el
+perfil (14.500 B con el de tiempo real); lo que ha cambiado es cuántas filas se
+escriben.
 
-### Camino de lectura del crudo
+### 8.2 Camino de lectura del crudo
 
-Los agregados viven en el mismo árbol, así que añaden altura. 50.000 entradas:
+Los agregados viven en el mismo árbol, así que añaden altura. 50.000 entradas,
+**mínimo de cinco corridas** porque la máquina mete un ±15% de ruido:
 
-| | `get` puntual | Recorrido completo |
-|---|---|---|
-| Sin agregados | 0,83 µs | 0,0090 s |
-| Con agregados | 0,92 µs (+11%) | 0,0093 s (+3%) |
+| | `get` puntual | Recorrido completo | Fichero |
+|---|---|---|---|
+| Sin agregados | 0,83 µs | 0,0089 s | 1.908.736 B |
+| Con agregados, por defecto | 0,85 µs (+2%) | 0,0089 s (±0%) | 2.002.944 B (+4,9%) |
+| Con agregados, tiempo real | 0,86 µs (+4%) | 0,0088 s (−1%) | 2.244.608 B (+17,6%) |
 
-### Disco por tier
+**Honestamente: el efecto está por debajo del ruido de la medición.** El
++11%/+3% que publicó la versión anterior de este documento no se reproduce ni
+con el perfil de tiempo real; lo único que se mide de forma estable es el
+crecimiento del fichero.
+
+### 8.3 Disco por tier
 
 Filas por celda **medidas** contra un `Rollup` real con la cardinalidad del
-edge (200 endpoints, 12 estados, 40 países, 10.000 usuarios): 13 en minuto,
-112 en hora y en día con `K = 32`.
+edge (200 endpoints, 12 estados, 40 países, 10.000 usuarios): 21 por celda de
+hora y de día con `K = 4`; 112 con `K = 32`; 13 en la celda de minuto.
 
-**Perfil de la sección 12.3** (K = 32; 48 h de minuto, 30 d de hora, 2 años de
-día):
+**Perfil por defecto** (`Minimal`: K = 4, sin minuto, 7 d de hora, 90 d de día):
 
 | Tier | Hoy | Crudo 6 h | Agregados | Total | Proyección del dueño |
 |---|---|---|---|---|---|
-| micro | 445 KB | 56 KB | 6.000 KB | **6.056 KB** | ~95 KB |
-| starter | 6.668 KB | 556 KB | 6.776 KB | **7.332 KB** | ~610 KB |
-| pro | 83.350 KB | 4.167 KB | 7.544 KB | **11.711 KB** | ~4.400 KB |
-| enterprise | 388.965 KB | 13.892 KB | 7.856 KB | **21.748 KB** | ~15.000 KB |
+| micro | 445 KB | 56 KB | 212 KB | **268 KB** | ~95 KB |
+| starter | 6.668 KB | 556 KB | 236 KB | **792 KB** | ~610 KB |
+| pro | 83.350 KB | 4.167 KB | 248 KB | **4.415 KB** | ~4.400 KB |
+| enterprise | 388.965 KB | 13.892 KB | 268 KB | **14.160 KB** | ~15.000 KB |
 
-Flota de 2.700 con mezcla 55/30/13/2: **19,28 GB** (hoy 58 GB).
+Flota con mezcla 55/30/13/2: **1,61 GB con 1.360 nodos y 3,20 GB con 2.700**.
 
-**Perfil mínimo** (K = 4; sin resolución de minuto, 7 d de hora, 90 d de día):
+**Los otros dos perfiles**, mismo cálculo:
 
-| Tier | Crudo 6 h | Agregados | Total | Proyección |
-|---|---|---|---|---|
-| micro | 56 KB | 212 KB | **268 KB** | ~95 KB |
-| starter | 556 KB | 236 KB | **792 KB** | ~610 KB |
-| pro | 4.167 KB | 248 KB | **4.415 KB** | ~4.400 KB |
-| enterprise | 13.892 KB | 268 KB | **14.160 KB** | ~15.000 KB |
+| Perfil | micro | starter | pro | enterprise | Flota 1.360 | Flota 2.700 |
+|---|---|---|---|---|---|---|
+| `Minimal` (por defecto) | **268 KB** | **792 KB** | **4.415 KB** | **14.160 KB** | **1,61 GB** | **3,20 GB** |
+| `Reports` (K = 32, sin minuto) | 1.052 KB | 1.628 KB | 5.367 KB | 15.140 KB | 2,68 GB | 5,32 GB |
+| `Realtime` (sección 12.3) | 6.056 KB | 7.332 KB | 11.711 KB | 21.748 KB | 9,71 GB | 19,28 GB |
 
-Flota: **3,20 GB**.
+Y, como referencia intermedia, las retenciones del perfil por defecto con
+`K = 16`: 652 / 1.196 / 4.883 / 14.640 KB, flota 2,13 y 4,23 GB.
 
-**La lectura honesta de estas dos tablas:** el coste de un nodo deja de
-depender del tráfico y pasa a depender del **número de celdas × filas por
-celda**, que es casi igual para un micro y para un enterprise. Con las
-retenciones de la sección 12.3 al pie de la letra, un nodo micro gasta más en
-agregados (6 MB) que lo que hoy gasta en crudo (445 KB): la agregación le
-cuesta disco, no se lo ahorra. La proyección del dueño se alcanza —a menos de
-un 30%— solo con el perfil mínimo, que renuncia a la resolución de minuto, a
-los dos años de historia diaria y a 28 de las 32 entradas del top-K.
+**La lectura honesta de la tabla:** el coste de un nodo deja de depender del
+tráfico y pasa a depender del **número de celdas × filas por celda**, que es
+casi igual para un micro y para un enterprise. Con las retenciones de la
+sección 12.3 al pie de la letra, un nodo micro gasta más en agregados (6 MB)
+que lo que hoy gasta en crudo (445 KB): la agregación le cuesta disco, no se lo
+ahorra. Y **el ahorro no lo trae `K`**: de los 16,1 GB de flota que el perfil
+por defecto se ahorra frente al de tiempo real, 13,9 son de apagar el minuto y
+acortar las retenciones y solo 2,1 de bajar `K` de 32 a 4.
 
-Las palancas, todas del llamante y sin tocar esta capa: `Config::top_k`, qué
-resoluciones se activan (`Config::minute`/`hour`/`day`) y cada cuánto se poda
-cada una.
+Las palancas, todas del llamante y sin tocar esta capa: el perfil,
+`Config::top_k`, qué resoluciones se activan (`Config::minute`/`hour`/`day`) y
+cada cuánto se poda cada una.
 
----
+### 8.4 Lo que cuesta `K = 4`: precisión del top-K
+
+La cota del algoritmo es `verdadero − informado <= N/K`, así que pasar de
+`K = 32` a `K = 4` la afloja **ocho veces**. Medido —no razonado— sobre
+repartos zipf-ianos (el tráfico real está concentrado; un reparto uniforme
+haría la pregunta fácil y no es el caso que importa), con los volúmenes de
+celda horaria de cada plan y 8.384 corridas independientes
+(`tests/rollup_size.rs`, `top_k_accuracy_at_the_default_k_of_four`):
+
+**Endpoints, zipf s = 1,0 sobre 200 valores** (la cabeza se lleva el 35% del
+tráfico):
+
+| Volumen | K | Top-4 correcto | Top-1 correcto | Tráfico en `otros` | Cuentas exactas |
+|---|---|---|---|---|---|
+| micro, 277/hora | **4** | **0,5%** | 63,5% | **97,2%** | 17,8% |
+| micro, 277/hora | 32 | 97,5% | 100% | 39,7% | 96,8% |
+| starter, 2.777/hora | **4** | **0,5%** | 61,0% | **99,7%** | 0,4% |
+| starter, 2.777/hora | 32 | 98,5% | 100% | 53,6% | 92,5% |
+| pro, 20.833/hora | **4** | **1,0%** | 66,7% | **100,0%** | 0,0% |
+| pro, 20.833/hora | 32 | 100% | 100% | 55,3% | 91,7% |
+| enterprise, 69.444/hora | **4** | **0,0%** | 60,7% | **100,0%** | 0,0% |
+| enterprise, 69.444/hora | 32 | 100% | 100% | 55,7% | 93,8% |
+
+**Por qué es tan malo y no es un fallo de implementación:** solo sobrevive a
+los desalojos un valor cuya frecuencia pase de `N/K`. Con `K = 4` eso es el 25%
+del tráfico de la celda y el endpoint más pesado de un reparto zipf-1,0 sobre
+200 valores se queda en el 17%: **ninguno lo alcanza**, todos se desalojan y se
+readmiten sin parar, y como el contador partido manda al cajón el agregado real
+de cada desalojado, el tráfico acaba entero en `otros`. El panel puede decir
+cuánto tráfico hubo, pero no de quién.
+
+Las dimensiones concentradas aguantan mejor, y siguen sin ser buenas:
+
+| Dimensión | K = 4: top-4 correcto | Tráfico en `otros` | K mínimo que acierta el 100% |
+|---|---|---|---|
+| Códigos de estado (12 valores, s = 2,5) | 29-41% | 8-11% | **8** |
+| User agents (25 valores, s = 1,4) | 6-9% | 54-59% | **16** |
+| Endpoints (200 valores, s = 1,0) | 0-1% | 97-100% | **32** |
+| Endpoints + 30% de rutas únicas (el ataque de 12.4) | 0-0,5% | 98-100% | 32 (y aun así 83-100%) |
+
+**Lo que NO cambia al bajar `K`**, comprobado en las 8.384 corridas: cero
+exageraciones (`informado <= verdadero`, siempre) y cero fallos de conservación
+(`Σ entradas + otros == N`, campo a campo). El error de `K = 4` es de
+subestimación y de identidad, nunca una cifra inventada.
+
+**Recomendación de quien lo midió:** si el informe por endpoint o por usuario
+importa, `Config::reports()` cuesta 784 KB más por nodo micro (1,05 MB frente a
+268 KB) y 2,1 GB más de flota a 2.700 nodos, y devuelve el top-K a ser
+utilizable. `Config::default()` es defendible solo si de los agregados se
+esperan totales, percentiles y códigos de estado.
 
 ## 9. Límites conocidos
 
