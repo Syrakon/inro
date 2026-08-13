@@ -2262,6 +2262,32 @@ impl<'db> WriteTxn<'db> {
         crate::tree::get(self, self.meta.root, &scoped(ns, key))
     }
 
+    /// Recorrido de `[from, to)` dentro de `ns`, sobre la raíz de **esta**
+    /// transacción — es decir, viendo también lo que ella misma lleva escrito
+    /// y todavía no ha confirmado. `ReadTxn::scan` no puede dar eso: su
+    /// instantánea es la del último commit.
+    ///
+    /// Existe para el patrón leer-modificar-escribir sobre un RANGO dentro de
+    /// una sola transacción, que `get` (puntual) no cubre cuando no se sabe
+    /// de antemano qué claves hay. Su primer consumidor es la capa de
+    /// agregación (`rollup`), que necesita releer una celda entera antes de
+    /// sobrescribirla; sin este método esa capa tendría que abrir una lectura
+    /// aparte y perdería justo lo que la hace correcta —ver el estado de la
+    /// transacción en curso— o tendría que vivir dentro del motor con acceso
+    /// privilegiado, que es peor.
+    ///
+    /// El `Cursor` toma prestada la transacción de forma **inmutable**, así
+    /// que el compilador ya impide mutarla mientras el recorrido siga vivo:
+    /// hay que recoger lo que interese y soltar el cursor antes de escribir.
+    /// No hace falta ninguna regla de invalidación escrita a mano.
+    ///
+    /// Devuelve `Result` y no un `Cursor` a secas por la misma razón que
+    /// `ReadTxn::scan` (ver su comentario): el descenso inicial puede toparse
+    /// con corrupción, y un `.expect` ahí sería un pánico de la API pública.
+    pub fn scan(&self, ns: u8, from: &[u8], to: &[u8]) -> Result<crate::tree::Cursor<'_, Self>> {
+        crate::tree::Cursor::new(self, self.meta.root, ns, from, to)
+    }
+
     /// Traslada la meta B a su posición definitiva (tarea 18). No hace nada
     /// si ya está ahí — bases con `page_size >= 4096` (ya en sectores
     /// distintos desde `Db::create`) o una reubicación anterior que ya

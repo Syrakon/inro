@@ -101,7 +101,7 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 proptest = "1"
 
 [features]
-default = ["std", "audit"]
+default = ["std", "audit", "rollup"]
 std = []
 encryption = ["dep:chacha20poly1305"]
 aes = ["encryption", "dep:aes-gcm-siv"]
@@ -128,3 +128,22 @@ bench-sqlite = ["dep:rusqlite"]
 # `std`, no al revés: pedir `audit` sin más ya activa `std`, porque
 # `audit_pages` vive en `tx.rs`, que no existe sin esa feature.
 audit = ["std"]
+# Capa de agregación temporal (`src/rollup/`, sección 12.3 de la
+# especificación). Va en `default` con el mismo criterio que `audit`: los
+# cinco comandos de verificación de este proyecto la ejercitan sin pedir
+# ninguna feature extra, y quien quiera un binario sin ella la deja fuera
+# explícitamente.
+#
+# **NO depende de `std`, a diferencia de `audit`**, y esa es la diferencia que
+# justifica declararla suelta en vez de colgarla de `std`: la codificación de
+# buckets, el histograma logarítmico y el top-K son `alloc` a secas, así que
+# `--no-default-features --features rollup` compila y pasa sus pruebas — un
+# integrador `no_std` que aporte su propio almacenamiento puede usar el
+# formato de agregados sin `Db`. Solo el puente con `WriteTxn`/`ReadTxn`
+# (observar, volcar, leer rangos, podar) está tras `#[cfg(feature = "std")]`
+# dentro del propio módulo.
+#
+# Cero dependencias nuevas, como el resto del crate: el varint y el B+tree ya
+# estaban, y el histograma, el sketch de top-K y la codificación de agregados
+# se escriben a mano.
+rollup = []

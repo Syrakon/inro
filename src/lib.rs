@@ -87,6 +87,23 @@ pub(crate) mod tx;
 pub(crate) mod tree;
 #[cfg(feature = "std")]
 pub mod index;
+// Capa de agregación temporal (sección 12.3 de la especificación). Tras su
+// propia *feature*, activada por defecto, igual que `audit`: quien construya
+// un binario mínimo puede dejarla fuera con `--no-default-features` y no paga
+// ni un byte de ella.
+//
+// **No lleva `#[cfg(feature = "std")]`**, a diferencia de `index`/`tx`: la
+// codificación de buckets, el histograma y el top-K son `alloc` a secas y
+// compilan bajo `no_std`; solo la parte que toca `WriteTxn`/`ReadTxn` está
+// gateada dentro del propio módulo. Se comprueba de verdad, no se supone, con
+// `cargo test --no-default-features --features rollup`.
+//
+// Es `pub mod` y no `pub(crate)` como `tree`/`tx`: aquí no hay ninguna vía de
+// escritura privilegiada que cerrar. Todo lo que hay dentro pasa por
+// `WriteTxn::put`/`delete`/`delete_range` como cualquier otro llamante, sobre
+// el espacio de claves `0x02`, que este motor documenta como datos de usuario.
+#[cfg(feature = "rollup")]
+pub mod rollup;
 
 pub use error::{CorruptKind, Error, IoError, Result};
 pub use storage::Storage;
