@@ -18,9 +18,12 @@
 //!   y sin agregación, sobre exactamente la misma carga cruda. Medido de
 //!   punta a punta, sin componer nada.
 //! - **Coste en disco de los agregados por tier**: se mide el tamaño de
-//!   fichero de un juego COMPLETO de filas de agregado para las retenciones
-//!   de la sección 12.3 (48 h de minuto, 30 d de hora, 2 años de día), con
-//!   las magnitudes de contador reales de cada plan. Las filas se generan con
+//!   fichero de un juego COMPLETO de filas de agregado para las retenciones de
+//!   cada perfil —el de por defecto (`Profile::Minimal`: sin minuto, 7 d de
+//!   hora, 90 d de día, K = 4) y el de tiempo real (`Profile::Realtime`, el
+//!   literal de la sección 12.3: 48 h de minuto, 30 d de hora, 2 años de día,
+//!   K = 32)—, con las magnitudes de contador reales de cada plan. Las filas
+//!   se generan con
 //!   el codificador de verdad (`Bucket::encode`) y la disposición de clave de
 //!   verdad; lo que NO se hace es reproducir petición a petición los 15
 //!   millones de requests mensuales de un nodo pro, que a 20 µs por `observe`
@@ -199,6 +202,7 @@ fn run_workload(
     batch: u32,
     flush_every: Option<u32>,
     raw_ns: u8,
+    cfg: Config,
 ) -> Run {
     let (store, writes, bytes) = CountingStorage::new(FileStorage::open(path).unwrap());
     let db = Db::create(
@@ -211,7 +215,7 @@ fn run_workload(
     writes.store(0, Ordering::Relaxed);
     bytes.store(0, Ordering::Relaxed);
 
-    let mut r = Rollup::new(Config::default());
+    let mut r = Rollup::new(cfg);
     let mut rows = 0u64;
     let (mut ep, mut user, mut country) = (String::new(), String::new(), String::new());
     for (c, chunk) in (0..n).collect::<Vec<_>>().chunks(batch as usize).enumerate() {
@@ -271,106 +275,132 @@ fn write_amplification_added_by_the_aggregate_path() {
     // `one_aggregate_row_costs_the_raw_path_its_append_split_bias`.
     let ns = inro::rollup::RAW_NS_RECOMMENDED;
     let p1 = tmp("inro-rollup-amp-raw.inro");
-    let raw = run_workload(&p1, N, BATCH, None, ns);
-    let p2 = tmp("inro-rollup-amp-agg.inro");
-    let agg = run_workload(&p2, N, BATCH, Some(1), ns);
-    let p3 = tmp("inro-rollup-amp-lazy.inro");
-    let lazy = run_workload(&p3, N, BATCH, Some(10), ns);
+    let raw = run_workload(&p1, N, BATCH, None, ns, Config::default());
+    let _ = std::fs::remove_file(&p1);
 
     println!("--- amplificacion de escritura: {N} registros, lotes de {BATCH}, {commits} commits, {RPS} rps ---");
     println!("utiles (clave+valor logicos): {useful} B = {:.2} B/entrada", useful as f64 / N as f64);
-    println!();
-    println!("CRECIMIENTO DEL FICHERO (comparable con la tabla de la seccion 12.4)");
-    for (name, r) in [("solo crudo", &raw), ("crudo+agregado", &agg), ("agregado cada 10", &lazy)] {
+    println!(
+        "  solo crudo (linea base)  {:>9} B  {:>7.2} B/entrada  {:>8} B/commit  amplificacion {:.2}x  |  fisico {} B ({} B/commit)",
+        raw.size,
+        raw.size as f64 / N as f64,
+        raw.size / commits,
+        raw.size as f64 / useful as f64,
+        raw.bytes,
+        raw.bytes / commits
+    );
+
+    // Los DOS perfiles. El de por defecto escribe una celda de 21 filas y solo
+    // dos resoluciones; el de tiempo real, 133 filas y tres, con la de minuto
+    // rotando sesenta veces más deprisa.
+    for (pname, cfg) in [("por defecto (K=4, sin minuto)", Config::default()),
+                         ("tiempo real (K=32, 12.3)", Config::realtime())] {
+        let p2 = tmp("inro-rollup-amp-agg.inro");
+        let agg = run_workload(&p2, N, BATCH, Some(1), ns, cfg);
+        let p3 = tmp("inro-rollup-amp-lazy.inro");
+        let lazy = run_workload(&p3, N, BATCH, Some(10), ns, cfg);
+
+        println!();
+        println!("=== perfil {pname} ===");
+        println!("CRECIMIENTO DEL FICHERO (comparable con la tabla de la seccion 12.4)");
+        for (name, r) in [("crudo+agregado", &agg), ("agregado cada 10", &lazy)] {
+            println!(
+                "  {name:<18} {:>9} B  {:>7.2} B/entrada  {:>8} B/commit  amplificacion {:.2}x",
+                r.size,
+                r.size as f64 / N as f64,
+                r.size / commits,
+                r.size as f64 / useful as f64
+            );
+        }
         println!(
-            "  {name:<18} {:>9} B  {:>7.2} B/entrada  {:>8} B/commit  amplificacion {:.2}x",
-            r.size,
-            r.size as f64 / N as f64,
-            r.size / commits,
-            r.size as f64 / useful as f64
+            "  la capa anade {} B/commit ({:.2}x sobre los utiles, {:+.1}% sobre el crudo solo)",
+            (agg.size - raw.size) / commits,
+            (agg.size - raw.size) as f64 / useful as f64,
+            (agg.size as f64 / raw.size as f64 - 1.0) * 100.0
         );
-    }
-    println!(
-        "  la capa anade {} B/commit ({:.2}x sobre los utiles, {:+.1}% sobre el crudo solo)",
-        (agg.size - raw.size) / commits,
-        (agg.size - raw.size) as f64 / useful as f64,
-        (agg.size as f64 / raw.size as f64 - 1.0) * 100.0
-    );
-    println!();
-    println!("TRAFICO FISICO DE ESCRITURA");
-    for (name, r) in [("solo crudo", &raw), ("crudo+agregado", &agg), ("agregado cada 10", &lazy)] {
+        println!("TRAFICO FISICO DE ESCRITURA");
+        for (name, r) in [("crudo+agregado", &agg), ("agregado cada 10", &lazy)] {
+            println!(
+                "  {name:<18} {:>11} B en {:>7} escrituras  {:>9} B/commit",
+                r.bytes,
+                r.writes,
+                r.bytes / commits
+            );
+        }
         println!(
-            "  {name:<18} {:>11} B en {:>7} escrituras  {:>9} B/commit",
-            r.bytes,
-            r.writes,
-            r.bytes / commits
+            "  la capa anade {:+.1}% de trafico fisico ({:+.1}% volcando cada 10); {} B por fila de agregado escrita",
+            (agg.bytes as f64 / raw.bytes as f64 - 1.0) * 100.0,
+            (lazy.bytes as f64 / raw.bytes as f64 - 1.0) * 100.0,
+            (agg.bytes - raw.bytes) / agg.rows.max(1)
         );
-    }
-    println!(
-        "  la capa anade {:+.1}% de trafico fisico; {} B por fila de agregado escrita",
-        (agg.bytes as f64 / raw.bytes as f64 - 1.0) * 100.0,
-        (agg.bytes - raw.bytes) / agg.rows.max(1)
-    );
-    println!();
-    println!(
-        "filas de agregado: {} con volcado por commit ({} por commit); {} volcando cada 10",
-        agg.rows,
-        agg.rows / commits,
-        lazy.rows
-    );
-    for p in [&p1, &p2, &p3] {
-        let _ = std::fs::remove_file(p);
+        println!(
+            "  filas de agregado: {} con volcado por commit ({} por commit); {} volcando cada 10",
+            agg.rows,
+            agg.rows / commits,
+            lazy.rows
+        );
+        let _ = std::fs::remove_file(&p2);
+        let _ = std::fs::remove_file(&p3);
     }
 }
 
 /// Filas por celda que produce un `Rollup` real con la cardinalidad del edge
-/// (200 endpoints, 8 estados, 40 países, muchos usuarios) y `K` por defecto.
-/// Es el número que la tabla por tier multiplica por las celdas de cada
-/// retención, así que se mide en vez de suponerse.
+/// (200 endpoints, 12 estados, 40 países, muchos usuarios), en los DOS
+/// perfiles. Es el número que la tabla por tier multiplica por las celdas de
+/// cada retención, así que se mide en vez de suponerse.
 #[test]
 fn rows_per_cell_measured_against_a_real_rollup() {
-    let path = tmp("inro-rollup-rows.inro");
-    let db = Db::create(
-        Box::new(FileStorage::open(&path).unwrap()),
-        Options { page_size: 4096, sync: Sync::Never, ..Options::default() },
-    )
-    .unwrap();
-    let mut r = Rollup::new(Config::default());
-    let (mut ep, mut user, mut country) = (String::new(), String::new(), String::new());
-    let mut tx = db.begin_write().unwrap();
-    // 3.000 peticiones dentro del MISMO minuto: llenan una celda de cada
-    // resolución con la cardinalidad completa.
-    for i in 0..3_000u32 {
-        synthetic_observation(i, &mut ep, &mut user, &mut country);
-        let mut o = obs(i, &ep, &user, &country);
-        o.ts = 1_760_000_000;
-        r.observe(&mut tx, &o).unwrap();
-    }
-    r.flush(&mut tx).unwrap();
-    tx.commit().unwrap();
+    for (pname, cfg) in
+        [("por defecto", Config::default()), ("tiempo real (12.3)", Config::realtime())]
+    {
+        let path = tmp(&format!("inro-rollup-rows-{}.inro", cfg.top_k));
+        let db = Db::create(
+            Box::new(FileStorage::open(&path).unwrap()),
+            Options { page_size: 4096, sync: Sync::Never, ..Options::default() },
+        )
+        .unwrap();
+        let mut r = Rollup::new(cfg);
+        let (mut ep, mut user, mut country) = (String::new(), String::new(), String::new());
+        let mut tx = db.begin_write().unwrap();
+        // 3.000 peticiones dentro del MISMO minuto: llenan una celda de cada
+        // resolución activa con la cardinalidad completa.
+        for i in 0..3_000u32 {
+            synthetic_observation(i, &mut ep, &mut user, &mut country);
+            let mut o = obs(i, &ep, &user, &country);
+            o.ts = 1_760_000_000;
+            r.observe(&mut tx, &o).unwrap();
+        }
+        r.flush(&mut tx).unwrap();
+        tx.commit().unwrap();
 
-    let rd = db.begin_read();
-    let mut counts = [0usize; 3];
-    for res in [Resolution::Minute, Resolution::Hour, Resolution::Day] {
-        let tsb = res.bucket_of(1_760_000_000).unwrap();
-        let rows = inro::rollup::read_range(&rd, res, tsb, tsb + 1, 10_000).unwrap();
-        counts[res.code() as usize] = rows.len();
-        let drawers = rows.iter().filter(|r| r.is_drawer()).count();
-        println!(
-            "{res:?}: {} filas por celda ({drawers} cajones `otros`), K = {}",
-            rows.len(),
-            r.config().top_k
-        );
-    }
-    drop(rd);
-    drop(db);
-    let _ = std::fs::remove_file(&path);
+        let rd = db.begin_read();
+        let mut counts = [0usize; 3];
+        for res in [Resolution::Minute, Resolution::Hour, Resolution::Day] {
+            let tsb = res.bucket_of(1_760_000_000).unwrap();
+            let rows = inro::rollup::read_range(&rd, res, tsb, tsb + 1, 10_000).unwrap();
+            counts[res.code() as usize] = rows.len();
+            let drawers = rows.iter().filter(|r| r.is_drawer()).count();
+            println!(
+                "perfil {pname} (K = {}): {res:?}: {} filas por celda ({drawers} cajones `otros`)",
+                cfg.top_k,
+                rows.len()
+            );
+        }
+        drop(rd);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
 
-    // Cota dura: 1 total + por dimensión K entradas y un cajón.
-    let k = 32usize;
-    assert!(counts[0] <= 1 + (k + 1), "minuto: {} filas", counts[0]);
-    assert!(counts[1] <= 1 + 4 * (k + 1), "hora: {} filas", counts[1]);
-    assert_eq!(counts[1], counts[2], "hora y día guardan las mismas dimensiones");
+        // Cota dura: 1 total + por dimensión K entradas y un cajón.
+        let k = cfg.top_k as usize;
+        if cfg.keeps(Resolution::Minute) {
+            assert!(counts[0] <= 1 + (k + 1), "minuto: {} filas", counts[0]);
+            assert!(counts[0] > 0, "el perfil retiene el minuto y no escribió nada");
+        } else {
+            assert_eq!(counts[0], 0, "el perfil no retiene el minuto y escribió {} filas", counts[0]);
+        }
+        assert!(counts[1] <= 1 + 4 * (k + 1), "hora: {} filas", counts[1]);
+        assert_eq!(counts[1], counts[2], "hora y día guardan las mismas dimensiones");
+    }
 }
 
 /// Tiers de `quota` (`edge/src/protection/limits.rs`, la fuente única).
@@ -460,28 +490,59 @@ fn cell_template(res: Resolution, cfg: Config) -> Vec<(Dimension, Option<Vec<u8>
 }
 
 /// Un perfil de retención y cardinalidad. La política de cuándo podar es del
-/// llamante (ver `rollup::prune_before`), así que aquí se miden dos: el que
-/// sale literalmente de la sección 12.3 y uno ajustado, para poner número a
-/// lo que cuesta cada palanca.
-struct Profile {
+/// llamante (ver `rollup::prune_before`), así que aquí se miden tres: el de
+/// **por defecto** (`Profile::Minimal`), el de **tiempo real**
+/// (`Profile::Realtime`, la sección 12.3 al pie de la letra) y uno intermedio,
+/// para poner número a lo que cuesta cada palanca.
+struct Prof {
     name: &'static str,
-    top_k: u16,
-    /// Celdas retenidas por resolución: minuto, hora, día.
-    cells: [u64; 3],
+    cfg: Config,
 }
 
-const PROFILES: [Profile; 3] = [
-    // Sección 12.3 al pie de la letra: 48 h de minuto, 30 d de hora, 2 años
-    // de día, K = 32 (el `Config::default()`).
-    Profile { name: "seccion 12.3", top_k: 32, cells: [48 * 60, 30 * 24, 730] },
-    // Ajustado: K = 8, 6 h de minuto, 30 d de hora, 1 año de día. Las tres
-    // palancas que el llamante ya tiene sin cambiar una línea de la capa.
-    Profile { name: "ajustado", top_k: 8, cells: [6 * 60, 30 * 24, 365] },
-    // Mínimo defendible para un nodo micro, que con 13.333 registros en
-    // ventana apenas necesita agregar: sin resolución de minuto, K = 4, una
-    // semana de hora y noventa días de día.
-    Profile { name: "minimo", top_k: 4, cells: [0, 7 * 24, 90] },
+const PROFILES: [Prof; 5] = [
+    // El de POR DEFECTO desde esta tarea: K = 4, sin resolución de minuto,
+    // 7 días de hora y 90 días de día.
+    Prof { name: "POR DEFECTO (Profile::Minimal)", cfg: Config::minimal() },
+    // Las mismas retenciones del perfil por defecto pero con K = 16 y K = 32.
+    // Están aquí porque `top_k_accuracy_at_the_default_k_of_four` mide que con
+    // K = 4 el informe por endpoint deja de servir: estas dos filas son lo que
+    // cuesta en disco recuperarlo SIN volver a la resolución de minuto.
+    Prof {
+        name: "por defecto pero K=16",
+        cfg: Config {
+            top_k: 16,
+            minute: false,
+            hour: true,
+            day: true,
+            max_open_cells: 2,
+            retention_secs: [48 * 3_600, 7 * 86_400, 90 * 86_400],
+        },
+    },
+    Prof { name: "informes (Profile::Reports, K=32 sin minuto)", cfg: Config::reports() },
+    // El opt-in: `Profile::Realtime`, sección 12.3 al pie de la letra.
+    Prof { name: "tiempo real (Profile::Realtime, 12.3)", cfg: Config::realtime() },
+    // Intermedio, solo para ver la pendiente entre los dos: K = 8, 6 h de
+    // minuto, 30 d de hora, 1 año de día.
+    Prof {
+        name: "intermedio (K=8, 6h/30d/1a)",
+        cfg: Config {
+            top_k: 8,
+            minute: true,
+            hour: true,
+            day: true,
+            max_open_cells: 2,
+            retention_secs: [6 * 3_600, 30 * 86_400, 365 * 86_400],
+        },
+    },
 ];
+
+/// Celdas que retiene un perfil en una resolución: su retención dividida por
+/// la anchura de la celda, y cero si la resolución está apagada. **Se deriva
+/// del `Config`, no se escribe a mano**, para que la tabla mida exactamente lo
+/// que el perfil dice y no lo que alguien copió.
+fn cells_of(cfg: &Config, res: Resolution) -> u64 {
+    if cfg.keeps(res) { cfg.retention(res) / res.seconds() } else { 0 }
+}
 
 /// Coste en disco de los agregados por tier y por perfil, con el crudo de 6
 /// horas compuesto a partir de los 34,14 B/entrada medidos.
@@ -491,27 +552,30 @@ fn aggregate_disk_per_tier_under_six_hour_raw_retention() {
     let order = [Resolution::Minute, Resolution::Hour, Resolution::Day];
 
     for prof in PROFILES {
-        let cfg = Config { top_k: prof.top_k, ..Config::default() };
+        let cfg = prof.cfg;
         let templates: Vec<Vec<(Dimension, Option<Vec<u8>>)>> =
             order.iter().map(|res| cell_template(*res, cfg)).collect();
+        let cells: Vec<u64> = order.iter().map(|res| cells_of(&cfg, *res)).collect();
 
         println!();
-        println!("=== perfil \"{}\": K = {} ===", prof.name, prof.top_k);
+        println!("=== perfil \"{}\": K = {} ===", prof.name, cfg.top_k);
         for (i, res) in order.iter().enumerate() {
             println!(
-                "  {res:?}: {} celdas x {} filas medidas",
-                prof.cells[i],
+                "  {res:?}: {} celdas ({} d de retencion) x {} filas medidas",
+                cells[i],
+                cfg.retention(*res) / 86_400,
                 templates[i].len()
             );
         }
 
+        // Mezcla de flota 55/30/13/2 (sección 12.2), a los dos tamaños de
+        // flota que el dueño maneja.
         let mut fleet = 0.0f64;
-        // Mezcla de flota 55/30/13/2 sobre 2700 nodos (sección 12.2).
         let mix = [0.55, 0.30, 0.13, 0.02];
 
         for (ti, t) in TIERS.iter().enumerate() {
             let per_day = t.monthly / 30;
-            let path = tmp(&format!("inro-rollup-tier-{}-{}.inro", t.name, prof.top_k));
+            let path = tmp(&format!("inro-rollup-tier-{}-{}.inro", t.name, cfg.top_k));
             let db = Db::create(
                 Box::new(FileStorage::open(&path).unwrap()),
                 Options { page_size: 4096, sync: Sync::Never, ..Options::default() },
@@ -522,7 +586,7 @@ fn aggregate_disk_per_tier_under_six_hour_raw_retention() {
             let mut per_res: Vec<(Resolution, u64, u64)> = Vec::new();
             for (i, res) in order.iter().enumerate() {
                 let tpl = &templates[i];
-                let cells = prof.cells[i];
+                let cells = cells[i];
                 let cell_requests = match res {
                     Resolution::Minute => per_day / (24 * 60),
                     Resolution::Hour => per_day / 24,
@@ -571,7 +635,7 @@ fn aggregate_disk_per_tier_under_six_hour_raw_retention() {
             let raw_6h = (t.monthly as f64 / 30.0 / 4.0) * RAW_BYTES_PER_ENTRY;
             let raw_today = (t.monthly as f64 / 30.0 * t.raw_days as f64) * RAW_BYTES_PER_ENTRY;
             let total = raw_6h + agg_size as f64;
-            fleet += 2700.0 * mix[ti] * total;
+            fleet += mix[ti] * total;
             println!(
                 "  {:<11} hoy {:>9.0} KB | crudo 6h {:>8.0} KB | agregados {:>7.0} KB ({rows_written} filas, {:.1} B/fila) | TOTAL {:>8.0} KB",
                 t.name,
@@ -593,10 +657,13 @@ fn aggregate_disk_per_tier_under_six_hour_raw_retention() {
                 );
             }
         }
-        println!(
-            "  FLOTA de 2700 con mezcla 55/30/13/2: {:.2} GB (hoy: 58 GB; proyeccion del duenno: 2,5 GB)",
-            fleet / 1024.0 / 1024.0 / 1024.0
-        );
+        for n in [1360.0f64, 2700.0] {
+            println!(
+                "  FLOTA de {n:.0} con mezcla 55/30/13/2: {:.2} GB",
+                n * fleet / 1024.0 / 1024.0 / 1024.0
+            );
+        }
+        println!("  (hoy, sin agregar y con la retencion cruda de cada plan: 58 GB a 2700; proyeccion del duenno: 2,5 GB)");
     }
 }
 
@@ -638,6 +705,250 @@ fn the_aggregate_layer_writes_far_less_than_the_raw_records_it_summarises() {
         agg_bytes < raw_bytes,
         "el agregado ({agg_bytes} B) cuesta más que el crudo que resume ({raw_bytes} B)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Lo que cuesta bajar K de 32 a 4, medido sobre repartos realistas.
+// ---------------------------------------------------------------------------
+
+/// Generador congruencial lineal propio; `rand` sería una dependencia.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0
+    }
+    /// Uniforme en `[0, 1)`.
+    fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Reparto zipf-iano: probabilidad del rango `r` proporcional a `1/r^s`.
+///
+/// **Es la forma que hay que usar y no la uniforme.** Con un reparto uniforme
+/// de 200 endpoints, el «verdadero top-4» es ruido puro y cualquier top-K
+/// parece igual de bueno o de malo; el tráfico real está concentrado, y es esa
+/// concentración la que decide si `K = 4` basta.
+struct Zipf {
+    cum: Vec<f64>,
+}
+
+impl Zipf {
+    fn new(n: usize, s: f64) -> Self {
+        let mut cum = Vec::with_capacity(n);
+        let mut acc = 0.0f64;
+        for r in 1..=n {
+            acc += 1.0 / (r as f64).powf(s);
+            cum.push(acc);
+        }
+        for c in cum.iter_mut() {
+            *c /= acc;
+        }
+        Zipf { cum }
+    }
+    fn pick(&self, u: f64) -> usize {
+        match self.cum.binary_search_by(|c| c.partial_cmp(&u).unwrap()) {
+            Ok(i) => i,
+            Err(i) => i.min(self.cum.len() - 1),
+        }
+    }
+    /// Masa de tráfico que se llevan los `k` valores más frecuentes.
+    fn head_mass(&self, k: usize) -> f64 {
+        self.cum[(k - 1).min(self.cum.len() - 1)]
+    }
+}
+
+/// Un reparto de dimensión con nombre.
+struct Shape {
+    name: &'static str,
+    values: usize,
+    s: f64,
+    /// Fracción de las peticiones que van a un valor ÚNICO (el ataque de
+    /// cardinalidad de la sección 12.4: `/users/48213/orders`).
+    unique_share: f64,
+}
+
+/// Lo que una corrida deja medido.
+#[derive(Default)]
+struct Acc {
+    trials: u64,
+    set_hits: u64,
+    order_hits: u64,
+    top1_hits: u64,
+    drawer_share: f64,
+    exact_counts: u64,
+    reported: u64,
+    worst_understatement: f64,
+    overstatements: u64,
+    conservation_failures: u64,
+}
+
+/// Una corrida: `n` observaciones del reparto `shape` por un `TopK` de `k`
+/// entradas, comparadas contra las cuentas EXACTAS de las mismas
+/// observaciones.
+fn accuracy_trial(acc: &mut Acc, shape: &Shape, n: u64, k: u16, seed: u64) {
+    use std::collections::HashMap;
+    let z = Zipf::new(shape.values, shape.s);
+    let mut rng = Lcg(seed);
+    let mut t = inro::rollup::TopK::new(k);
+    let mut truth: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut uniq = 0u64;
+    for i in 0..n {
+        let v = if rng.unit() < shape.unique_share {
+            uniq += 1;
+            format!("/users/{}/orders", seed * 1_000_003 + uniq)
+        } else {
+            format!("/api/v1/{}", z.pick(rng.unit()))
+        };
+        *truth.entry(v.as_bytes().to_vec()).or_insert(0) += 1;
+        t.record(v.as_bytes(), (i % 400) as u32, 7, 11, i % 50 == 0).unwrap();
+    }
+
+    // Conservación exacta, campo a campo.
+    let sum_req: u64 = t.entries().iter().map(|e| e.bucket.requests).sum();
+    let sum_in: u64 = t.entries().iter().map(|e| e.bucket.bytes_in).sum();
+    let sum_hist: u64 = t.entries().iter().map(|e| e.bucket.hist.total()).sum();
+    if sum_req + t.drawer.requests != n
+        || sum_in + t.drawer.bytes_in != n * 7
+        || sum_hist + t.drawer.hist.total() != n
+    {
+        acc.conservation_failures += 1;
+    }
+
+    // Verdad: los cuatro valores más frecuentes de ESTAS observaciones.
+    let mut real: Vec<(Vec<u8>, u64)> = truth.into_iter().collect();
+    real.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let true_top: Vec<(Vec<u8>, u64)> = real.iter().take(4).cloned().collect();
+    let real_map: std::collections::HashMap<&[u8], u64> =
+        real.iter().map(|(v, c)| (v.as_slice(), *c)).collect();
+
+    // Lo informado: las cuatro entradas de mayor cuenta informada.
+    let mut rep: Vec<(&[u8], u64)> =
+        t.entries().iter().map(|e| (e.value.as_slice(), e.bucket.requests)).collect();
+    rep.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let rep_top: Vec<(&[u8], u64)> = rep.iter().take(4).cloned().collect();
+
+    // Acierto de conjunto CON EMPATES EQUIVALENTES: dos valores con la misma
+    // frecuencia verdadera son intercambiables, y a los volúmenes de un micro
+    // (277 peticiones por hora) los empates son la norma. Exigir el valor
+    // exacto mediría el desempate, no la precisión.
+    let mut want: Vec<u64> = true_top.iter().map(|(_, c)| *c).collect();
+    let mut got: Vec<u64> =
+        rep_top.iter().map(|(v, _)| real_map.get(*v).copied().unwrap_or(0)).collect();
+    want.sort_unstable();
+    got.sort_unstable();
+    if want == got {
+        acc.set_hits += 1;
+    }
+    let got_ordered: Vec<u64> =
+        rep_top.iter().map(|(v, _)| real_map.get(*v).copied().unwrap_or(0)).collect();
+    let want_ordered: Vec<u64> = true_top.iter().map(|(_, c)| *c).collect();
+    if got_ordered == want_ordered {
+        acc.order_hits += 1;
+    }
+    if !rep_top.is_empty()
+        && !true_top.is_empty()
+        && real_map.get(rep_top[0].0).copied().unwrap_or(0) == true_top[0].1
+    {
+        acc.top1_hits += 1;
+    }
+
+    // Exactitud de las cuentas informadas de esas entradas.
+    for (v, reported) in &rep_top {
+        let real_c = real_map.get(*v).copied().unwrap_or(0);
+        acc.reported += 1;
+        if *reported > real_c {
+            acc.overstatements += 1;
+        } else if *reported == real_c {
+            acc.exact_counts += 1;
+        }
+        if real_c > 0 {
+            let miss = (real_c - reported.min(&real_c)) as f64 / real_c as f64;
+            acc.worst_understatement = acc.worst_understatement.max(miss);
+        }
+    }
+
+    acc.drawer_share += t.drawer.requests as f64 / n as f64;
+    acc.trials += 1;
+}
+
+/// **Lo que cuesta el `K = 4` del perfil por defecto**, medido contra las
+/// cuentas exactas de las mismas observaciones.
+///
+/// La cota de subestimación de Space-Saving es `N/K`: bajar de `K = 32` a
+/// `K = 4` la afloja **ocho veces**. Esta prueba pone número a lo que eso
+/// significa de verdad sobre repartos zipf-ianos —el tráfico real está
+/// concentrado, no repartido— a los volúmenes de celda horaria de cada plan:
+///
+/// - con qué frecuencia el top-4 informado ES el top-4 verdadero,
+/// - cuánto tráfico acaba en el cajón `otros` (lo que el panel no puede
+///   nombrar),
+/// - si las cuentas informadas siguen siendo exactas y nunca exageradas.
+#[test]
+#[ignore]
+fn top_k_accuracy_at_the_default_k_of_four() {
+    let shapes = [
+        Shape { name: "endpoints, zipf s=1,0 (200 valores)", values: 200, s: 1.0, unique_share: 0.0 },
+        Shape { name: "user agents, zipf s=1,4 (25 valores)", values: 25, s: 1.4, unique_share: 0.0 },
+        Shape { name: "codigos de estado, zipf s=2,5 (12 valores)", values: 12, s: 2.5, unique_share: 0.0 },
+        Shape {
+            name: "endpoints zipf + 30% de rutas unicas (ataque 12.4)",
+            values: 200,
+            s: 1.0,
+            unique_share: 0.30,
+        },
+    ];
+
+    for shape in &shapes {
+        let z = Zipf::new(shape.values, shape.s);
+        println!();
+        println!("=== reparto \"{}\" ===", shape.name);
+        println!(
+            "  masa teorica de la cabeza: top-4 {:.1}% | top-32 {:.1}% (sin contar el {:.0}% de unicos)",
+            z.head_mass(4) * 100.0,
+            z.head_mass(32) * 100.0,
+            shape.unique_share * 100.0
+        );
+        println!(
+            "  {:<12} {:>8} {:>4} {:>12} {:>8} {:>7} {:>9} {:>12} {:>10} {:>8}",
+            "tier", "N/celda", "K", "top-4 exacto", "orden", "top-1", "cajon", "subestim.", "cuentas", "exagera"
+        );
+        for t in TIERS.iter() {
+            // Peticiones de una celda HORARIA, que es la resolución más fina
+            // que el perfil por defecto retiene.
+            let n = (t.monthly / 30 / 24).max(1);
+            let trials = (2_000_000 / n).clamp(5, 200);
+            for k in [4u16, 8, 16, 32] {
+                let mut acc = Acc::default();
+                for s in 0..trials {
+                    accuracy_trial(&mut acc, shape, n, k, 0x1234_5678 + s * 7919);
+                }
+                let pc = |x: u64| x as f64 / acc.trials as f64 * 100.0;
+                println!(
+                    "  {:<12} {n:>8} {k:>4} {:>11.1}% {:>7.1}% {:>6.1}% {:>8.1}% {:>11.1}% {:>9.1}% {:>8}",
+                    t.name,
+                    pc(acc.set_hits),
+                    pc(acc.order_hits),
+                    pc(acc.top1_hits),
+                    acc.drawer_share / acc.trials as f64 * 100.0,
+                    acc.worst_understatement * 100.0,
+                    acc.exact_counts as f64 / acc.reported as f64 * 100.0,
+                    acc.overstatements
+                );
+                assert_eq!(acc.overstatements, 0, "una cuenta informada supera la verdadera");
+                assert_eq!(acc.conservation_failures, 0, "la conservacion se rompio");
+            }
+        }
+    }
+    println!();
+    println!("  'cajon' = % del trafico que el panel NO puede nombrar; 'subestim.' = peor error");
+    println!("  relativo de una entrada informada; 'cuentas' = % de entradas informadas cuya cuenta");
+    println!("  es EXACTA; 'exagera' = veces que lo informado supera lo verdadero (tiene que ser 0).");
 }
 
 /// **El hallazgo que esta capa estuvo a punto de introducir sin que nadie lo
@@ -728,13 +1039,13 @@ fn the_raw_read_path_with_and_without_aggregates_in_the_same_tree() {
     const N: u32 = 50_000;
     let ns = inro::rollup::RAW_NS_RECOMMENDED;
 
-    fn build(path: &std::path::Path, n: u32, with_agg: bool, ns: u8) -> Db {
+    fn build(path: &std::path::Path, n: u32, with_agg: bool, ns: u8, cfg: Config) -> Db {
         let db = Db::create(
             Box::new(FileStorage::open(path).unwrap()),
             Options { page_size: 4096, sync: Sync::Never, ..Options::default() },
         )
         .unwrap();
-        let mut r = Rollup::new(Config::default());
+        let mut r = Rollup::new(cfg);
         let (mut ep, mut user, mut country) = (String::new(), String::new(), String::new());
         for chunk in (0..n).collect::<Vec<_>>().chunks(1000) {
             let mut tx = db.begin_write().unwrap();
@@ -755,9 +1066,13 @@ fn the_raw_read_path_with_and_without_aggregates_in_the_same_tree() {
     }
 
     println!("--- camino de lectura del crudo, {N} entradas ---");
-    for (name, with_agg) in [("sin agregados", false), ("con agregados", true)] {
-        let path = tmp(&format!("inro-rollup-read-{with_agg}.inro"));
-        let db = build(&path, N, with_agg, ns);
+    for (name, with_agg, cfg) in [
+        ("sin agregados", false, Config::default()),
+        ("agg por defecto", true, Config::default()),
+        ("agg tiempo real", true, Config::realtime()),
+    ] {
+        let path = tmp(&format!("inro-rollup-read-{name}.inro"));
+        let db = build(&path, N, with_agg, ns, cfg);
         let rd = db.begin_read();
 
         // `get` puntual: 5.000 claves repartidas.
