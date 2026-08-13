@@ -520,3 +520,47 @@ fn ram_stays_bounded_across_a_long_run_with_exploding_cardinality() {
     std::println!("rollup: pico de RAM {peak} bytes con 10.000 valores distintos por dimensión");
     assert!(peak < 512 * 1024, "la RAM del agregador subió a {peak} bytes");
 }
+
+/// El desalojo de un valor que YA tiene fila en disco tiene que borrar esa
+/// fila, no solo mover su contenido al cajón.
+///
+/// **Esta prueba existe porque una mutación deliberada la reclamó**: quitar
+/// entero el bloque de borrados de `write_cell` no lo atrapaba ninguna de las
+/// diecisiete pruebas de este fichero. Sin el borrado, la fila vieja sigue en
+/// disco con su contenido *y* ese mismo contenido está en el cajón: al leer,
+/// las peticiones se cuentan dos veces y la dimensión suma más que su propio
+/// total. Es una respuesta equivocada silenciosa, la clase de fallo que la
+/// invariante 2 pone por encima de un `Err`.
+#[test]
+fn a_value_evicted_after_it_reached_disk_loses_its_row_too() {
+    let db = db();
+    let mut r = Rollup::new(Config { top_k: 2, ..Config::default() });
+    let mut n = 0u64;
+    // Cuatro endpoints que se turnan la cabeza: cada lote deja dos en disco y
+    // desaloja a los otros dos en el siguiente.
+    let eps: [&[u8]; 4] = [b"/a", b"/b", b"/c", b"/d"];
+    for batch in 0..8u32 {
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..40u32 {
+            // El endpoint dominante rota por lote.
+            let e = eps[((batch + i / 10) % 4) as usize];
+            r.observe(&mut tx, &obs(T0 + 5, e, 200, 4)).unwrap();
+            n += 1;
+        }
+        r.flush(&mut tx).unwrap();
+        tx.commit().unwrap();
+    }
+
+    let rd = db.begin_read();
+    let tsb = Resolution::Hour.bucket_of(T0 + 5).unwrap();
+    let rows = read_dimension(&rd, Resolution::Hour, tsb, Dimension::Endpoint).unwrap();
+    assert!(
+        rows.len() <= 3,
+        "{} filas en disco con K = 2: sobreviven filas de valores ya desalojados",
+        rows.len()
+    );
+    let sum: u64 = rows.iter().map(|r| r.bucket.requests).sum();
+    let total = read_total(&rd, Resolution::Hour, tsb).unwrap().unwrap();
+    assert_eq!(total.requests, n);
+    assert_eq!(sum, n, "las filas de endpoint suman {sum} para {n} peticiones reales");
+}

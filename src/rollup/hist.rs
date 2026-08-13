@@ -286,7 +286,14 @@ mod tests {
 
         // Casi todo rápido, cola larga: la forma normal de una API.
         let mut d = Vec::new();
-        for _ in 0..20_000 {
+        // Tamaños NO múltiplos de 1000, a propósito. Con `n` divisible entre
+        // mil, `ceil(n·p/1000)` y `n·p/1000` truncado dan el MISMO rango para
+        // cualquier `p` de los que se prueban, y una prueba de contención con
+        // solo esos tamaños pasa igual aunque el código use la definición
+        // equivocada de percentil — comprobado rompiéndolo a propósito: el
+        // cambio de `div_ceil` a división truncada no lo atrapaba ninguna de
+        // las once pruebas de este módulo.
+        for _ in 0..20_003 {
             let x = r.below(1000);
             d.push(if x < 900 {
                 1 + r.below(20)
@@ -300,28 +307,37 @@ mod tests {
 
         // Bimodal: caché acertada (1-3 ms) o fallada (80-120 ms).
         let mut d = Vec::new();
-        for _ in 0..20_000 {
+        for _ in 0..19_997 {
             d.push(if r.below(100) < 70 { 1 + r.below(3) } else { 80 + r.below(40) });
         }
         out.push(("bimodal", d));
 
         // Todo en la cubeta abierta: timeouts.
         let mut d = Vec::new();
-        for _ in 0..5_000 {
+        for _ in 0..4_999 {
             d.push(20_000 + r.below(40_000));
         }
         out.push(("timeouts", d));
 
         // Constante: el caso degenerado que rompe cualquier interpolación
         // ingenua.
-        out.push(("constante", alloc::vec![7u32; 3_000]));
+        out.push(("constante", alloc::vec![7u32; 3_001]));
 
         // Uniforme muy ancha.
         let mut d = Vec::new();
-        for _ in 0..20_000 {
+        for _ in 0..20_011 {
             d.push(r.below(5_000));
         }
         out.push(("uniforme", d));
+
+        // Muestra diminuta con todos los valores en cubetas distintas: aquí
+        // un rango de menos hace saltar de cubeta, así que separa las dos
+        // definiciones de percentil de la forma más ruidosa posible.
+        out.push(("diminuta", alloc::vec![1u32, 3, 6, 12, 25, 50, 100, 200, 400, 900, 1800]));
+
+        // Una sola muestra: el borde donde cualquier redondeo de rango se
+        // nota inmediatamente.
+        out.push(("unica", alloc::vec![37u32]));
 
         out
     }
