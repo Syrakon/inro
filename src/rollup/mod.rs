@@ -84,6 +84,40 @@ pub mod topk;
 pub use bucket::Bucket;
 pub use hist::{Histogram, Percentile};
 pub use key::AGG_NS;
+
+/// Espacio de claves **recomendado para los registros crudos** cuando se usa
+/// esta capa. No lo impone nada: es el argumento `ns` que pasa quien escribe
+/// el crudo, y este módulo no lo ve nunca. Pero la diferencia está medida y
+/// es enorme.
+///
+/// `tree.rs` reparte una hoja desbordada por el punto medio **salvo** cuando
+/// la clave que entra es la mayor de TODO el árbol y la hoja es la de más a
+/// la derecha (`SplitBias::Append`). Ese sesgo es lo que bajó el crudo de
+/// 67,72 a 34,14 bytes por entrada, porque un log se inserta siempre por el
+/// final. Y el motor antepone el byte de espacio de claves a cada clave, así
+/// que el orden de los espacios ES el orden del árbol: con el crudo en `0x01`
+/// y los agregados en `0x02`, **basta UNA fila de agregado para que ninguna
+/// clave cruda vuelva a ser la mayor del árbol**. El sesgo deja de dispararse
+/// y el llenado de hoja vuelve al ~50%.
+///
+/// **Medido** (`tests/rollup_size.rs`,
+/// `one_aggregate_row_costs_the_raw_path_its_append_split_bias`, 20.000
+/// registros, páginas de 4 KB): 39,94 B/entrada sin ninguna fila en `0x02`,
+/// **84,99 B/entrada con una sola** — un 112,8% más, muy por encima del
+/// umbral de 40 que vigila la integración continua. Con el crudo en este
+/// espacio y los agregados en `0x02`: 39,94 B/entrada otra vez, penalización
+/// cero.
+///
+/// El arreglo de fondo sería que `SplitBias` razonara por espacio de claves y
+/// no por «mayor clave del árbol», pero cambiar la política de partición de
+/// nodos es una tarea propia con su propia revisión (sección 12.2 de la
+/// especificación lo dice explícitamente). Esto es la mitigación que cuesta
+/// un byte y recupera el 100%.
+///
+/// **Desvía del mapa de espacios de la sección 10 de la especificación**, que
+/// pone el crudo en `0x01`. La desviación es deliberada y el motivo está
+/// medido; queda anotado en el informe.
+pub const RAW_NS_RECOMMENDED: u8 = 0x7f;
 pub use topk::{MAX_DIM_LEN, TopK};
 
 use crate::error::{Error, Result};

@@ -87,16 +87,61 @@ impl Bucket {
         bytes_out: u64,
         error: bool,
     ) -> Result<()> {
-        self.requests = self.requests.checked_add(1).ok_or(Error::BadFormat)?;
-        if error {
-            self.errors = self.errors.checked_add(1).ok_or(Error::BadFormat)?;
+        self.record_many(latency_ms, bytes_in, bytes_out, error, 1)
+    }
+
+    /// Registra `n` peticiones idénticas de una vez: misma latencia, mismos
+    /// bytes cada una, mismo veredicto de error.
+    ///
+    /// Para quien funde datos ya resumidos de otra fuente en una celda —o
+    /// reconstruye una— sin tener las peticiones sueltas. Sube contadores e
+    /// histograma **a la vez**, así que las tres relaciones que `decode`
+    /// comprueba se mantienen por construcción y no por disciplina del
+    /// llamante.
+    pub fn record_many(
+        &mut self,
+        latency_ms: u32,
+        bytes_in: u64,
+        bytes_out: u64,
+        error: bool,
+        n: u64,
+    ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
         }
-        self.bytes_in = self.bytes_in.checked_add(bytes_in).ok_or(Error::BadFormat)?;
-        self.bytes_out = self.bytes_out.checked_add(bytes_out).ok_or(Error::BadFormat)?;
+        // Se calcula TODO antes de escribir nada, igual que hace
+        // `WriteTxn::put` con sus índices (invariante 22): si algo va a
+        // desbordar, el bucket se queda exactamente como estaba. Un
+        // desbordamiento a medio aplicar dejaría `requests` subido y el
+        // histograma sin subir, que es justo la incoherencia que `decode`
+        // rechaza — y el llamante se encontraría con un bucket que ya no se
+        // puede ni guardar.
+        let requests = self.requests.checked_add(n).ok_or(Error::BadFormat)?;
+        let errors = if error {
+            self.errors.checked_add(n).ok_or(Error::BadFormat)?
+        } else {
+            self.errors
+        };
+        let bytes_in = self
+            .bytes_in
+            .checked_add(bytes_in.checked_mul(n).ok_or(Error::BadFormat)?)
+            .ok_or(Error::BadFormat)?;
+        let bytes_out = self
+            .bytes_out
+            .checked_add(bytes_out.checked_mul(n).ok_or(Error::BadFormat)?)
+            .ok_or(Error::BadFormat)?;
+        let mut hist = self.hist;
+        hist.record_many(latency_ms, n)?;
+
+        self.requests = requests;
+        self.errors = errors;
+        self.bytes_in = bytes_in;
+        self.bytes_out = bytes_out;
+        self.hist = hist;
         if latency_ms > self.max_latency {
             self.max_latency = latency_ms;
         }
-        self.hist.record(latency_ms)
+        Ok(())
     }
 
     /// Suma `other` a este bucket. La operación que hace conmutativo el
@@ -433,6 +478,33 @@ mod tests {
         assert_eq!(ab.bytes_out, a.bytes_out + b.bytes_out);
         assert_eq!(ab.max_latency, a.max_latency.max(b.max_latency));
         assert_eq!(Bucket::decode(&ab.encode()).unwrap(), ab, "la fusión sigue siendo decodable");
+    }
+
+    #[test]
+    fn record_many_matches_a_loop_of_record() {
+        let mut a = Bucket::new();
+        for _ in 0..37 {
+            a.record(13, 5, 7, true).unwrap();
+        }
+        let mut b = Bucket::new();
+        b.record_many(13, 5, 7, true, 37).unwrap();
+        assert_eq!(a, b);
+        // Y sigue cumpliendo las relaciones que `decode` comprueba.
+        assert_eq!(Bucket::decode(&b.encode()).unwrap(), b);
+        // Cero es un no-op, no una petición fantasma.
+        b.record_many(13, 5, 7, true, 0).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_refused_record_many_leaves_the_bucket_exactly_as_it_was() {
+        let mut b = sample();
+        let before = b;
+        assert!(b.record_many(1, u64::MAX, 1, false, 3).is_err());
+        assert_eq!(b, before, "un desbordamiento dejó el bucket mutado a medias");
+        assert!(b.record_many(1, 1, 1, false, u64::MAX).is_err());
+        assert_eq!(b, before);
+        assert_eq!(Bucket::decode(&b.encode()).unwrap(), before, "y sigue guardable");
     }
 
     #[test]

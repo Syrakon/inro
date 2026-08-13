@@ -159,8 +159,20 @@ impl Histogram {
 
     /// Registra una muestra de `v` milisegundos.
     pub fn record(&mut self, v: u32) -> Result<()> {
+        self.record_many(v, 1)
+    }
+
+    /// Registra `n` muestras de `v` milisegundos de una vez.
+    ///
+    /// No es una comodidad de pruebas: quien funde agregados ya resumidos —o
+    /// reconstruye una celda desde otra fuente— tiene la cuenta, no las
+    /// muestras, y hacerlo con un bucle de `record` sería `O(n)` por una suma
+    /// que es `O(1)`. Mantiene la relación que `Bucket::decode` comprueba
+    /// (la suma del histograma iguala las peticiones) por construcción,
+    /// porque `Bucket::record_many` sube las dos cosas a la vez.
+    pub fn record_many(&mut self, v: u32, n: u64) -> Result<()> {
         let k = bucket_of(v);
-        self.counts[k] = self.counts[k].checked_add(1).ok_or(Error::BadFormat)?;
+        self.counts[k] = self.counts[k].checked_add(n).ok_or(Error::BadFormat)?;
         Ok(())
     }
 
