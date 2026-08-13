@@ -654,6 +654,68 @@ mod tests {
     /// hay ningún índice CON `ns = 0x81`, así que la escritura se acepta sin
     /// pasar por la maquinaria de índices, y la corrupción solo se
     /// manifiesta después, al leerla como si fuera una entrada real.
+    /// `delete_range` sobre el espacio de un índice lo borraba ENTERO
+    /// dejando vivas todas las filas, sin error y sin que `audit_pages`
+    /// protestara — la propiedad de páginas quedaba impecable porque las
+    /// entradas simplemente ya no estaban.
+    ///
+    /// El agujero era estructural, no un descuido puntual: la negativa de
+    /// `delete_range` busca índices DECLARADOS sobre ese `ns`, y
+    /// `define_index` prohíbe declarar uno sobre un espacio reservado
+    /// (`def.ns >= INDEX_NS_BASE`). Es decir, para `ns = 0x80 | id` la
+    /// negativa nunca podía saltar: no por olvido, sino porque preguntaba
+    /// algo cuya respuesta era necesariamente "no".
+    ///
+    /// Sin el guardián, esta prueba falla en el `unwrap_err` de abajo,
+    /// porque `delete_range` devuelve `Ok`. Y el daño, medido quitando el
+    /// guardián y dejando correr la operación: **el índice queda en 0
+    /// entradas y las 3 filas siguen vivas**. `scan_index` devuelve entonces
+    /// la lista vacía para una consulta cuyas filas existen — dato
+    /// silenciosamente equivocado, que es peor que un error.
+    #[test]
+    fn delete_range_cannot_wipe_an_index_through_its_reserved_namespace() {
+        let db = db(); // índice id=1 -> index_ns = 0x81
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..3u32 {
+            tx.put(0x10, &i.to_be_bytes(), b"madrid").unwrap();
+        }
+        tx.commit().unwrap();
+
+        let mut tx = db.begin_write().unwrap();
+        let err = tx.delete_range(0x81, b"", &SCAN_EVERYTHING).unwrap_err();
+        assert_eq!(
+            err,
+            Error::ReservedNamespace { ns: 0x81 },
+            "0x81 es el arbol del indice id=1, no un espacio del llamante"
+        );
+        drop(tx);
+
+        let r = db.begin_read();
+        assert_eq!(
+            r.scan_index(1, b"madrid", b"madrid\xff").unwrap().len(),
+            3,
+            "el indice sigue entero"
+        );
+    }
+
+    /// El catálogo (`0x00`) guarda las definiciones de índice. Escribir ahí
+    /// por la API pública permitía plantar basura que `define_index` y
+    /// `scan_index` tienen luego que tolerar; cerrarlo es más barato que
+    /// seguir tolerándola.
+    #[test]
+    fn the_catalog_namespace_is_closed_to_the_public_api() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        assert_eq!(
+            tx.put(CATALOG_NS, b"\x01", b"basura").unwrap_err(),
+            Error::ReservedNamespace { ns: CATALOG_NS }
+        );
+        assert_eq!(
+            tx.delete(CATALOG_NS, b"\x01").unwrap_err(),
+            Error::ReservedNamespace { ns: CATALOG_NS }
+        );
+    }
+
     #[test]
     fn scan_index_reports_bad_format_instead_of_panicking_on_a_garbage_entry() {
         let db = db(); // índice id=1, no único -> index_ns = 0x81
@@ -661,7 +723,11 @@ mod tests {
         // Los últimos dos bytes de una entrada no única codifican la
         // longitud de la clave primaria; aquí dicen 65535 sobre una entrada
         // de solo 2 bytes en total.
-        tx.put(0x81, b"\xff\xff", b"").unwrap();
+        // `put_raw`, no `put`: el espacio 0x81 es un arbol de indice y la
+        // API publica lo rechaza ahora con `ReservedNamespace`. Plantar la
+        // basura es un detalle del montaje; lo que la prueba afirma es que
+        // `scan_index` la reporte en vez de entrar en panico.
+        tx.put_raw(0x81, b"\xff\xff", b"").unwrap();
         tx.commit().unwrap();
 
         let r = db.begin_read();

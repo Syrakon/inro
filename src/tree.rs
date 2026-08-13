@@ -5102,28 +5102,28 @@ mod range_tests {
     /// borrado (`0xfe`) es inmediatamente inferior al que debe sobrevivir
     /// (`0xff`), el mayor byte de espacio posible.
     #[test]
-    fn keyspace_isolation_holds_at_the_0xff_boundary() {
+    fn keyspace_isolation_holds_at_the_top_of_user_space() {
         let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
         let mut tx = db.begin_write().unwrap();
         for i in 0..300u32 {
-            tx.put(0xfe, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
+            tx.put(0x7e, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
         }
-        tx.put(0xff, b"centinela", b"intacto").unwrap();
+        tx.put(0x7f, b"centinela", b"intacto").unwrap();
         tx.commit().unwrap();
 
         let mut tx = db.begin_write().unwrap();
-        tx.delete_range(0xfe, b"", b"\xff\xff\xff\xff").unwrap();
+        tx.delete_range(0x7e, b"", b"\xff\xff\xff\xff").unwrap();
         tx.commit().unwrap();
 
         let r = db.begin_read();
         for i in 0..300u32 {
             let key = alloc::format!("{i:06}");
-            assert_eq!(r.get(0xfe, key.as_bytes()).unwrap(), None, "clave {key}");
+            assert_eq!(r.get(0x7e, key.as_bytes()).unwrap(), None, "clave {key}");
         }
         assert_eq!(
-            r.get(0xff, b"centinela").unwrap().as_deref(),
+            r.get(0x7f, b"centinela").unwrap().as_deref(),
             Some(b"intacto".as_slice()),
-            "el espacio 0xff no debe tocarse"
+            "el espacio 0x7f no debe tocarse"
         );
     }
 
@@ -5132,25 +5132,25 @@ mod range_tests {
     /// cualquier problema de desbordamiento o de comparación especial en
     /// ese extremo, no solo en el vecino inmediatamente inferior.
     #[test]
-    fn keyspace_isolation_when_the_deleted_namespace_is_0xff_itself() {
+    fn keyspace_isolation_when_the_deleted_namespace_is_the_top_one() {
         let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
         let mut tx = db.begin_write().unwrap();
-        tx.put(0xfe, b"vecino", b"intacto").unwrap();
+        tx.put(0x7e, b"vecino", b"intacto").unwrap();
         for i in 0..300u32 {
-            tx.put(0xff, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
+            tx.put(0x7f, alloc::format!("{i:06}").as_bytes(), b"v").unwrap();
         }
         tx.commit().unwrap();
 
         let mut tx = db.begin_write().unwrap();
-        tx.delete_range(0xff, b"", b"\xff\xff\xff\xff").unwrap();
+        tx.delete_range(0x7f, b"", b"\xff\xff\xff\xff").unwrap();
         tx.commit().unwrap();
 
         let r = db.begin_read();
         for i in 0..300u32 {
             let key = alloc::format!("{i:06}");
-            assert_eq!(r.get(0xff, key.as_bytes()).unwrap(), None, "clave {key}");
+            assert_eq!(r.get(0x7f, key.as_bytes()).unwrap(), None, "clave {key}");
         }
-        assert_eq!(r.get(0xfe, b"vecino").unwrap().as_deref(), Some(b"intacto".as_slice()));
+        assert_eq!(r.get(0x7e, b"vecino").unwrap().as_deref(), Some(b"intacto".as_slice()));
     }
 
     /// Reutiliza `check_invariants` (tarea 11-12): tras un borrado de rango
@@ -6140,7 +6140,7 @@ mod parse_order_and_overlap_tests {
     }
 
     /// Página hoja de tres entradas con claves "a", "abcd", "abce" DENTRO
-    /// del espacio de nombres `0x00` -- `crate::tx::scoped` antepone el
+    /// del espacio de nombres `0x01` -- `crate::tx::scoped` antepone el
     /// byte de `ns` antes de que la clave llegue al árbol (única
     /// transformación entre lo que ve `Db::get`/`WriteTxn::put` y lo que
     /// vive en la página), así que construir la página con claves SIN ese
@@ -6201,7 +6201,7 @@ mod parse_order_and_overlap_tests {
         commit_as_root(&db, &permuted_slots_leaf_page());
 
         let mut tx = db.begin_write().unwrap();
-        let result = tx.put(0x00, b"abcf", b"x");
+        let result = tx.put(0x01, b"abcf", b"x");
         assert!(
             matches!(result, Err(Error::Corrupt { kind: CorruptKind::SlotOffset, .. })),
             "put contra una hoja con slots permutados debe devolver \

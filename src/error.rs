@@ -120,6 +120,24 @@ pub enum Error {
     /// entradas del rango. A diferencia de `IndexNotDeclared`, declarar el
     /// índice no cambia el resultado: la operación sigue rechazada.
     DeleteRangeIndexed { ns: u8 },
+    /// Escritura por la API pública sobre un espacio de claves RESERVADO al
+    /// motor: `CATALOG_NS` (0x00) o cualquiera desde `INDEX_NS_BASE` (0x80)
+    /// arriba, que son los árboles de índice.
+    ///
+    /// `define_index` ya rechazaba definir un índice sobre esos espacios,
+    /// pero `put`/`delete`/`delete_range` no comprobaban nada — y ahí estaba
+    /// el agujero: como NINGÚN `IndexDef` puede tener un `ns` reservado, la
+    /// negativa de `delete_range` (que busca índices declarados sobre `ns`)
+    /// nunca saltaba para `ns = INDEX_NS_BASE | id`. Es decir, un
+    /// `delete_range(0x80 | id, b"", b"\xff")` **borraba el índice entero
+    /// dejando vivas todas las filas**, sin error, y `audit_pages` seguía
+    /// devolviendo `true` porque la propiedad de páginas quedaba impecable:
+    /// las entradas simplemente ya no estaban.
+    ///
+    /// El motor escribe en esos espacios por dentro con `put_raw`/
+    /// `delete_raw`, que no pasan por aquí, así que cerrar la puerta pública
+    /// no le quita nada a él.
+    ReservedNamespace { ns: u8 },
     KeyTooLarge { len: u32, max: u32 },
     /// No queda espacio direccionable: el fichero alcanzó 2^32 páginas.
     Full,

@@ -1987,7 +1987,13 @@ impl<'db> WriteTxn<'db> {
     /// para actualizar también los índices secundarios dentro de la misma
     /// transacción; `define_index` también la usa directamente para escribir
     /// el catálogo, que nunca está indexado.
-    fn put_raw(&mut self, ns: u8, key: &[u8], value: &[u8]) -> Result<()> {
+    /// `pub(crate)` y no privado: `index.rs` necesita plantar una entrada
+    /// corrupta EN un espacio de índice para comprobar que `scan_index` la
+    /// reporta en vez de entrar en pánico, y desde que `put` rechaza los
+    /// espacios reservados (`Error::ReservedNamespace`) esa es la única vía
+    /// dentro del crate. No amplía nada de cara al usuario: `put_raw` sigue
+    /// sin ser `pub`.
+    pub(crate) fn put_raw(&mut self, ns: u8, key: &[u8], value: &[u8]) -> Result<()> {
         let full = scoped(ns, key);
         let root = crate::tree::put(self, self.meta.root, &full, value)?;
         self.meta.root = root;
@@ -2036,6 +2042,9 @@ impl<'db> WriteTxn<'db> {
     /// cosas un cambio de la forma pública de `Error` fuera del alcance de
     /// esta ronda.
     pub fn put(&mut self, ns: u8, key: &[u8], value: &[u8]) -> Result<()> {
+        if ns == CATALOG_NS || ns >= INDEX_NS_BASE {
+            return Err(Error::ReservedNamespace { ns });
+        }
         let defs = self.db.indexes_for(ns);
         // Antes de decidir NADA, ni siquiera el atajo de "aquí no hay
         // índices": esa lista vacía puede significar que esta apertura no
@@ -2142,6 +2151,9 @@ impl<'db> WriteTxn<'db> {
     /// dentro de la misma transacción. Mismo contrato de error que `put`:
     /// abandona la transacción si devuelve `Err`.
     pub fn delete(&mut self, ns: u8, key: &[u8]) -> Result<bool> {
+        if ns == CATALOG_NS || ns >= INDEX_NS_BASE {
+            return Err(Error::ReservedNamespace { ns });
+        }
         let defs = self.db.indexes_for(ns);
         // Mismo guardián que en `put`, y por el mismo motivo: sin él, una
         // apertura que no declara sus índices borra la fila y deja su
@@ -2234,6 +2246,9 @@ impl<'db> WriteTxn<'db> {
     /// clave a clave —el remedio que (1) describe— sí obtendrá entonces
     /// `IndexNotDeclared`, que es donde declarar el índice sí resuelve.
     pub fn delete_range(&mut self, ns: u8, from: &[u8], to: &[u8]) -> Result<()> {
+        if ns == CATALOG_NS || ns >= INDEX_NS_BASE {
+            return Err(Error::ReservedNamespace { ns });
+        }
         if !self.db.indexes_for(ns).is_empty() || self.catalog_indexes_namespace(ns)? {
             return Err(Error::DeleteRangeIndexed { ns });
         }
