@@ -72,15 +72,17 @@ fn a_single_observation_lands_in_all_three_resolutions() {
     }
 }
 
-/// El perfil por defecto (`Profile::Minimal`) **no escribe ni una fila de
-/// resolución de minuto**. Es la mitad del ahorro de disco y lo que le cuesta
-/// al panel su zoom en tiempo real, así que se comprueba en vez de suponerse.
+/// El perfil por defecto (`Profile::Reports`) **no escribe ni una fila de
+/// resolución de minuto**. Ahí está la mayor parte del ahorro de disco, y es
+/// lo que le cuesta al panel su zoom en tiempo real, así que se comprueba en
+/// vez de suponerse. `K` se queda en 32: bajarlo aportaba 2,1 GB de los 16,1
+/// del perfil y dejaba el informe por dimensión inservible.
 #[test]
 fn the_default_profile_writes_no_minute_resolution_at_all() {
     let db = db();
     let cfg = Config::default();
-    assert_eq!(cfg, Config::minimal());
-    assert_eq!(cfg.top_k, 4);
+    assert_eq!(cfg, Config::reports());
+    assert_eq!(cfg.top_k, 32);
     assert!(!cfg.keeps(Resolution::Minute));
     assert_eq!(cfg.active().collect::<Vec<_>>(), vec![Resolution::Hour, Resolution::Day]);
 
@@ -101,11 +103,11 @@ fn the_default_profile_writes_no_minute_resolution_at_all() {
         let tsb = res.bucket_of(T0).unwrap();
         assert_eq!(read_total(&rd, res, tsb).unwrap().unwrap().requests, 300, "{res:?}");
     }
-    // Y con K = 4 la celda horaria son 21 filas como mucho: 1 total + cuatro
+    // Y con K = 32 la celda horaria son 133 filas como mucho: 1 total + cuatro
     // dimensiones de K entradas y un cajón.
     let tsb = Resolution::Hour.bucket_of(T0).unwrap();
     let rows = read_range(&rd, Resolution::Hour, tsb, tsb + 1, 10_000).unwrap();
-    assert!(rows.len() <= 1 + 4 * (4 + 1), "{} filas en una celda horaria", rows.len());
+    assert!(rows.len() <= 1 + 4 * (32 + 1), "{} filas en una celda horaria", rows.len());
 }
 
 /// Los tres perfiles son la escalera que documenta el módulo: `Reports` solo
@@ -121,8 +123,8 @@ fn the_three_profiles_are_the_ladder_the_docs_describe() {
     assert_eq!(r.retention(Resolution::Hour), 7 * 86_400);
     assert_eq!(rt.retention(Resolution::Hour), 30 * 86_400);
     assert_eq!(rt.retention(Resolution::Day), 730 * 86_400);
-    assert_eq!(Config::default(), m);
-    assert_eq!(Profile::default(), Profile::Minimal);
+    assert_eq!(Config::default(), r, "el defecto es Reports, no Minimal");
+    assert_eq!(Profile::default(), Profile::Reports);
 }
 
 #[test]

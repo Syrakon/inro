@@ -38,15 +38,17 @@ agregado, o ninguno de los dos.
 
 ## 2. Uso
 
-**Lo primero es el perfil** (§7): `Config::default()` es el mínimo —sin
-resolución de minuto y con `K = 4`—, y esa elección tiene un coste de precisión
-medido que conviene leer antes de aceptarla.
+**Lo primero es el perfil** (§7): `Config::default()` es `Reports` —sin
+resolución de minuto, retenciones cortas y `K = 32`—, que conserva casi todo el
+ahorro de disco sin pagar precisión. `Config::minimal()` baja `K` a 4 y ahorra
+2,1 GB más de flota, a cambio de dejar el desglose por dimensión inservible;
+`Config::realtime()` añade la resolución de minuto para el zoom del panel.
 
 ```rust
 use inro::rollup::{Config, Observation, Rollup, RAW_NS_RECOMMENDED};
 
-let mut rollup = Rollup::new(Config::default());   // Profile::Minimal
-// let mut rollup = Rollup::new(Config::reports());  // top-K utilizable
+let mut rollup = Rollup::new(Config::default());   // Profile::Reports
+// let mut rollup = Rollup::new(Config::minimal());  // 2,1 GB menos, sin top-K util
 // let mut rollup = Rollup::new(Config::realtime()); // + zoom de minuto
 
 let mut tx = db.begin_write()?;
@@ -317,7 +319,7 @@ suelta.
 cambia el orden de magnitud.** Hay tres, y la elección se lee en el sitio donde
 se construye el `Rollup`:
 
-| | `Minimal` — `Config::default()` | `Reports` — `Config::reports()` | `Realtime` — `Config::realtime()` |
+| | `Minimal` — `Config::minimal()` | `Reports` — `Config::default()` | `Realtime` — `Config::realtime()` |
 |---|---|---|---|
 | `top_k` | **4** | 32 | 32 |
 | Minuto (totales y estados) | **apagada** | apagada | 48 horas |
@@ -486,11 +488,17 @@ exageraciones (`informado <= verdadero`, siempre) y cero fallos de conservación
 (`Σ entradas + otros == N`, campo a campo). El error de `K = 4` es de
 subestimación y de identidad, nunca una cifra inventada.
 
-**Recomendación de quien lo midió:** si el informe por endpoint o por usuario
-importa, `Config::reports()` cuesta 784 KB más por nodo micro (1,05 MB frente a
-268 KB) y 2,1 GB más de flota a 2.700 nodos, y devuelve el top-K a ser
-utilizable. `Config::default()` es defendible solo si de los agregados se
-esperan totales, percentiles y códigos de estado.
+**Decidido tras medirlo, y por eso el defecto cambió:** `Config::default()` es
+`Reports`. `Minimal` se eligió sobre una cifra de disco, antes de medir la
+precisión; con `K = 4` el informe por dimensión queda inservible y el ahorro que
+aportaba `K` eran 2,1 GB de los 16,1 del perfil — los otros 13,9 vienen de
+apagar el minuto y acortar retenciones, que `Reports` conserva. `Reports` cuesta
+784 KB más por nodo micro (1,05 MB frente a 268 KB) y 2,1 GB más de flota a
+2.700 nodos.
+
+`Config::minimal()` sigue disponible y es defendible si de los agregados solo se
+esperan totales, percentiles y códigos de estado, que son exactos y no dependen
+de `K`.
 
 ## 9. Límites conocidos
 

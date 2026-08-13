@@ -73,23 +73,28 @@
 //! cuesta disco en vez de ahorrárselo. Medido, no supuesto
 //! (`tests/rollup_size.rs`).
 //!
-//! Por eso el perfil por defecto es `Profile::Minimal` y no el de la
-//! especificación:
+//! Por eso el perfil por defecto NO es el de la especificación. Pero
+//! tampoco es el mínimo: medida la precisión, `K = 4` deja el desglose por
+//! dimensión inservible —el top-4 informado acierta en el 0,5% de las celdas
+//! y el 97-100% del tráfico cae en `otros`— y bajar `K` solo aportaba 2,1 GB
+//! de los 16,1 que ahorra el perfil. Los otros 13,9 vienen de apagar el
+//! minuto y acortar retenciones, y esos `Reports` los conserva enteros. El
+//! defecto es `Profile::Reports`.
 //!
-//! | | `Minimal` (por defecto) | `Reports` | `Realtime` (§12.3) |
+//! | | `Minimal` | `Reports` (por defecto) | `Realtime` (§12.3) |
 //! |---|---|---|---|
-//! | `top_k` | **4** | 32 | 32 |
-//! | Minuto | **apagada** | apagada | activa, 48 h |
-//! | Hora | **7 días** | 7 días | 30 días |
-//! | Día | **90 días** | 90 días | 2 años |
-//! | Filas por celda horaria (medidas) | **21** | 112 | 112 |
-//! | Disco de un micro | **268 KB** | 1.052 KB | 6.056 KB |
-//! | Flota de 2.700 | **3,20 GB** | 5,32 GB | 19,28 GB |
-//! | Top-4 por endpoint acertado | **0,5%** | 97,5-100% | 97,5-100% |
-//! | Zoom en tiempo real | no | no | **sí** |
+//! | `top_k` | 4 | **32** | 32 |
+//! | Minuto | apagada | **apagada** | activa, 48 h |
+//! | Hora | 7 días | **7 días** | 30 días |
+//! | Día | 90 días | **90 días** | 2 años |
+//! | Filas por celda horaria (medidas) | 21 | **112** | 112 |
+//! | Disco de un micro | 268 KB | **1.052 KB** | 6.056 KB |
+//! | Flota de 2.700 | 3,20 GB | **5,32 GB** | 19,28 GB |
+//! | Top-4 por endpoint acertado | 0,5% | **97,5-100%** | 97,5-100% |
+//! | Zoom en tiempo real | no | **no** | sí |
 //!
 //! ```ignore
-//! let mut rollup = Rollup::new(Config::default());   // Minimal
+//! let mut rollup = Rollup::new(Config::default());   // Reports
 //! let mut panel  = Rollup::new(Config::realtime());  // §12.3, con minuto
 //! ```
 //!
@@ -222,7 +227,7 @@ impl Resolution {
     /// la resolución que alimenta el zoom en tiempo real del panel, y las
     /// dimensiones de alta cardinalidad multiplicarían por cuatro un número
     /// de celdas que ya es sesenta veces el horario. **Está apagada en el
-    /// perfil por defecto** (`Profile::Minimal`); la enciende
+    /// perfil por defecto** (`Profile::Reports`); la enciende
     /// `Config::realtime()`.
     pub fn dimensions(self) -> &'static [Dimension] {
         match self {
@@ -289,7 +294,7 @@ pub struct Observation<'a> {
 /// se lea:
 ///
 /// ```ignore
-/// let mut rollup = Rollup::new(Config::default());   // Profile::Minimal
+/// let mut rollup = Rollup::new(Config::default());   // Profile::Reports
 /// let mut panel  = Rollup::new(Config::realtime());  // Profile::Realtime
 /// ```
 ///
@@ -297,8 +302,9 @@ pub struct Observation<'a> {
 /// puede seguir tocando con `Config { top_k: 8, ..Config::realtime() }`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub enum Profile {
-    /// **El de por defecto.** `K = 4`, **sin resolución de minuto**, 7 días de
-    /// hora y 90 días de día.
+    /// `K = 4`, **sin resolución de minuto**, 7 días de hora y 90 días de
+    /// día. **Ya NO es el de por defecto**: lo fue hasta que se midió la
+    /// precisión del top-K. Ver `Profile::Reports`.
     ///
     /// Existe porque el coste de esta capa no lo pone el tráfico sino el
     /// número de celdas × filas por celda: con el perfil de la especificación,
@@ -321,9 +327,8 @@ pub enum Profile {
     ///
     /// Si el informe por endpoint o por usuario importa, `Profile::Reports`
     /// cuesta 784 KB más por nodo micro y lo arregla.
-    #[default]
     Minimal,
-    /// Las retenciones de `Minimal` —sin minuto, 7 días de hora, 90 de día—
+    /// **El de por defecto.** Las retenciones de `Minimal` —sin minuto, 7 días de hora, 90 de día—
     /// **pero con `K = 32`**.
     ///
     /// Es el punto medio medido: se queda con casi todo el ahorro de disco (la
@@ -336,6 +341,7 @@ pub enum Profile {
     /// minuto**: de los 16,1 GB de flota que se ahorran frente a §12.3, 13,9
     /// son de apagar el minuto y acortar la retención y solo 2,1 de bajar `K`
     /// de 32 a 4.
+    #[default]
     Reports,
     /// El de la sección 12.3 al pie de la letra: `K = 32`, las tres
     /// resoluciones, 48 h de minuto, 30 d de hora, 2 años de día.
@@ -385,7 +391,7 @@ impl Profile {
     }
 }
 
-/// Ajustes de la capa. `Config::default()` es `Profile::Minimal`.
+/// Ajustes de la capa. `Config::default()` es `Profile::Reports`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Config {
     /// Entradas por dimensión y celda. Es a la vez el tope de RAM y el de
@@ -408,9 +414,29 @@ pub struct Config {
 }
 
 impl Default for Config {
-    /// `Profile::Minimal`. Ver el comentario del módulo para el porqué.
+    /// `Profile::Reports`, no `Minimal`. La medición de la precisión del
+    /// top-K decidió esto tras haberse elegido `Minimal` sobre una cifra de
+    /// disco: con `K = 4` y una distribución zipf realista de 200 endpoints,
+    /// el top-4 informado coincide con el verdadero en el **0,5%** de las
+    /// celdas horarias y entre el **97% y el 100% del tráfico cae en el
+    /// cajón `otros`** — el desglose por dimensión queda vacío, que es
+    /// justamente para lo que existe la agregación. La causa es aritmética:
+    /// Space-Saving solo garantiza lo que supera `N/K`, y con `K = 4` eso es
+    /// el 25% del tráfico de la celda, umbral que ningún endpoint real
+    /// alcanza.
+    ///
+    /// Y bajar `K` **no era de donde venía el ahorro**: de los 16,1 GB que
+    /// el perfil mínimo recorta en una flota de 2.700, 13,9 son de quitar la
+    /// resolución de minuto y acortar retenciones, y solo 2,1 de bajar `K`.
+    /// `Reports` conserva esos 13,9 y devuelve la precisión por 2,1 GB de
+    /// más: 5,32 GB de flota frente a 3,20, y 11× por debajo de los 58 GB
+    /// que ocupa hoy el crudo sin agregar.
+    ///
+    /// `Config::minimal()` sigue disponible para quien solo necesite
+    /// totales, errores, bytes y percentiles de latencia — que son exactos y
+    /// no dependen de `K`.
     fn default() -> Self {
-        Profile::Minimal.config()
+        Profile::Reports.config()
     }
 }
 
