@@ -54,7 +54,9 @@ impl Lcg {
 #[test]
 fn a_single_observation_lands_in_all_three_resolutions() {
     let db = db();
-    let mut r = Rollup::new(Config::default());
+    // Las TRES: el perfil por defecto apaga el minuto, así que este caso pide
+    // explícitamente el de tiempo real.
+    let mut r = Rollup::new(Config::realtime());
     let mut tx = db.begin_write().unwrap();
     r.observe(&mut tx, &obs(T0 + 7, b"/a", 200, 12)).unwrap();
     r.flush(&mut tx).unwrap();
@@ -70,10 +72,63 @@ fn a_single_observation_lands_in_all_three_resolutions() {
     }
 }
 
+/// El perfil por defecto (`Profile::Minimal`) **no escribe ni una fila de
+/// resolución de minuto**. Es la mitad del ahorro de disco y lo que le cuesta
+/// al panel su zoom en tiempo real, así que se comprueba en vez de suponerse.
+#[test]
+fn the_default_profile_writes_no_minute_resolution_at_all() {
+    let db = db();
+    let cfg = Config::default();
+    assert_eq!(cfg, Config::minimal());
+    assert_eq!(cfg.top_k, 4);
+    assert!(!cfg.keeps(Resolution::Minute));
+    assert_eq!(cfg.active().collect::<Vec<_>>(), vec![Resolution::Hour, Resolution::Day]);
+
+    let mut r = Rollup::new(cfg);
+    let mut tx = db.begin_write().unwrap();
+    for i in 0..300u32 {
+        r.observe(&mut tx, &obs(T0 + i as u64, b"/a", 200, 12)).unwrap();
+    }
+    r.flush(&mut tx).unwrap();
+    tx.commit().unwrap();
+
+    let rd = db.begin_read();
+    assert!(
+        read_range(&rd, Resolution::Minute, 0, u32::MAX, 10_000).unwrap().is_empty(),
+        "el perfil por defecto escribió filas de minuto"
+    );
+    for res in [Resolution::Hour, Resolution::Day] {
+        let tsb = res.bucket_of(T0).unwrap();
+        assert_eq!(read_total(&rd, res, tsb).unwrap().unwrap().requests, 300, "{res:?}");
+    }
+    // Y con K = 4 la celda horaria son 21 filas como mucho: 1 total + cuatro
+    // dimensiones de K entradas y un cajón.
+    let tsb = Resolution::Hour.bucket_of(T0).unwrap();
+    let rows = read_range(&rd, Resolution::Hour, tsb, tsb + 1, 10_000).unwrap();
+    assert!(rows.len() <= 1 + 4 * (4 + 1), "{} filas en una celda horaria", rows.len());
+}
+
+/// Los tres perfiles son la escalera que documenta el módulo: `Reports` solo
+/// cambia `K` respecto al de por defecto, y `Realtime` es el único que añade
+/// la resolución de minuto y las retenciones largas de la sección 12.3.
+#[test]
+fn the_three_profiles_are_the_ladder_the_docs_describe() {
+    let (m, r, rt) = (Config::minimal(), Config::reports(), Config::realtime());
+    assert_eq!((m.top_k, m.minute), (4, false));
+    assert_eq!((r.top_k, r.minute), (32, false));
+    assert_eq!((rt.top_k, rt.minute), (32, true));
+    assert_eq!(m.retention_secs, r.retention_secs, "`Reports` solo cambia K");
+    assert_eq!(r.retention(Resolution::Hour), 7 * 86_400);
+    assert_eq!(rt.retention(Resolution::Hour), 30 * 86_400);
+    assert_eq!(rt.retention(Resolution::Day), 730 * 86_400);
+    assert_eq!(Config::default(), m);
+    assert_eq!(Profile::default(), Profile::Minimal);
+}
+
 #[test]
 fn the_minute_resolution_keeps_only_totals_and_status() {
     let db = db();
-    let mut r = Rollup::new(Config::default());
+    let mut r = Rollup::new(Config::realtime());
     let mut tx = db.begin_write().unwrap();
     r.observe(&mut tx, &obs(T0, b"/a", 200, 5)).unwrap();
     r.flush(&mut tx).unwrap();
@@ -336,7 +391,9 @@ fn open_cells_never_pass_the_configured_cap() {
 #[test]
 fn pruning_removes_the_old_cells_and_leaves_the_rest_untouched() {
     let db = db();
-    let mut r = Rollup::new(Config::default());
+    // Con el perfil de tiempo real, para que la poda de la hora tenga celdas
+    // de minuto vecinas que NO deba llevarse por delante.
+    let mut r = Rollup::new(Config::realtime());
     let mut tx = db.begin_write().unwrap();
     for h in 0..40u64 {
         r.observe(&mut tx, &obs(T0 + h * 3600, b"/a", 200, 4)).unwrap();
@@ -366,12 +423,24 @@ fn pruning_removes_the_old_cells_and_leaves_the_rest_untouched() {
 #[test]
 fn the_cutoff_helper_matches_the_documented_retentions() {
     let now = T0 + 1_000_000;
-    assert_eq!(Resolution::Minute.default_retention_secs(), 48 * 3600);
-    assert_eq!(Resolution::Hour.default_retention_secs(), 30 * 86_400);
-    assert_eq!(Resolution::Day.default_retention_secs(), 730 * 86_400);
-    for res in RESOLUTIONS {
-        let cut = res.cutoff_bucket(now, res.default_retention_secs()).unwrap();
-        assert_eq!(cut, res.bucket_of(now - res.default_retention_secs()).unwrap());
+    // La retención es del PERFIL, no de la resolución: 7 días de hora en el
+    // de por defecto, 30 en el de tiempo real. Preguntárselo a un `Resolution`
+    // suelto —lo que hacía `default_retention_secs`— daría la del perfil
+    // equivocado sin decirlo.
+    let min = Config::minimal();
+    assert_eq!(min.retention(Resolution::Hour), 7 * 86_400);
+    assert_eq!(min.retention(Resolution::Day), 90 * 86_400);
+    let rt = Config::realtime();
+    assert_eq!(rt.retention(Resolution::Minute), 48 * 3600);
+    assert_eq!(rt.retention(Resolution::Hour), 30 * 86_400);
+    assert_eq!(rt.retention(Resolution::Day), 730 * 86_400);
+
+    for cfg in [min, rt] {
+        for res in RESOLUTIONS {
+            let cut = cfg.cutoff_bucket(res, now).unwrap();
+            assert_eq!(cut, res.bucket_of(now - cfg.retention(res)).unwrap());
+            assert_eq!(cut, res.cutoff_bucket(now, cfg.retention(res)).unwrap());
+        }
     }
     // Una retención mayor que la edad del universo unix no da la vuelta.
     assert_eq!(Resolution::Day.cutoff_bucket(10, u64::MAX).unwrap(), 0);
@@ -409,8 +478,10 @@ fn a_foreign_row_planted_in_the_aggregate_namespace_is_reported_not_swallowed() 
     assert!(e.is_err(), "una fila ajena se coló como agregado");
     assert!(read_total(&rd, Resolution::Minute, 6).is_err(), "un valor ajeno se decodificó");
 
-    // Y observar sobre esa misma celda tampoco puede entrar en pánico.
-    let mut r = Rollup::new(Config::default());
+    // Y observar sobre esa misma celda tampoco puede entrar en pánico. Con el
+    // perfil de tiempo real, que es el que abre —y por tanto carga de disco—
+    // la celda de minuto donde está plantada la fila ajena.
+    let mut r = Rollup::new(Config::realtime());
     let mut tx = db.begin_write().unwrap();
     let res = r.observe(&mut tx, &obs(T0, b"/a", 200, 4));
     assert!(res.is_ok() || res.is_err());
@@ -501,24 +572,37 @@ fn the_engine_refuses_an_index_over_the_aggregate_namespace_before_it_can_diverg
 
 #[test]
 fn ram_stays_bounded_across_a_long_run_with_exploding_cardinality() {
-    let db = db();
-    let mut r = Rollup::new(Config { top_k: 32, ..Config::default() });
-    let mut peak = 0usize;
-    for batch in 0..20u32 {
-        let mut tx = db.begin_write().unwrap();
-        for i in 0..500u32 {
-            let ep = format!("/users/{}/orders", batch * 500 + i);
-            let user = format!("u{}", batch * 500 + i);
-            let mut o = obs(T0 + (batch * 500 + i) as u64, ep.as_bytes(), 200, 5);
-            o.user = user.as_bytes();
-            r.observe(&mut tx, &o).unwrap();
+    // Los DOS perfiles, porque `K` es el factor dominante de esta cifra: la
+    // RAM del agregador es K entradas por (resolución, celda, dimensión) y
+    // cada entrada carga un histograma de 128 bytes.
+    fn peak_ram(cfg: Config) -> usize {
+        let db = db();
+        let mut r = Rollup::new(cfg);
+        let mut peak = 0usize;
+        for batch in 0..20u32 {
+            let mut tx = db.begin_write().unwrap();
+            for i in 0..500u32 {
+                let ep = format!("/users/{}/orders", batch * 500 + i);
+                let user = format!("u{}", batch * 500 + i);
+                let mut o = obs(T0 + (batch * 500 + i) as u64, ep.as_bytes(), 200, 5);
+                o.user = user.as_bytes();
+                r.observe(&mut tx, &o).unwrap();
+            }
+            r.flush(&mut tx).unwrap();
+            tx.commit().unwrap();
+            peak = peak.max(r.ram_bytes());
         }
-        r.flush(&mut tx).unwrap();
-        tx.commit().unwrap();
-        peak = peak.max(r.ram_bytes());
+        peak
     }
-    std::println!("rollup: pico de RAM {peak} bytes con 10.000 valores distintos por dimensión");
-    assert!(peak < 512 * 1024, "la RAM del agregador subió a {peak} bytes");
+    let minimal = peak_ram(Config::default());
+    let realtime = peak_ram(Config::realtime());
+    std::println!(
+        "rollup, 10.000 valores distintos por dimensión: pico de RAM {minimal} B con el perfil \
+         por defecto (K=4, sin minuto) y {realtime} B con el de tiempo real (K=32, tres \
+         resoluciones)"
+    );
+    assert!(minimal < realtime, "K = 4 tendría que gastar menos RAM que K = 32");
+    assert!(realtime < 512 * 1024, "la RAM del agregador subió a {realtime} bytes");
 }
 
 /// El desalojo de un valor que YA tiene fila en disco tiene que borrar esa

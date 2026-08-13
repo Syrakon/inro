@@ -487,6 +487,97 @@ mod tests {
         assert_eq!(t.entries().len(), 1);
     }
 
+    /// Generador congruencial lineal propio; `rand` sería una dependencia.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 11
+        }
+    }
+
+    /// Reparto zipf-iano por rangos con pesos ENTEROS `1.000.000 / r`: el de
+    /// las rutas de una API real, y el que de verdad decide cuánto acierta un
+    /// top-K. Un reparto uniforme haría la pregunta fácil y no es el caso que
+    /// importa. Sin coma flotante, para que la prueba corra también bajo
+    /// `no_std`.
+    struct Zipf {
+        cum: Vec<u64>,
+    }
+
+    impl Zipf {
+        fn new(n: u32) -> Self {
+            let mut cum = Vec::with_capacity(n as usize);
+            let mut acc = 0u64;
+            for r in 1..=n as u64 {
+                acc += 1_000_000 / r;
+                cum.push(acc);
+            }
+            Zipf { cum }
+        }
+        fn total(&self) -> u64 {
+            *self.cum.last().unwrap()
+        }
+        fn pick(&self, x: u64) -> usize {
+            let t = x % self.total();
+            match self.cum.binary_search(&t) {
+                Ok(i) => i + 1,
+                Err(i) => i,
+            }
+        }
+    }
+
+    /// **Las tres garantías del módulo con el `K = 4` del perfil por defecto**,
+    /// sobre el reparto que se encuentra de verdad. Con `K = 32` la cota `N/K`
+    /// era ocho veces más apretada; que la cota se afloje no puede convertir
+    /// ninguna de las tres en falsa, y eso es justo lo que aquí se comprueba.
+    #[test]
+    fn at_the_default_k_of_four_a_zipfish_dimension_keeps_every_guarantee() {
+        const N: u64 = 20_000;
+        let z = Zipf::new(200);
+        let mut rng = Lcg(0x5eed);
+        let mut t = TopK::new(4);
+        let mut truth: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        for i in 0..N {
+            let v = format!("/api/v1/{}", z.pick(rng.next()));
+            *truth.entry(v.as_bytes().to_vec()).or_insert(0) += 1;
+            t.record(v.as_bytes(), (i % 400) as u32, 7, 11, i % 50 == 0).unwrap();
+        }
+
+        // 1. Conservación exacta, campo a campo.
+        let sum = |f: fn(&Entry) -> u64| t.entries().iter().map(f).sum::<u64>();
+        assert_eq!(sum(|e| e.bucket.requests) + t.drawer.requests, N);
+        assert_eq!(sum(|e| e.bucket.errors) + t.drawer.errors, N / 50);
+        assert_eq!(sum(|e| e.bucket.bytes_in) + t.drawer.bytes_in, N * 7);
+        assert_eq!(sum(|e| e.bucket.hist.total()) + t.drawer.hist.total(), N);
+
+        // 2. Nunca se exagera.
+        for e in t.entries() {
+            let real = truth.get(&e.value).copied().unwrap_or(0);
+            assert!(
+                e.bucket.requests <= real,
+                "informado {} por encima del verdadero {real}",
+                e.bucket.requests
+            );
+        }
+
+        // 3. Ningún pesado por encima de N/K se pierde, con la cota ocho veces
+        //    más floja.
+        assert_eq!(t.understatement_bound(), N / 4);
+        for (v, real) in &truth {
+            if *real > N / 4 {
+                assert!(
+                    t.entries().iter().any(|e| e.value == *v),
+                    "un valor con {real} de {N} peticiones no está en la tabla"
+                );
+            }
+        }
+        assert!(t.debt_within_bound());
+    }
+
     #[test]
     fn the_understatement_bound_is_zero_until_the_table_fills() {
         let mut t = TopK::new(4);

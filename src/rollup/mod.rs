@@ -63,18 +63,60 @@
 //! podría quedarse sin aplicar mientras su contenido ya está en el cajón, y
 //! esa fila se contaría dos veces al leer.
 //!
+//! # Perfiles: la palanca de disco, y por qué el de por defecto es el mínimo
+//!
+//! El coste en disco de esta capa **no depende del tráfico**: depende del
+//! número de celdas × filas por celda, que es casi el mismo para un nodo
+//! diminuto y para uno enorme. Con el perfil literal de la sección 12.3 (`K =
+//! 32`, minuto retenido 48 h, hora 30 d, día 2 años) un nodo *micro* gasta
+//! **6.056 KB de agregados para resumir 445 KB de crudo**: la agregación le
+//! cuesta disco en vez de ahorrárselo. Medido, no supuesto
+//! (`tests/rollup_size.rs`).
+//!
+//! Por eso el perfil por defecto es `Profile::Minimal` y no el de la
+//! especificación:
+//!
+//! | | `Minimal` (por defecto) | `Reports` | `Realtime` (§12.3) |
+//! |---|---|---|---|
+//! | `top_k` | **4** | 32 | 32 |
+//! | Minuto | **apagada** | apagada | activa, 48 h |
+//! | Hora | **7 días** | 7 días | 30 días |
+//! | Día | **90 días** | 90 días | 2 años |
+//! | Filas por celda horaria (medidas) | **21** | 112 | 112 |
+//! | Disco de un micro | **268 KB** | 1.052 KB | 6.056 KB |
+//! | Flota de 2.700 | **3,20 GB** | 5,32 GB | 19,28 GB |
+//! | Top-4 por endpoint acertado | **0,5%** | 97,5-100% | 97,5-100% |
+//! | Zoom en tiempo real | no | no | **sí** |
+//!
+//! ```ignore
+//! let mut rollup = Rollup::new(Config::default());   // Minimal
+//! let mut panel  = Rollup::new(Config::realtime());  // §12.3, con minuto
+//! ```
+//!
+//! **Lo que `Minimal` cuesta, medido y no supuesto:** sin resolución de minuto
+//! **no hay zoom en tiempo real** (la celda más fina pasa a ser la hora); y con
+//! `K = 4` la cota de Space-Saving —solo sobrevive lo que pasa de `N/K`, aquí
+//! el 25% del tráfico de la celda— deja **el 97-100% del tráfico por endpoint
+//! en el cajón `otros`** y acierta el top-4 en el 0,5% de las celdas. Los
+//! totales siguen siendo exactos y ninguna cuenta se exagera: lo que se pierde
+//! es poder decir DE QUIÉN es el tráfico, no cuánto hubo.
+//!
+//! Quien necesite el informe por dimensión pide `Config::reports()`; quien
+//! necesite además el minuto, `Config::realtime()`. Ninguno se ha borrado.
+//!
 //! # Retenciones
 //!
-//! | Resolución | Dimensiones | Retención por defecto |
-//! |---|---|---|
-//! | Minuto | totales y códigos de estado | 48 horas |
-//! | Hora | todas | 30 días |
-//! | Día | todas | dos años |
+//! Las retenciones son **del perfil**, no de la resolución: 30 días de hora
+//! son de `Realtime` y 7 de `Minimal`, así que preguntárselas a un
+//! `Resolution` suelto —como hacía una versión anterior de esta capa con
+//! `Resolution::default_retention_secs`— devolvería la retención de un perfil
+//! que quizá no es el que escribió los datos. Se piden a la configuración:
+//! `Config::retention` y `Config::cutoff_bucket`.
 //!
-//! **La política de cuándo podar es del llamante**, no de esta capa: aquí
-//! están `Resolution::default_retention_secs`, `Resolution::cutoff_bucket` y
-//! `prune_before`, que es todo lo que una poda necesita. No hay ningún
-//! planificador, y no lo habrá desde aquí.
+//! **La política de cuándo podar sigue siendo del llamante**, no de esta capa:
+//! aquí están la aritmética (`Config::cutoff_bucket`,
+//! `Resolution::cutoff_bucket`) y `prune_before`, que es todo lo que una poda
+//! necesita. No hay ningún planificador, y no lo habrá desde aquí.
 
 pub mod bucket;
 pub mod hist;
@@ -136,7 +178,7 @@ pub enum Resolution {
 pub const RESOLUTIONS: [Resolution; 3] = [Resolution::Minute, Resolution::Hour, Resolution::Day];
 
 impl Resolution {
-    pub fn code(self) -> u8 {
+    pub const fn code(self) -> u8 {
         self as u8
     }
 
@@ -155,16 +197,6 @@ impl Resolution {
             Resolution::Minute => 60,
             Resolution::Hour => 3_600,
             Resolution::Day => 86_400,
-        }
-    }
-
-    /// Retención por defecto de la sección 12.3. **Un valor por defecto, no
-    /// una política**: quien poda decide.
-    pub fn default_retention_secs(self) -> u64 {
-        match self {
-            Resolution::Minute => 48 * 3_600,
-            Resolution::Hour => 30 * 86_400,
-            Resolution::Day => 730 * 86_400,
         }
     }
 
@@ -189,7 +221,9 @@ impl Resolution {
     /// El minuto solo guarda totales y códigos de estado (sección 12.3): es
     /// la resolución que alimenta el zoom en tiempo real del panel, y las
     /// dimensiones de alta cardinalidad multiplicarían por cuatro un número
-    /// de celdas que ya es sesenta veces el horario.
+    /// de celdas que ya es sesenta veces el horario. **Está apagada en el
+    /// perfil por defecto** (`Profile::Minimal`); la enciende
+    /// `Config::realtime()`.
     pub fn dimensions(self) -> &'static [Dimension] {
         match self {
             Resolution::Minute => &[Dimension::Status],
@@ -248,7 +282,110 @@ pub struct Observation<'a> {
     pub user: &'a [u8],
 }
 
-/// Ajustes de la capa.
+/// Perfil de retención y cardinalidad: **la palanca de disco de esta capa**, y
+/// la única decisión que le cambia el orden de magnitud.
+///
+/// Se elige en el sitio donde se construye el `Rollup`, para que la elección
+/// se lea:
+///
+/// ```ignore
+/// let mut rollup = Rollup::new(Config::default());   // Profile::Minimal
+/// let mut panel  = Rollup::new(Config::realtime());  // Profile::Realtime
+/// ```
+///
+/// Un perfil no es más que un `Config` de partida: cualquiera de sus campos se
+/// puede seguir tocando con `Config { top_k: 8, ..Config::realtime() }`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum Profile {
+    /// **El de por defecto.** `K = 4`, **sin resolución de minuto**, 7 días de
+    /// hora y 90 días de día.
+    ///
+    /// Existe porque el coste de esta capa no lo pone el tráfico sino el
+    /// número de celdas × filas por celda: con el perfil de la especificación,
+    /// un nodo micro gasta 6.056 KB de agregados para resumir 445 KB de crudo.
+    /// Con este, 268 KB (medido, `tests/rollup_size.rs`), y la flota de 2.700
+    /// baja de 19,28 GB a 3,20 GB.
+    ///
+    /// **Lo que se paga, y no es barato**: no hay resolución de minuto, así
+    /// que no hay zoom en tiempo real; y con `K = 4` **el informe por
+    /// dimensión deja de servir en las dimensiones de cardinalidad media**.
+    /// Medido sobre un reparto zipf de 200 endpoints
+    /// (`top_k_accuracy_at_the_default_k_of_four`): el top-4 informado es el
+    /// verdadero en el **0,5% de las celdas horarias**, el más pesado se
+    /// acierta el **61%** de las veces y el **97-100% del tráfico acaba en el
+    /// cajón `otros`**. El motivo es la cota del propio algoritmo: solo
+    /// sobrevive a los desalojos lo que pasa de `N/K`, y con `K = 4` eso es el
+    /// 25% del tráfico de la celda, que ningún endpoint alcanza. Lo que sigue
+    /// siendo cierto es lo que nunca depende de `K`: los totales se conservan
+    /// exactos y ninguna cuenta se exagera.
+    ///
+    /// Si el informe por endpoint o por usuario importa, `Profile::Reports`
+    /// cuesta 784 KB más por nodo micro y lo arregla.
+    #[default]
+    Minimal,
+    /// Las retenciones de `Minimal` —sin minuto, 7 días de hora, 90 de día—
+    /// **pero con `K = 32`**.
+    ///
+    /// Es el punto medio medido: se queda con casi todo el ahorro de disco (la
+    /// flota de 2.700 pasa de 19,28 GB a **5,32 GB**, frente a los 3,20 GB de
+    /// `Minimal`) y recupera entera la precisión del top-K — top-4 correcto en
+    /// el 97,5-100% de las celdas y cuentas exactas en el 92-97% de las
+    /// entradas, contra el 0,5% y el 0-18% de `Minimal`.
+    ///
+    /// **El ahorro de disco no lo trae `K`, lo traen la retención y el
+    /// minuto**: de los 16,1 GB de flota que se ahorran frente a §12.3, 13,9
+    /// son de apagar el minuto y acortar la retención y solo 2,1 de bajar `K`
+    /// de 32 a 4.
+    Reports,
+    /// El de la sección 12.3 al pie de la letra: `K = 32`, las tres
+    /// resoluciones, 48 h de minuto, 30 d de hora, 2 años de día.
+    ///
+    /// **Es el único que alimenta el zoom en tiempo real del panel**, porque
+    /// es el único con resolución de minuto. Cuesta 6.056 KB en un micro y
+    /// 19,28 GB de flota; en un nodo grande la diferencia es mucho menor
+    /// (21.748 KB frente a 14.160 KB), porque ahí el crudo domina.
+    Realtime,
+}
+
+impl Profile {
+    /// Retención por defecto de una resolución **en este perfil**, en
+    /// segundos.
+    ///
+    /// La del minuto en `Minimal` es la de la especificación (48 h) y solo
+    /// entra en juego si el llamante vuelve a encender esa resolución sobre
+    /// este perfil.
+    pub const fn retention_secs(self, res: Resolution) -> u64 {
+        match (self, res) {
+            (Profile::Minimal | Profile::Reports, Resolution::Minute) => 48 * 3_600,
+            (Profile::Minimal | Profile::Reports, Resolution::Hour) => 7 * 86_400,
+            (Profile::Minimal | Profile::Reports, Resolution::Day) => 90 * 86_400,
+            (Profile::Realtime, Resolution::Minute) => 48 * 3_600,
+            (Profile::Realtime, Resolution::Hour) => 30 * 86_400,
+            (Profile::Realtime, Resolution::Day) => 730 * 86_400,
+        }
+    }
+
+    /// El `Config` de partida de este perfil.
+    pub const fn config(self) -> Config {
+        Config {
+            top_k: match self {
+                Profile::Minimal => 4,
+                Profile::Reports | Profile::Realtime => 32,
+            },
+            minute: matches!(self, Profile::Realtime),
+            hour: true,
+            day: true,
+            max_open_cells: 2,
+            retention_secs: [
+                self.retention_secs(Resolution::Minute),
+                self.retention_secs(Resolution::Hour),
+                self.retention_secs(Resolution::Day),
+            ],
+        }
+    }
+}
+
+/// Ajustes de la capa. `Config::default()` es `Profile::Minimal`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Config {
     /// Entradas por dimensión y celda. Es a la vez el tope de RAM y el de
@@ -264,21 +401,62 @@ pub struct Config {
     /// una más, la más antigua se escribe en la transacción en curso y se
     /// suelta.
     pub max_open_cells: u16,
+    /// Retención por defecto de cada resolución en segundos, indexada por
+    /// `Resolution::code()`. **Un valor por defecto, no una política**: quien
+    /// poda decide. Se lee con `Config::retention`.
+    pub retention_secs: [u64; 3],
 }
 
 impl Default for Config {
+    /// `Profile::Minimal`. Ver el comentario del módulo para el porqué.
     fn default() -> Self {
-        Config { top_k: 32, minute: true, hour: true, day: true, max_open_cells: 2 }
+        Profile::Minimal.config()
     }
 }
 
 impl Config {
-    fn keeps(&self, res: Resolution) -> bool {
+    /// El perfil por defecto: `K = 4`, sin minuto, 7 d de hora, 90 d de día.
+    pub const fn minimal() -> Config {
+        Profile::Minimal.config()
+    }
+
+    /// Las retenciones del perfil por defecto con `K = 32`: casi todo el
+    /// ahorro de disco y la precisión del top-K intacta. Ver `Profile::Reports`.
+    pub const fn reports() -> Config {
+        Profile::Reports.config()
+    }
+
+    /// El perfil de la sección 12.3, con resolución de minuto y `K = 32`. Es
+    /// el que hace falta para el zoom en tiempo real del panel.
+    pub const fn realtime() -> Config {
+        Profile::Realtime.config()
+    }
+
+    /// Retención por defecto de una resolución, en segundos.
+    pub const fn retention(&self, res: Resolution) -> u64 {
+        self.retention_secs[res.code() as usize]
+    }
+
+    /// Primera celda de `res` que sobrevive a su retención vista desde
+    /// `now_secs`. Es el argumento de `prune_before`, y pedirlo aquí en vez de
+    /// a la resolución suelta es lo que garantiza que la retención sea la del
+    /// perfil que escribió los datos.
+    pub fn cutoff_bucket(&self, res: Resolution, now_secs: u64) -> Option<u32> {
+        res.cutoff_bucket(now_secs, self.retention(res))
+    }
+
+    /// Si esta resolución se mantiene.
+    pub const fn keeps(&self, res: Resolution) -> bool {
         match res {
             Resolution::Minute => self.minute,
             Resolution::Hour => self.hour,
             Resolution::Day => self.day,
         }
+    }
+
+    /// Resoluciones activas, en orden.
+    pub fn active(&self) -> impl Iterator<Item = Resolution> + '_ {
+        RESOLUTIONS.into_iter().filter(|r| self.keeps(*r))
     }
 }
 
@@ -419,8 +597,10 @@ mod engine {
 
     /// Tope de filas que se leen al cargar una celda de disco.
     ///
-    /// Esta capa escribe como mucho `4·(k+1) + 1` filas por celda, así que con
-    /// `k = 32` son 133 y este tope da dos órdenes de holgura. Existe porque
+    /// Esta capa escribe como mucho `4·(k+1) + 1` filas por celda: 21 con el
+    /// `k = 4` del perfil por defecto y 133 con el `k = 32` de
+    /// `Profile::Realtime`, así que este tope da dos órdenes de holgura sobre
+    /// el más caro de los dos. Existe porque
     /// **`0x02` es un espacio de datos de usuario** (ver `AGG_NS`): cualquiera
     /// puede plantar ahí un millón de filas con `put`, y sin tope la carga de
     /// una celda las leería todas. Pasado el tope se devuelve `Err` en vez de
@@ -566,7 +746,8 @@ mod engine {
         ///
         /// Llamar justo antes del `commit` del lote. Solo escribe lo que ha
         /// cambiado desde el volcado anterior: sin ese filtro, un lote que
-        /// toca 40 endpoints reescribiría las 133 filas de la celda.
+        /// toca 40 endpoints reescribiría la celda entera (21 filas con el
+        /// perfil por defecto, 133 con `Profile::Realtime`).
         pub fn flush(&mut self, tx: &mut WriteTxn<'_>) -> Result<FlushStats> {
             let mut stats = FlushStats::default();
             for res in RESOLUTIONS {
