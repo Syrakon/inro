@@ -81,16 +81,31 @@ por delante. Hay un único árbol para todo.
 `Error::ReservedNamespace`. El motor escribe ahí por dentro con
 `put_raw`/`delete_raw`, que no pasan por esa comprobación.
 
-**El ORDEN de los espacios es el orden del árbol**, y eso tiene una
-consecuencia que cuesta disco si se ignora: `SplitBias::Append` —la partición
-sesgada al anexar que baja el crudo de un log de 67,72 a 34,14 bytes por
-entrada— solo se dispara cuando la clave que entra es la mayor de TODO el
-árbol. Si hay datos en un espacio POR ENCIMA del que recibe las inserciones
-ascendentes, el sesgo no salta nunca y el llenado de hoja vuelve al ~50%.
-Medido: una sola fila en `0x02` sube el crudo de `0x01` de 39,94 a 84,99
-bytes por entrada, un +112,8% (`tests/rollup_size.rs`). Quien mezcle un log
-creciente con otra cosa en el mismo fichero debe poner el log en el espacio
-más alto de los que use — ver `agregacion.md` §3.
+**El ORDEN de los espacios es el orden del árbol.** Eso costó disco durante
+un tiempo y ya no cuesta, pero conviene saber por qué, porque el mecanismo
+sigue ahí: `SplitBias::Append` —la partición sesgada al anexar que baja el
+crudo de un log de 67,72 a 34,14 bytes por entrada— exigía en su primera
+versión que la clave que entra fuera la mayor de TODO el árbol. Con esa
+condición, **una sola fila en un espacio superior** (una fila de agregado en
+`0x02`, una entrada de índice secundario en `0x80|id`) dejaba a todos los
+espacios inferiores sin volver a dispararlo nunca, y el llenado de hoja caía
+al ~50%. Medido sobre 200.000 registros con páginas de 4 KB: **34,98 →
+80,26 bytes por entrada, 2,29x, por una fila**.
+
+Hoy el sesgo razona **por región y no por árbol**: `WriteTxn::put_raw` le
+pasa a `tree::put` la cota `[ns + 1]` —un solo byte, que por construcción de
+`scoped` separa un espacio del siguiente— y el sesgo se dispara cuando la
+clave que entra es la mayor **por debajo de esa cota**, esté donde esté el
+resto del árbol. Cada espacio consigue su propio anexado denso, a la vez, sin
+que el llamante tenga que ordenarlos. Medido con la misma carga: 35,16
+B/entrada con una fila en `0x02`, 35,25 con la capa de agregación corriendo
+de verdad, contra 34,98 del crudo solo — la diferencia es una hoja por
+frontera entre espacios. `tree.rs` sigue sin saber nada de espacios de
+claves: solo recibe una cota superior exclusiva sobre claves opacas.
+
+Ya **no** hace falta poner el log en el espacio más alto de los que se usen
+(lo que recomendaba `rollup::RAW_NS_RECOMMENDED`): con el crudo en `0x01` y
+los agregados en `0x02` el coste es el mismo que con el crudo arriba.
 
 ---
 

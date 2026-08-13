@@ -524,31 +524,84 @@ enum Insertion {
 /// (34,17 de 68,81 bytes por entrada). LMDB y SQLite tratan este caso aparte
 /// por el mismo motivo.
 ///
-/// El sesgo solo se pide cuando la entrada nueva es la MAYOR DEL ÁRBOL
-/// ENTERO: la página está en el camino más a la derecha desde la raíz (todos
-/// los descensos tomaron el hijo `extra`) Y el punto de inserción es la
-/// última posición de esa página. Con esas dos condiciones, todo lo que ya
-/// estaba se queda en la izquierda y la derecha nace con la entrada nueva
-/// sola, que es exactamente la que sí va a seguir creciendo. Es deliberado
-/// que NO baste con "se inserta al final de esta hoja": en inserción
-/// aleatoria eso ocurre en una hoja de cada `n` por puro azar, y sesgar ahí
-/// llenaría la izquierda al 100% para que se parta otra vez a la siguiente
-/// inserción — más divisiones, no menos hueco. La condición de camino
-/// derecho la hace inalcanzable salvo para un anexado real
-/// (`bytes_per_entry_reacts_to_shuffled_insertion_order` existe justo para
-/// vigilar esa diferencia).
+/// # La cota de anexado, y por qué "la mayor del árbol" no servía
+///
+/// El sesgo se pide cuando la entrada nueva es la mayor **de su región de
+/// anexado**: la región es `(-∞, upper)` para la cota `upper` que el
+/// llamante pasa a `put`, y `upper = None` significa "todo el árbol". Es la
+/// condición que `insert_rec` calcula durante el descenso, sin ninguna
+/// lectura extra (ver `rightmost` ahí).
+///
+/// La primera versión de este sesgo exigía que la clave fuera la mayor del
+/// **ÁRBOL ENTERO**, y eso resultó ser una condición frágil hasta el punto
+/// de anularse sola. `tx.rs` antepone a cada clave el byte del espacio
+/// (`scoped`), así que **el orden de los espacios ES el orden del árbol**:
+/// una sola fila en un espacio superior —una fila de agregado en `0x02`, una
+/// entrada de índice secundario en `0x80 | id`, cualquier cosa— deja para
+/// siempre a todas las claves de los espacios inferiores sin poder volver a
+/// ser la mayor del árbol. Medido, 200.000 registros con forma de log y
+/// páginas de 4 KB: **34,98 B/entrada con el crudo solo en `0x01`, 80,26
+/// B/entrada en cuanto existe UNA fila en `0x02`** — 2,29x, y ninguna prueba
+/// de un solo espacio podía verlo.
+///
+/// # Por qué la condición LOCAL tampoco sirve, medida
+///
+/// El candidato evidente —"basta con que la clave entre al final de ESTA
+/// hoja", sin mirar el camino desde la raíz— **no arregla nada, y está
+/// medido**: quitarle a la condición la parte de camino derecho deja los
+/// mismos 80,26 B/entrada, byte a byte. El motivo es estructural, no de
+/// grado: la fila de `0x02` es la mayor del árbol, así que vive en la MISMA
+/// hoja que la frontera de `0x01` y siempre queda DETRÁS de la clave nueva.
+/// El punto de inserción es `n_slots - 1`, nunca `n_slots`, así que la
+/// condición local no llega a dispararse ni una vez. Lo que hace falta no es
+/// relajar la condición sino **acotarla**: no "la mayor del árbol" sino "la
+/// mayor por debajo de `upper`".
+///
+/// # El punto de corte
+///
+/// `Append` lleva el corte consigo porque ya no es siempre el mismo. La
+/// regla es una sola: **todo lo que hay por debajo de la clave nueva, más la
+/// clave nueva, se queda en la izquierda; lo que hay por encima (que por la
+/// condición de arriba está todo fuera de la región, `>= upper`) se va a la
+/// derecha** — es decir, `cut = i + 1` para un punto de inserción `i`.
+///
+/// El anexado puro es el caso límite de esa misma regla: si no hay nada por
+/// encima (`i == n_slots`), la derecha se quedaría vacía, que no es una
+/// división, así que el corte baja a `n_slots` — la izquierda entera y la
+/// derecha con la clave nueva sola, exactamente lo que hacía la versión
+/// anterior. De ahí el `min` en `insert_rec`. Los dos casos son la misma
+/// idea: dejar congelado al 100% lo que ya no va a crecer y dar página propia
+/// a la frontera, que sí.
+///
+/// Cortar por `i` en vez de por `i + 1` también funciona, pero peor y para
+/// siempre en vez de una sola vez: deja la fila de `0x02` viajando pegada a
+/// la frontera, de modo que CADA hoja se congela a `capacidad - m` entradas
+/// (con `m` = cuántas claves de espacios superiores comparten hoja con la
+/// frontera). Con `cut = i + 1` se paga UNA página a `m` entradas —el bloque
+/// superior se desgaja de una vez— y a partir de ahí toda la región vuelve
+/// al caso de anexado puro con llenado del 100%.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SplitBias {
     /// Punto medio por cuenta de entradas: reparte a partes iguales, deja
     /// sitio a los dos lados. Es lo correcto cuando no se sabe por dónde va
     /// a crecer la página, y es lo que usan todos los caminos salvo el
-    /// anexado (borrado, poda, y cualquier inserción que no sea la mayor
-    /// clave del árbol).
+    /// anexado (borrado, poda, y cualquier inserción que no sea la mayor de
+    /// su región).
     Middle,
-    /// La entrada nueva es la mayor del árbol y esta página es la última:
-    /// empezar por el corte que deja la izquierda entera y la derecha con
-    /// una sola entrada.
-    Append,
+    /// La entrada nueva es la mayor de su región de anexado. El `usize` es
+    /// el primer punto de corte a probar, ya calculado por `insert_rec`
+    /// (`(i + 1).min(n_slots)`, ver arriba); `emit` no puede deducirlo por
+    /// su cuenta porque no sabe cuál de las entradas que recibe es la nueva.
+    Append(usize),
+}
+
+/// ¿Cae `k` FUERA, por arriba, de la región de anexado que delimita `upper`?
+///
+/// `None` es "sin cota": la región es el árbol entero y nada queda por
+/// encima de ella, que es exactamente el comportamiento anterior a la cota
+/// (ver `SplitBias`). La comparación es `>=` porque `upper` es EXCLUSIVA.
+fn beyond(upper: Option<&[u8]>, k: &[u8]) -> bool {
+    upper.is_some_and(|u| k >= u)
 }
 
 /// `true` si `entries` (los que va a recibir una página de tipo `page_type`)
@@ -605,10 +658,16 @@ fn emit(
     // No cabe: partir en dos páginas. El primer candidato lo elige `bias`
     // (ver `SplitBias`): el punto medio por cuenta de entradas
     // (`entries.len() / 2`) cuando no se sabe por dónde va a crecer la
-    // página, y el último hueco (`entries.len() - 1`, izquierda entera y
-    // derecha con una sola entrada) cuando la entrada nueva es la mayor del
-    // árbol y esta es la última página — el caso dominante en cargas de log,
-    // donde el punto medio congela la mitad izquierda al 50% para siempre.
+    // página, y el corte que `insert_rec` ya calculó —justo detrás de la
+    // clave nueva— cuando esa clave es la mayor de su región de anexado, el
+    // caso dominante en cargas de log, donde el punto medio congela la mitad
+    // izquierda al 50% para siempre.
+    //
+    // `Append` nunca trae un corte fuera de rango: `insert_rec` lo acota a
+    // `n_slots`, que es `entries.len() - 1` para la hoja reconstruida que le
+    // pasa. Aunque lo trajera, no habría corrupción: `attempt` descarta
+    // cualquier corte inválido y el bucle de búsqueda de más abajo recorre
+    // los demás, la misma red que ya cubre un sesgo equivocado.
     //
     // Las dos elecciones colapsan al mismo valor, 0, con una sola entrada, y
     // ese caso se atiende igual abajo.
@@ -628,7 +687,7 @@ fn emit(
     // día.
     let mid = match bias {
         SplitBias::Middle => entries.len() / 2,
-        SplitBias::Append => entries.len().saturating_sub(1),
+        SplitBias::Append(cut) => cut,
     };
     if mid == 0 {
         let len = match entries[0].1 {
@@ -724,13 +783,14 @@ fn emit(
     // común, con mucha diferencia), termina aquí en dos llamadas a `build`,
     // igual que antes.
     //
-    // Con `SplitBias::Append` el primer candidato es `entries.len() - 1`, y
-    // en un nodo INTERNO ese candidato se descarta siempre por construcción
-    // (la mitad derecha se quedaría sin separador propio, ver `attempt`): el
-    // bucle de abajo baja entonces a `entries.len() - 2`, que deja la
-    // derecha con exactamente un separador y dos hijos. Es un descarte
-    // previsto, no un fallo — el mismo mecanismo que ya cubría el caso de la
-    // compresión perdida.
+    // `SplitBias::Append` solo lo piden las HOJAS (`insert_rec` pasa
+    // `Middle` en los siete demás sitios que llaman a `emit`, incluida la
+    // división de un nodo interno), así que el descarte que sí ocurriría en
+    // un interno —el corte `entries.len() - 1` deja la mitad derecha sin
+    // separador propio, ver `attempt`— no llega a plantearse. Si algún día
+    // se pidiera, el bucle de abajo bajaría a `entries.len() - 2`, que deja
+    // la derecha con exactamente un separador y dos hijos: un descarte
+    // previsto, no un fallo.
     //
     // Si NO basta — tarea 19, hallazgo de las pruebas basadas en
     // propiedades contra un oráculo `BTreeMap` — el punto medio por cuenta
@@ -813,13 +873,24 @@ fn emit(
 /// `depth` cuenta la página actual, igual que en `descend` (la raíz entra con
 /// `depth == 1`).
 ///
-/// `rightmost` dice si esta página está en el camino MÁS A LA DERECHA desde la
-/// raíz: la raíz entra con `true`, y cada descenso lo conserva solo si tomó el
-/// hijo `extra` (el mayor). Es la mitad de la condición de anexado que
-/// `SplitBias::Append` necesita — la otra mitad, "y además la clave nueva va
-/// al final de esta página", se comprueba abajo con el punto de inserción. Se
-/// calcula durante el descenso, que ya se estaba haciendo de todos modos, así
-/// que no cuesta ni una lectura de página.
+/// `rightmost` es el invariante de anexado, acotado por `upper`: **ninguna
+/// clave del árbol mayor que `key` y menor que `upper` vive fuera del subárbol
+/// de esta página**. La raíz entra con `true` (todo el árbol es su subárbol) y
+/// cada descenso lo conserva solo si lo que queda a la derecha del hijo
+/// elegido está ya fuera de la región — o bien porque no queda nada (se tomó
+/// el hijo `extra`), o bien porque el separador que lo delimita por abajo ya
+/// alcanza `upper`, y los separadores están ordenados, así que todo lo que
+/// haya más a la derecha también.
+///
+/// Con `upper = None` la región es el árbol entero y la condición se reduce
+/// EXACTAMENTE a la anterior, "camino más a la derecha desde la raíz": la
+/// única forma de conservar `rightmost` es tomar `extra` en cada nivel.
+///
+/// Es la mitad de la condición que `SplitBias::Append` necesita — la otra
+/// mitad, "y además no queda ninguna clave de la región detrás del punto de
+/// inserción en esta hoja", se comprueba abajo. Se calcula durante el
+/// descenso, que ya se estaba haciendo de todos modos, así que no cuesta ni
+/// una lectura de página ni una comparación que no fuera a hacerse.
 fn insert_rec(
     tx: &mut WriteTxn,
     page_no: PageNo,
@@ -827,6 +898,7 @@ fn insert_rec(
     value: &[u8],
     depth: u32,
     rightmost: bool,
+    upper: Option<&[u8]>,
 ) -> Result<Insertion> {
     if depth > MAX_DEPTH {
         return Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::TreeLoop });
@@ -852,13 +924,24 @@ fn insert_rec(
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page.n_slots() + 1);
             let mut payloads: Vec<LeafPayload> = Vec::with_capacity(page.n_slots() + 1);
             let found = search_key(&page, key);
-            // Anexado real: hoja del extremo derecho del árbol Y la clave
-            // nueva va detrás de todas las de esta hoja. `Ok(_)` es un
-            // REEMPLAZO — no añade ninguna entrada, y si aun así hace crecer
-            // la página lo hace por el medio, no por el borde, así que no
-            // cuenta como anexado. Ver `SplitBias`.
+            // Anexado real: `rightmost` ya garantiza que no hay ninguna clave
+            // de la región (`< upper`) mayor que la nueva FUERA de esta hoja,
+            // así que solo falta descartar que la haya DENTRO, detrás del
+            // punto de inserción — o no hay nada detrás (`i == n_slots`), o
+            // lo que hay ya está fuera de la región, y basta mirar la primera
+            // porque la hoja está ordenada.
+            //
+            // El corte queda justo detrás de la clave nueva (`i + 1`), o en
+            // `n_slots` cuando no hay nada detrás y `i + 1` dejaría la
+            // derecha vacía; ver `SplitBias` para por qué es esa y no otra.
+            //
+            // `Ok(_)` es un REEMPLAZO — no añade ninguna entrada, y si aun
+            // así hace crecer la página lo hace por el medio, no por el
+            // borde, así que no cuenta como anexado.
             let bias = match found {
-                Err(i) if rightmost && i == page.n_slots() => SplitBias::Append,
+                Err(i) if rightmost && (i == page.n_slots() || beyond(upper, &page.key(i))) => {
+                    SplitBias::Append((i + 1).min(page.n_slots()))
+                }
                 _ => SplitBias::Middle,
             };
             match found {
@@ -904,11 +987,15 @@ fn insert_rec(
         PageType::Internal => {
             let idx = child_index(&page, key);
             let child = child_at(&page, idx);
-            // El hijo sigue en el camino más a la derecha solo si esta página
-            // lo estaba Y el descenso tomó `extra`, que es lo que significa
-            // `idx == page.n_slots()` (ver `child_at`).
-            let child_rightmost = rightmost && idx == page.n_slots();
-            let result = insert_rec(tx, child, key, value, depth + 1, child_rightmost)?;
+            // El hijo conserva el invariante de anexado solo si esta página lo
+            // tenía Y lo que queda a su derecha ya está fuera de la región: o
+            // no queda nada (el descenso tomó `extra`, que es lo que significa
+            // `idx == page.n_slots()`, ver `child_at`), o el separador
+            // `page.key(idx)` —cota inferior de TODO lo que va detrás del hijo
+            // elegido— ya alcanza `upper`. Ver el comentario de `insert_rec`.
+            let child_rightmost =
+                rightmost && (idx == page.n_slots() || beyond(upper, &page.key(idx)));
+            let result = insert_rec(tx, child, key, value, depth + 1, child_rightmost, upper)?;
 
             let mut entries: Vec<(Vec<u8>, CellPayload)> = Vec::with_capacity(page.n_slots() + 2);
             let mut extra = page.extra();
@@ -987,7 +1074,31 @@ fn insert_rec(
 /// se optimizara para no deshacer siempre, un `put` fallido dejaría páginas
 /// liberadas de más sin que la raíz llegara a apuntar a la reconstrucción
 /// parcial — dos dueños o una fuga, según el caso.
-pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<PageNo> {
+///
+/// # `upper`: la región de anexado
+///
+/// `upper` es la cota superior EXCLUSIVA de la región dentro de la cual el
+/// llamante espera anexar por el final, o `None` si no hay tal región. Es lo
+/// ÚNICO que este árbol necesita saber de los espacios de claves —que no
+/// conoce, y no debe conocer— para que el sesgo de división de `SplitBias`
+/// siga funcionando cuando existen claves por encima de las suyas. `tx.rs`
+/// pasa `[ns + 1]`, un solo byte, porque antepone `ns` a cada clave
+/// (`scoped`) y por tanto toda clave del espacio `ns` es menor que ese byte
+/// suelto y toda clave de un espacio superior es mayor o igual. Para
+/// `ns == 0xff` pasa `None`: no existe ninguna cadena de bytes mayor que
+/// todas las que empiezan por `0xff`.
+///
+/// **No es una restricción: `put` inserta `key` esté donde esté respecto de
+/// `upper`.** Solo dirige un sesgo de llenado, así que una cota equivocada
+/// cuesta bytes en disco, nunca corrección — la misma garantía que ya daba
+/// `SplitBias` (ver su comentario).
+pub fn put(
+    tx: &mut WriteTxn,
+    root: PageNo,
+    key: &[u8],
+    value: &[u8],
+    upper: Option<&[u8]>,
+) -> Result<PageNo> {
     let page_size = tx.logical_page_size();
     // Una división de nodo interno promueve un separador y reparte el resto
     // entre dos mitades; para que ambas conserven al menos un separador
@@ -1027,7 +1138,7 @@ pub fn put(tx: &mut WriteTxn, root: PageNo, key: &[u8], value: &[u8]) -> Result<
         };
     }
 
-    match insert_rec(tx, root, key, value, 1, true)? {
+    match insert_rec(tx, root, key, value, 1, true, upper)? {
         Insertion::Updated(p, _) => Ok(p),
         Insertion::Split { left, left_plain, sep, right, right_plain } => {
             // El árbol crece por arriba: raíz nueva con un solo separador.
@@ -2488,7 +2599,7 @@ mod put_tests {
     fn insert_into_an_empty_tree_creates_a_leaf_root() {
         let db = db();
         let mut tx = db.begin_write().unwrap();
-        let root = put(&mut tx, 0, b"k", b"v").unwrap();
+        let root = put(&mut tx, 0, b"k", b"v", None).unwrap();
         assert_ne!(root, 0);
         assert_eq!(get(&tx, root, b"k").unwrap().as_deref(), Some(b"v".as_slice()));
     }
@@ -2497,8 +2608,8 @@ mod put_tests {
     fn inserting_the_same_key_twice_replaces_the_value() {
         let db = db();
         let mut tx = db.begin_write().unwrap();
-        let root = put(&mut tx, 0, b"k", b"uno").unwrap();
-        let root = put(&mut tx, root, b"k", b"dos").unwrap();
+        let root = put(&mut tx, 0, b"k", b"uno", None).unwrap();
+        let root = put(&mut tx, root, b"k", b"dos", None).unwrap();
         assert_eq!(get(&tx, root, b"k").unwrap().as_deref(), Some(b"dos".as_slice()));
     }
 
@@ -2509,7 +2620,7 @@ mod put_tests {
         let mut root = 0;
         for i in 0..500u32 {
             let key = alloc::format!("clave/{i:06}");
-            root = put(&mut tx, root, key.as_bytes(), &i.to_le_bytes()).unwrap();
+            root = put(&mut tx, root, key.as_bytes(), &i.to_le_bytes(), None).unwrap();
         }
         for i in 0..500u32 {
             let key = alloc::format!("clave/{i:06}");
@@ -2528,7 +2639,7 @@ mod put_tests {
         let mut root = 0;
         for i in (0..500u32).rev() {
             let key = alloc::format!("clave/{i:06}");
-            root = put(&mut tx, root, key.as_bytes(), b"x").unwrap();
+            root = put(&mut tx, root, key.as_bytes(), b"x", None).unwrap();
         }
         for i in 0..500u32 {
             let key = alloc::format!("clave/{i:06}");
@@ -2540,7 +2651,7 @@ mod put_tests {
     fn a_value_survives_a_commit_and_reopen_of_the_reader() {
         let db = db();
         let mut tx = db.begin_write().unwrap();
-        let root = put(&mut tx, 0, b"persistente", b"si").unwrap();
+        let root = put(&mut tx, 0, b"persistente", b"si", None).unwrap();
         tx.set_root(root);
         tx.commit().unwrap();
         let r = db.begin_read();
@@ -2551,8 +2662,8 @@ mod put_tests {
     fn the_old_root_is_freed_after_an_update() {
         let db = db();
         let mut tx = db.begin_write().unwrap();
-        let first = put(&mut tx, 0, b"a", b"1").unwrap();
-        let second = put(&mut tx, first, b"b", b"2").unwrap();
+        let first = put(&mut tx, 0, b"a", b"1", None).unwrap();
+        let second = put(&mut tx, first, b"b", b"2", None).unwrap();
         assert_ne!(first, second, "copy-on-write: la raíz nueva es otra página");
         tx.set_root(second);
         tx.commit().unwrap();
@@ -2576,7 +2687,7 @@ mod put_tests {
         let db = db();
         let mut tx = db.begin_write().unwrap();
         let huge_key = alloc::vec![b'x'; 1000];
-        let err = put(&mut tx, 0, &huge_key, b"v").unwrap_err();
+        let err = put(&mut tx, 0, &huge_key, b"v", None).unwrap_err();
         assert!(
             matches!(err, crate::Error::KeyTooLarge { .. }),
             "se esperaba KeyTooLarge, se obtuvo {err:?}"
@@ -2601,7 +2712,7 @@ mod put_tests {
         for i in 0..30u32 {
             let mut key = prefix.clone();
             key.extend_from_slice(alloc::format!("{i:020}").as_bytes());
-            match put(&mut tx, root, &key, b"v") {
+            match put(&mut tx, root, &key, b"v", None) {
                 Ok(new_root) => root = new_root,
                 Err(crate::Error::KeyTooLarge { .. }) => {} // aceptable: no cabe, pero no entra en pánico
                 Err(e) => panic!("error inesperado: {e:?}"),
@@ -2619,7 +2730,7 @@ mod put_tests {
         let db = db();
         let mut tx = db.begin_write().unwrap();
         let key = alloc::vec![b'k'; 129];
-        let err = put(&mut tx, 0, &key, b"v").unwrap_err();
+        let err = put(&mut tx, 0, &key, b"v", None).unwrap_err();
         assert_eq!(err, crate::Error::KeyTooLarge { len: 129, max: 128 });
     }
 
@@ -2630,7 +2741,7 @@ mod put_tests {
         let db = db();
         let mut tx = db.begin_write().unwrap();
         let key = alloc::vec![b'k'; 128];
-        let root = put(&mut tx, 0, &key, b"v").unwrap();
+        let root = put(&mut tx, 0, &key, b"v", None).unwrap();
         assert_eq!(get(&tx, root, &key).unwrap().as_deref(), Some(b"v".as_slice()));
     }
 
@@ -2650,7 +2761,7 @@ mod put_tests {
         let db = db();
         let mut tx = db.begin_write().unwrap();
         let huge_value = alloc::vec![0u8; 2000];
-        let root = put(&mut tx, 0, b"k", &huge_value).unwrap();
+        let root = put(&mut tx, 0, b"k", &huge_value, None).unwrap();
         assert_eq!(get(&tx, root, b"k").unwrap().unwrap(), huge_value);
     }
 
@@ -2676,7 +2787,7 @@ mod put_tests {
         for i in 0..n {
             let mut key = alloc::format!("{i:07}").into_bytes();
             key.resize(127, b'k');
-            root = put(&mut tx, root, &key, b"v").unwrap();
+            root = put(&mut tx, root, &key, b"v", None).unwrap();
         }
         let mut max_depth = 0usize;
         for i in (0..n).step_by(37) {
@@ -2713,7 +2824,7 @@ mod put_tests {
         tx.write_page(a, &pa).unwrap();
         tx.write_page(b, &pb).unwrap();
 
-        let err = put(&mut tx, a, b"cualquiera", b"v").unwrap_err();
+        let err = put(&mut tx, a, b"cualquiera", b"v", None).unwrap_err();
         assert!(
             matches!(err, crate::Error::Corrupt { kind: crate::CorruptKind::TreeLoop, .. }),
             "se esperaba TreeLoop, se obtuvo {err:?}"
@@ -2954,7 +3065,7 @@ mod invariant_tests {
         let n = 4000u32;
         let mut root = 0;
         for i in 0..n {
-            root = put(&mut tx, root, &log_key(i), &i.to_le_bytes()).unwrap();
+            root = put(&mut tx, root, &log_key(i), &i.to_le_bytes(), None).unwrap();
         }
 
         let mut counts = Vec::new();
@@ -3004,10 +3115,10 @@ mod invariant_tests {
         let n = 4000u32;
         let mut root = 0;
         for i in (0..n).step_by(2) {
-            root = put(&mut tx, root, &log_key(i), &i.to_le_bytes()).unwrap();
+            root = put(&mut tx, root, &log_key(i), &i.to_le_bytes(), None).unwrap();
         }
         for i in (1..n).step_by(2) {
-            root = put(&mut tx, root, &log_key(i), &i.to_le_bytes()).unwrap();
+            root = put(&mut tx, root, &log_key(i), &i.to_le_bytes(), None).unwrap();
         }
 
         let mut counts = Vec::new();
@@ -3039,6 +3150,509 @@ mod invariant_tests {
         check_invariants(&tx, root, None, None, &mut visited);
     }
 
+    /// Cuántos niveles tiene el árbol, contando la raíz como 1. Sirve para
+    /// distinguir "el árbol creció como debe" de las dos degeneraciones que
+    /// este fichero ya ha producido: nodos de un solo hijo apilando
+    /// profundidad sin ramificar (llegó a 65 niveles con 95.512 claves,
+    /// dejando toda clave guardada ilegible) y divisiones que dejan hojas de
+    /// una sola entrada.
+    fn tree_depth(tx: &impl PageSource, page_no: PageNo) -> u32 {
+        let valid = tx.read_page(page_no).unwrap();
+        let page = valid.page();
+        match page.page_type() {
+            PageType::Leaf => 1,
+            PageType::Internal => {
+                let mut deepest = 0;
+                for i in 0..=page.n_slots() {
+                    deepest = deepest.max(tree_depth(tx, child_at(&page, i)));
+                }
+                1 + deepest
+            }
+            _ => panic!("tipo de página inesperado en el árbol: {:?}", page.page_type()),
+        }
+    }
+
+    /// Como `leaf_slot_counts`, pero además con la PRIMERA clave de cada
+    /// hoja. Hace falta para distinguir las hojas cortas legítimas de las
+    /// degeneradas: el corte de anexado desgaja una vez, y solo una, el
+    /// bloque de claves que ya está por encima de la cota, y esa hoja puede
+    /// quedarse con muy pocas entradas por construcción — ver `SplitBias`.
+    /// Una hoja corta POR DEBAJO de la cota, en cambio, sí sería la
+    /// degeneración que este fichero ya produjo una vez.
+    fn leaf_counts_and_first_keys(
+        tx: &impl PageSource,
+        page_no: PageNo,
+        out: &mut Vec<(usize, Vec<u8>)>,
+    ) {
+        let valid = tx.read_page(page_no).unwrap();
+        let page = valid.page();
+        match page.page_type() {
+            PageType::Leaf => {
+                let first = if page.n_slots() > 0 { page.key(0) } else { Vec::new() };
+                out.push((page.n_slots(), first));
+            }
+            PageType::Internal => {
+                for i in 0..page.n_slots() {
+                    leaf_counts_and_first_keys(tx, page.child(i), out);
+                }
+                leaf_counts_and_first_keys(tx, page.extra(), out);
+            }
+            _ => panic!("tipo de página inesperado en el árbol: {:?}", page.page_type()),
+        }
+    }
+
+    /// `log_key` precedida del byte de espacio de claves, igual que hace
+    /// `tx::scoped`. Es la forma REAL de las claves que llegan al árbol, y la
+    /// única con la que este defecto es visible: sin el byte delante, no hay
+    /// forma de que exista una clave "de otro espacio" por encima.
+    fn scoped_log_key(ns: u8, i: u32) -> Vec<u8> {
+        let mut k = Vec::with_capacity(11);
+        k.push(ns);
+        k.extend_from_slice(&log_key(i));
+        k
+    }
+
+    /// Construye un árbol con `n` claves ascendentes en el espacio `ns`, más
+    /// (si `above`) una sola clave en el espacio `ns + 1`, y devuelve la raíz
+    /// junto con el llenado medio de sus hojas. `upper` se pasa tal cual a
+    /// `put`, que es justo lo que esta batería contrasta.
+    fn ascending_run(
+        tx: &mut WriteTxn,
+        ns: u8,
+        n: u32,
+        above: bool,
+        upper: Option<&[u8]>,
+    ) -> (PageNo, f64, Vec<usize>) {
+        let mut root = 0;
+        if above {
+            // La fila del espacio superior se planta ANTES, como la planta el
+            // despliegue real: la capa de agregación escribe en `0x02` desde
+            // el primer commit, no al final.
+            //
+            // La clave es EXACTAMENTE la cota, `[ns + 1]` sin nada detrás —
+            // que es lo que produce `tx::scoped(ns + 1, b"")`, una clave de
+            // usuario vacía en el espacio siguiente. Es el caso límite que
+            // distingue el `>=` de `beyond` de un `>`: con `>` esta clave no
+            // contaría como "por encima de la cota", el sesgo no se
+            // dispararía y el llenado se hundiría. Con cualquier clave más
+            // larga los dos operadores darían lo mismo y la prueba no vería
+            // la diferencia.
+            root = put(tx, root, &[ns + 1], b"agregado", None).unwrap();
+        }
+        for i in 0..n {
+            root = put(tx, root, &scoped_log_key(ns, i), &i.to_le_bytes(), upper).unwrap();
+        }
+        let mut counts = Vec::new();
+        leaf_slot_counts(tx, root, &mut counts);
+        let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
+        (root, mean, counts)
+    }
+
+    /// **La regresión que ninguna prueba de un solo espacio de claves podía
+    /// ver.** `tx.rs` antepone el byte del espacio a cada clave (`scoped`),
+    /// así que el orden de los espacios ES el orden del árbol: basta UNA fila
+    /// en un espacio superior —una fila de agregado en `0x02`, una entrada de
+    /// índice secundario en `0x80 | id`— para que ninguna clave de un espacio
+    /// inferior vuelva a ser la mayor del ÁRBOL, que era la condición que
+    /// pedía la primera versión de `SplitBias::Append`. El sesgo dejaba de
+    /// dispararse y el llenado de hoja volvía al ~50%: medido sobre 200.000
+    /// registros con páginas de 4 KB, **34,98 → 80,26 bytes por entrada, 2,29
+    /// veces el fichero, por una sola fila**.
+    ///
+    /// La prueba mide las DOS mitades en la misma corrida y compara: mismo
+    /// volumen, mismas claves, mismo orden, y lo único que cambia es si
+    /// existe esa fila de arriba. Comparar contra la otra mitad y no contra
+    /// una constante es deliberado (mismo criterio que
+    /// `bytes_per_entry_reacts_to_shuffled_insertion_order` en
+    /// `tests/size.rs`): cualquier mejora futura del llenado mueve las dos a
+    /// la vez y no convierte un avance en un fallo.
+    #[test]
+    fn a_key_in_a_higher_namespace_does_not_cost_the_lower_one_its_append_bias() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let capacity = log_leaf_capacity(tx.logical_page_size());
+        let n = 4000u32;
+
+        let (_, solo, _) = ascending_run(&mut tx, 0x01, n, false, Some(&[0x02]));
+        let (root, con_fila, counts) = ascending_run(&mut tx, 0x01, n, true, Some(&[0x02]));
+
+        assert!(
+            con_fila >= 0.85 * capacity as f64,
+            "llenado medio de hoja {con_fila:.1} sobre una capacidad real de {capacity} \
+             ({:.0} %) en {} hojas con UNA clave en 0x02: el sesgo de anexado no se está \
+             disparando para el espacio 0x01",
+            con_fila / capacity as f64 * 100.0,
+            counts.len()
+        );
+        assert!(
+            con_fila >= 0.95 * solo,
+            "con una clave en 0x02 el llenado medio cae de {solo:.1} a {con_fila:.1} \
+             entradas por hoja: una sola fila de un espacio superior vuelve a costarle al \
+             inferior su sesgo de anexado"
+        );
+
+        // Y sigue siendo un árbol, no solo un fichero pequeño: 4000 claves con
+        // páginas de 512 B no caben en dos niveles, así que esto ejercita
+        // divisiones de nodo INTERNO, no solo de hoja.
+        assert!(
+            tree_depth(&tx, root) >= 3,
+            "el árbol se quedó en {} niveles: esta prueba no está llegando a las \
+             divisiones de nodo interno que dice ejercitar",
+            tree_depth(&tx, root)
+        );
+        for i in 0..n {
+            assert_eq!(
+                get(&tx, root, &scoped_log_key(0x01, i)).unwrap().as_deref(),
+                Some(&i.to_le_bytes()[..]),
+                "clave {i} del espacio 0x01"
+            );
+        }
+        assert_eq!(
+            get(&tx, root, &[0x02]).unwrap().as_deref(),
+            Some(b"agregado".as_slice()),
+            "la clave del espacio superior tiene que seguir ahí"
+        );
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    /// La cota es lo que hace el trabajo, y esta prueba lo demuestra
+    /// ejecutando el MISMO caso con y sin ella. Sin `upper`, `put` reproduce
+    /// exactamente la condición anterior a esta corrección ("la mayor del
+    /// árbol entero"), que con una clave en `0x02` no se dispara nunca.
+    ///
+    /// Existe para que la prueba de arriba no pueda pasar por accidente: si
+    /// alguien retirara la cota y el llenado siguiera alto, sería que el
+    /// llenado lo produce otra cosa y la de arriba no está midiendo lo que
+    /// dice medir.
+    #[test]
+    fn without_the_bound_the_higher_key_still_freezes_the_leaves_at_half() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let capacity = log_leaf_capacity(tx.logical_page_size());
+        let n = 4000u32;
+
+        let (_, con_cota, _) = ascending_run(&mut tx, 0x01, n, true, Some(&[0x02]));
+        let (root, sin_cota, _) = ascending_run(&mut tx, 0x01, n, true, None);
+
+        assert!(
+            sin_cota <= 0.65 * capacity as f64,
+            "sin cota el llenado medio es {sin_cota:.1} sobre {capacity} ({:.0} %): se \
+             esperaba el ~50 % del reparto por el punto medio. Si de verdad ha subido, el \
+             sesgo se está disparando por un camino que no es la cota, y \
+             `a_key_in_a_higher_namespace_does_not_cost_the_lower_one_its_append_bias` \
+             ya no prueba lo que dice",
+            sin_cota / capacity as f64 * 100.0
+        );
+        assert!(
+            con_cota >= 1.4 * sin_cota,
+            "con cota {con_cota:.1} contra sin cota {sin_cota:.1} entradas por hoja: la \
+             cota tendría que ser la diferencia entera"
+        );
+        // Sin cota el árbol también tiene que quedar bien formado: la
+        // corrección no puede haber roto el camino que ya existía.
+        for i in 0..n {
+            assert_eq!(
+                get(&tx, root, &scoped_log_key(0x01, i)).unwrap().as_deref(),
+                Some(&i.to_le_bytes()[..]),
+                "clave {i}"
+            );
+        }
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    /// El anexado puro —una sola región, sin nada por encima— no puede
+    /// haberse movido: es el caso que produjo los 34,14 bytes por entrada y
+    /// el que paga las facturas. Con `upper` pero sin ninguna clave por
+    /// encima, el punto de inserción es siempre `n_slots`, el corte cae en
+    /// `min(i + 1, n_slots) = n_slots`, y eso es literalmente lo que hacía la
+    /// versión anterior.
+    #[test]
+    fn the_pure_append_case_is_unchanged_by_the_bound() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let n = 4000u32;
+        let (root_con, con_cota, _) = ascending_run(&mut tx, 0x01, n, false, Some(&[0x02]));
+        let (root_sin, sin_cota, _) = ascending_run(&mut tx, 0x01, n, false, None);
+        assert_eq!(
+            con_cota, sin_cota,
+            "con y sin cota, sin nada por encima, el llenado tiene que ser IDÉNTICO"
+        );
+        assert_eq!(
+            tree_depth(&tx, root_con),
+            tree_depth(&tx, root_sin),
+            "y el árbol, de la misma forma"
+        );
+    }
+
+    /// Que el sesgo no se cuele en la inserción interior sigue siendo la otra
+    /// mitad del contrato (ver
+    /// `a_page_that_fills_by_interior_insertion_still_splits_near_the_middle`,
+    /// arriba), y ahora hay que fijarlo TAMBIÉN con cota: la condición nueva
+    /// mira `page.key(i) >= upper`, así que una implementación descuidada
+    /// —comparar contra la clave nueva en vez de contra la cota, o dar el
+    /// sesgo por bueno en cuanto exista cota— dispararía el anexado en cada
+    /// inserción interior y dejaría una mitad derecha de una sola entrada por
+    /// división.
+    #[test]
+    fn interior_insertion_still_splits_near_the_middle_with_a_bound() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let capacity = log_leaf_capacity(tx.logical_page_size());
+        let n = 4000u32;
+        let upper: Option<&[u8]> = Some(&[0x02]);
+        let mut root = put(&mut tx, 0, &[0x02], b"agregado", None).unwrap();
+        for i in (0..n).step_by(2) {
+            root = put(&mut tx, root, &scoped_log_key(0x01, i), &i.to_le_bytes(), upper).unwrap();
+        }
+        for i in (1..n).step_by(2) {
+            root = put(&mut tx, root, &scoped_log_key(0x01, i), &i.to_le_bytes(), upper).unwrap();
+        }
+
+        let mut counts = Vec::new();
+        leaf_slot_counts(&tx, root, &mut counts);
+        let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
+        assert!(
+            mean >= 0.45 * capacity as f64,
+            "llenado medio de hoja {mean:.1} sobre una capacidad real de {capacity} \
+             ({:.0} %) en {} hojas: la división interior está degenerando CON cota",
+            mean / capacity as f64 * 100.0,
+            counts.len()
+        );
+        // Ninguna hoja POR DEBAJO de la cota puede quedarse corta. La que sí
+        // puede —y lo hace, con una sola entrada— es la que recoge el bloque
+        // que ya estaba por encima de la cota: el corte de anexado lo desgaja
+        // una vez y para siempre, que es exactamente su propósito (ver
+        // `SplitBias`). Distinguir las dos es el motivo de que esta prueba
+        // mire las claves y no solo las cuentas: sin esa distinción, o bien
+        // no se detecta una hoja degenerada de verdad, o bien se prohíbe el
+        // desgajado que hace todo el trabajo.
+        let mut leaves = Vec::new();
+        leaf_counts_and_first_keys(&tx, root, &mut leaves);
+        for (count, first) in &leaves {
+            if first.as_slice() < &[0x02][..] {
+                assert!(
+                    *count >= 2,
+                    "la hoja que empieza en {first:?} quedó con {count} entradas tras \
+                     divisiones interiores: {leaves:?}"
+                );
+            }
+        }
+        assert_eq!(
+            leaves.iter().filter(|(_, first)| first.as_slice() >= &[0x02][..]).count(),
+            1,
+            "el bloque por encima de la cota tiene que ocupar UNA sola hoja, no más: \
+             {leaves:?}"
+        );
+        for i in 0..n {
+            assert_eq!(
+                get(&tx, root, &scoped_log_key(0x01, i)).unwrap().as_deref(),
+                Some(&i.to_le_bytes()[..]),
+                "clave {i}"
+            );
+        }
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    /// **El bloque que queda por encima de la cota se desgaja UNA vez, no se
+    /// desangra clave a clave.** Es lo que fija el corte en `i + 1` y no en
+    /// `n_slots`, y hasta que existió esta prueba las dos elecciones eran
+    /// indistinguibles: con UNA sola clave por encima `min(i + 1, n_slots)` y
+    /// `n_slots` valen lo mismo, así que la batería de mutación las daba por
+    /// equivalentes. Con VARIAS ya no.
+    ///
+    /// Con el corte en `n_slots` la hoja de la frontera se queda con todo el
+    /// bloque superior menos su última clave, o sea sigue llena; la siguiente
+    /// inserción vuelve a partirla y a soltar UNA clave más, y así una página
+    /// de una sola entrada por cada clave que hubiera arriba. Con el corte en
+    /// `i + 1` el bloque entero se va de una vez a su propia hoja y la
+    /// frontera queda libre para crecer hasta llenarse.
+    ///
+    /// Las 20 claves sembradas caben de sobra en una hoja (capacidad medida
+    /// ~40 con páginas de 512 B), así que "una sola hoja por encima de la
+    /// cota" es la respuesta correcta, no una cota arbitraria.
+    #[test]
+    fn a_block_above_the_bound_is_split_off_once_not_bled_one_key_at_a_time() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let capacity = log_leaf_capacity(tx.logical_page_size());
+        let above = 20u32;
+        let n = 4000u32;
+        let upper: Option<&[u8]> = Some(&[0x02]);
+
+        let mut root = 0;
+        for j in 0..above {
+            let mut k = alloc::vec![0x02u8];
+            k.extend_from_slice(&j.to_be_bytes());
+            root = put(&mut tx, root, &k, b"agregado", None).unwrap();
+        }
+        for i in 0..n {
+            root = put(&mut tx, root, &scoped_log_key(0x01, i), &i.to_le_bytes(), upper).unwrap();
+        }
+
+        let mut leaves = Vec::new();
+        leaf_counts_and_first_keys(&tx, root, &mut leaves);
+        let arriba: Vec<_> = leaves.iter().filter(|(_, f)| f.as_slice() >= &[0x02][..]).collect();
+        assert_eq!(
+            arriba.len(),
+            1,
+            "el bloque de {above} claves por encima de la cota quedó repartido en {} hojas: \
+             el corte lo está desangrando en vez de desgajarlo de una vez. Hojas: {leaves:?}",
+            arriba.len()
+        );
+        assert_eq!(
+            arriba[0].0, above as usize,
+            "la hoja del bloque superior debería tener las {above} claves"
+        );
+
+        let mean = leaves.iter().map(|(c, _)| c).sum::<usize>() as f64 / leaves.len() as f64;
+        assert!(
+            mean >= 0.85 * capacity as f64,
+            "llenado medio {mean:.1} sobre {capacity} ({:.0} %) en {} hojas",
+            mean / capacity as f64 * 100.0,
+            leaves.len()
+        );
+
+        for i in 0..n {
+            assert_eq!(
+                get(&tx, root, &scoped_log_key(0x01, i)).unwrap().as_deref(),
+                Some(&i.to_le_bytes()[..]),
+                "clave {i} del espacio 0x01"
+            );
+        }
+        for j in 0..above {
+            let mut k = alloc::vec![0x02u8];
+            k.extend_from_slice(&j.to_be_bytes());
+            assert_eq!(
+                get(&tx, root, &k).unwrap().as_deref(),
+                Some(b"agregado".as_slice()),
+                "clave {j} del espacio 0x02"
+            );
+        }
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    /// Tres regiones anexando A LA VEZ, que es la forma real del despliegue
+    /// (crudo en `0x01`, agregados en `0x02`, y por encima el espacio de un
+    /// índice secundario en `0x80 | id`): cada una tiene que conseguir su
+    /// propio sesgo, no solo la de más arriba. Con la condición anterior solo
+    /// la última lo conseguía; con una condición meramente LOCAL no lo
+    /// conseguía ninguna, porque la frontera de cada región comparte hoja con
+    /// la cabeza de la siguiente y el punto de inserción nunca cae al final.
+    ///
+    /// Es además el caso que de verdad ejercita el corte `i + 1`: las tres
+    /// fronteras existen a la vez y cada una tiene que desgajar el bloque
+    /// superior de su hoja una sola vez.
+    #[test]
+    fn three_regions_appending_at_once_each_get_their_own_bias() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let capacity = log_leaf_capacity(tx.logical_page_size());
+        let n = 2000u32;
+        let regions: [u8; 3] = [0x01, 0x02, 0x80];
+        let mut root = 0;
+        // Entrelazadas: ninguna región termina antes de que empiece la
+        // siguiente, así que las tres fronteras están vivas a la vez.
+        for i in 0..n {
+            for ns in regions {
+                let bound = [ns + 1];
+                root =
+                    put(&mut tx, root, &scoped_log_key(ns, i), &i.to_le_bytes(), Some(&bound[..]))
+                        .unwrap();
+            }
+        }
+
+        let mut counts = Vec::new();
+        leaf_slot_counts(&tx, root, &mut counts);
+        let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
+        assert!(
+            mean >= 0.85 * capacity as f64,
+            "llenado medio de hoja {mean:.1} sobre una capacidad real de {capacity} \
+             ({:.0} %) en {} hojas con tres regiones anexando a la vez: alguna de las tres \
+             no está consiguiendo su sesgo",
+            mean / capacity as f64 * 100.0,
+            counts.len()
+        );
+        assert!(
+            tree_depth(&tx, root) >= 3,
+            "solo {} niveles: no se están ejercitando divisiones de nodo interno",
+            tree_depth(&tx, root)
+        );
+        for ns in regions {
+            for i in 0..n {
+                assert_eq!(
+                    get(&tx, root, &scoped_log_key(ns, i)).unwrap().as_deref(),
+                    Some(&i.to_le_bytes()[..]),
+                    "clave {i} del espacio {ns:#04x}"
+                );
+            }
+        }
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
+    /// Anexar, podar la mitad vieja y volver a anexar, con una clave por
+    /// encima. `delete_rec` colapsa nodos internos de un solo hijo pero NO
+    /// fusiona hojas infrautilizadas (`docs/invariantes.md` §3), así que una
+    /// política de división que congela páginas al 100% podría, en principio,
+    /// acumular hojas a medias que el reparto por el punto medio habría
+    /// evitado. Esta prueba fija que no ocurre: tras el ciclo completo, el
+    /// llenado medio sigue alto y el árbol sigue bien formado.
+    ///
+    /// El motivo es que las dos cosas no se estorban: la poda vacía hojas
+    /// ENTERAS por el extremo viejo —que `delete_rec` sí sabe quitar— y el
+    /// anexado sigue creando hojas llenas por el extremo nuevo. Medido sobre
+    /// 200.000 registros con páginas de 4 KB: 1667 páginas en uso, 837 tras
+    /// podar la mitad, 1668 tras reanexar la misma cantidad; con la condición
+    /// anterior y la misma clave arriba eran 3871 / 1938 / 3873.
+    #[test]
+    fn appending_after_pruning_does_not_accumulate_half_empty_leaves() {
+        let db = db();
+        let mut tx = db.begin_write().unwrap();
+        let capacity = log_leaf_capacity(tx.logical_page_size());
+        let n = 4000u32;
+        let upper: Option<&[u8]> = Some(&[0x02]);
+        let mut root = put(&mut tx, 0, &[0x02], b"agregado", None).unwrap();
+        for i in 0..n {
+            root = put(&mut tx, root, &scoped_log_key(0x01, i), &i.to_le_bytes(), upper).unwrap();
+        }
+        root = delete_range(&mut tx, root, &scoped_log_key(0x01, 0), &scoped_log_key(0x01, n / 2))
+            .unwrap();
+        for i in n..n + n / 2 {
+            root = put(&mut tx, root, &scoped_log_key(0x01, i), &i.to_le_bytes(), upper).unwrap();
+        }
+
+        let mut counts = Vec::new();
+        leaf_slot_counts(&tx, root, &mut counts);
+        let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
+        assert!(
+            mean >= 0.85 * capacity as f64,
+            "tras anexar, podar y reanexar el llenado medio es {mean:.1} sobre {capacity} \
+             ({:.0} %) en {} hojas: el ciclo está dejando hojas a medias",
+            mean / capacity as f64 * 100.0,
+            counts.len()
+        );
+        for i in n / 2..n + n / 2 {
+            assert_eq!(
+                get(&tx, root, &scoped_log_key(0x01, i)).unwrap().as_deref(),
+                Some(&i.to_le_bytes()[..]),
+                "clave {i} tendría que haber sobrevivido"
+            );
+        }
+        for i in 0..n / 2 {
+            assert_eq!(
+                get(&tx, root, &scoped_log_key(0x01, i)).unwrap(),
+                None,
+                "clave {i} tendría que estar podada"
+            );
+        }
+        let mut visited = BTreeSet::new();
+        check_invariants(&tx, root, None, None, &mut visited);
+    }
+
     #[test]
     fn random_order_insertion_is_fully_readable_and_well_formed() {
         let db = db();
@@ -3054,7 +3668,7 @@ mod invariant_tests {
         let mut root = 0;
         for &i in &order {
             let key = alloc::format!("clave/{i:06}");
-            root = put(&mut tx, root, key.as_bytes(), &i.to_le_bytes()).unwrap();
+            root = put(&mut tx, root, key.as_bytes(), &i.to_le_bytes(), None).unwrap();
         }
         for i in 0..n {
             let key = alloc::format!("clave/{i:06}");
@@ -3096,7 +3710,7 @@ mod invariant_tests {
         let mut root = 0;
         for &i in &order {
             let key = key_for(i);
-            root = put(&mut tx, root, &key, &i.to_le_bytes()).unwrap();
+            root = put(&mut tx, root, &key, &i.to_le_bytes(), None).unwrap();
         }
         for i in 0..n {
             let key = key_for(i);
@@ -3129,7 +3743,7 @@ mod invariant_tests {
             for &i in &order {
                 let key = alloc::format!("clave/{i:06}");
                 let value = alloc::format!("v{}-{}", i, rng.next());
-                root = put(&mut tx, root, key.as_bytes(), value.as_bytes()).unwrap();
+                root = put(&mut tx, root, key.as_bytes(), value.as_bytes(), None).unwrap();
                 expected.insert(i, value);
             }
         }
@@ -3193,14 +3807,14 @@ mod invariant_tests {
                 .unwrap();
 
         let mut tx = db.begin_write().unwrap();
-        let mut root = put(&mut tx, 0, b"k", b"0").unwrap();
+        let mut root = put(&mut tx, 0, b"k", b"0", None).unwrap();
         tx.set_root(root);
         tx.commit().unwrap();
         let size_after_first_commit = storage.snapshot().len();
 
         let mut tx = db.begin_write().unwrap();
         for i in 0..2000u32 {
-            root = put(&mut tx, root, b"k", &i.to_le_bytes()).unwrap();
+            root = put(&mut tx, root, b"k", &i.to_le_bytes(), None).unwrap();
         }
         tx.set_root(root);
         tx.commit().unwrap();
@@ -3245,7 +3859,7 @@ mod invariant_tests {
                 .unwrap();
 
         let mut tx = db.begin_write().unwrap();
-        let mut root = put(&mut tx, 0, b"k", b"0").unwrap();
+        let mut root = put(&mut tx, 0, b"k", b"0", None).unwrap();
         tx.set_root(root);
         tx.commit().unwrap();
 
@@ -3255,7 +3869,7 @@ mod invariant_tests {
         // es esperado, no lo que se comprueba.
         let mut tx = db.begin_write().unwrap();
         for i in 0..2000u32 {
-            root = put(&mut tx, root, b"k", &i.to_le_bytes()).unwrap();
+            root = put(&mut tx, root, b"k", &i.to_le_bytes(), None).unwrap();
         }
         tx.set_root(root);
         tx.commit().unwrap();
@@ -3267,7 +3881,7 @@ mod invariant_tests {
         // reciclarlas casi todas en vez de extender el fichero otra vez.
         let mut tx = db.begin_write().unwrap();
         for i in 2000..4000u32 {
-            root = put(&mut tx, root, b"k", &i.to_le_bytes()).unwrap();
+            root = put(&mut tx, root, b"k", &i.to_le_bytes(), None).unwrap();
         }
         tx.set_root(root);
         tx.commit().unwrap();
@@ -3325,6 +3939,7 @@ mod invariant_tests {
                 root,
                 alloc::format!("log/{i:06}").as_bytes(),
                 b"registro de ejemplo de la carga real",
+                None,
             )
             .unwrap();
         }
@@ -3356,8 +3971,8 @@ mod delete_tests {
     fn deleting_a_present_key_removes_it() {
         let db = db();
         let mut tx = db.begin_write().unwrap();
-        let root = put(&mut tx, 0, b"a", b"1").unwrap();
-        let root = put(&mut tx, root, b"b", b"2").unwrap();
+        let root = put(&mut tx, 0, b"a", b"1", None).unwrap();
+        let root = put(&mut tx, root, b"b", b"2", None).unwrap();
         let (root, existed) = delete(&mut tx, root, b"a").unwrap();
         assert!(existed);
         assert_eq!(get(&tx, root, b"a").unwrap(), None);
@@ -3368,7 +3983,7 @@ mod delete_tests {
     fn deleting_an_absent_key_reports_false_and_does_not_rewrite() {
         let db = db();
         let mut tx = db.begin_write().unwrap();
-        let root = put(&mut tx, 0, b"a", b"1").unwrap();
+        let root = put(&mut tx, 0, b"a", b"1", None).unwrap();
         let (new_root, existed) = delete(&mut tx, root, b"z").unwrap();
         assert!(!existed);
         assert_eq!(new_root, root, "sin cambios no hay copy-on-write");
@@ -3378,7 +3993,7 @@ mod delete_tests {
     fn emptying_the_tree_returns_a_null_root() {
         let db = db();
         let mut tx = db.begin_write().unwrap();
-        let root = put(&mut tx, 0, b"solo", b"1").unwrap();
+        let root = put(&mut tx, 0, b"solo", b"1", None).unwrap();
         let (root, existed) = delete(&mut tx, root, b"solo").unwrap();
         assert!(existed);
         assert_eq!(root, 0);
@@ -3390,7 +4005,7 @@ mod delete_tests {
         let mut tx = db.begin_write().unwrap();
         let mut root = 0;
         for i in 0..800u32 {
-            root = put(&mut tx, root, alloc::format!("k/{i:06}").as_bytes(), b"v").unwrap();
+            root = put(&mut tx, root, alloc::format!("k/{i:06}").as_bytes(), b"v", None).unwrap();
         }
         for i in 0..800u32 {
             let (r, existed) = delete(&mut tx, root, alloc::format!("k/{i:06}").as_bytes()).unwrap();
@@ -3406,7 +4021,7 @@ mod delete_tests {
         let mut tx = db.begin_write().unwrap();
         let mut root = 0;
         for i in 0..600u32 {
-            root = put(&mut tx, root, alloc::format!("k/{i:06}").as_bytes(), b"v").unwrap();
+            root = put(&mut tx, root, alloc::format!("k/{i:06}").as_bytes(), b"v", None).unwrap();
         }
         for i in (0..600u32).step_by(2) {
             let (r, _) = delete(&mut tx, root, alloc::format!("k/{i:06}").as_bytes()).unwrap();
@@ -3474,7 +4089,7 @@ mod delete_invariant_tests {
         let mut tx = db.begin_write().unwrap();
         let mut root = 0;
         for k in [b"aa".as_slice(), b"bb", b"cc", b"dd", b"ee"] {
-            root = put(&mut tx, root, k, b"v").unwrap();
+            root = put(&mut tx, root, k, b"v", None).unwrap();
         }
         let (root, existed) = delete(&mut tx, root, b"aa").unwrap();
         assert!(existed);
@@ -3492,7 +4107,7 @@ mod delete_invariant_tests {
         let mut tx = db.begin_write().unwrap();
         let mut root = 0;
         for k in [b"aa".as_slice(), b"bb", b"cc", b"dd", b"ee"] {
-            root = put(&mut tx, root, k, b"v").unwrap();
+            root = put(&mut tx, root, k, b"v", None).unwrap();
         }
         let (root, existed) = delete(&mut tx, root, b"ee").unwrap();
         assert!(existed);
@@ -3530,7 +4145,7 @@ mod delete_invariant_tests {
         }
         let mut root = 0;
         for &i in &order {
-            root = put(&mut tx, root, alloc::format!("clave/{i:06}").as_bytes(), b"v").unwrap();
+            root = put(&mut tx, root, alloc::format!("clave/{i:06}").as_bytes(), b"v", None).unwrap();
         }
 
         let sep = first_root_separator(&tx, root);
@@ -3717,7 +4332,7 @@ mod delete_invariant_tests {
             let i = rng.next() % universe;
             let key = alloc::format!("k/{i:05}");
             if rng.next().is_multiple_of(2) {
-                root = put(&mut tx, root, key.as_bytes(), b"v").unwrap();
+                root = put(&mut tx, root, key.as_bytes(), b"v", None).unwrap();
                 expected.insert(i);
             } else {
                 let (r, existed) = delete(&mut tx, root, key.as_bytes()).unwrap();
@@ -3788,7 +4403,7 @@ mod delete_invariant_tests {
         let mut root = 0;
         let n = 400u32;
         for i in 0..n {
-            root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v").unwrap();
+            root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v", None).unwrap();
         }
         tx.set_root(root);
         tx.commit().unwrap();
@@ -3807,7 +4422,7 @@ mod delete_invariant_tests {
             }
             assert_eq!(root, 0, "el árbol vacío no deja raíz");
             for i in 0..n {
-                root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v").unwrap();
+                root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v", None).unwrap();
             }
             tx.set_root(root);
             tx.commit().unwrap();
@@ -3856,7 +4471,7 @@ mod delete_invariant_tests {
         let mut root = 0;
         let n = 400u32;
         for i in 0..n {
-            root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v").unwrap();
+            root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v", None).unwrap();
         }
         tx.set_root(root);
         tx.commit().unwrap();
@@ -3885,7 +4500,7 @@ mod delete_invariant_tests {
             let mut tx = db.begin_write().unwrap();
             let mut root = 0;
             for i in 0..n {
-                root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v").unwrap();
+                root = put(&mut tx, root, alloc::format!("k/{i:05}").as_bytes(), b"v", None).unwrap();
             }
             tx.set_root(root);
             tx.commit().unwrap();
@@ -3933,7 +4548,7 @@ mod delete_invariant_tests {
         let mut tx = db.begin_write().unwrap();
         let mut root = 0;
         for i in 0..n {
-            root = put(&mut tx, root, &key_for(i), b"v").unwrap();
+            root = put(&mut tx, root, &key_for(i), b"v", None).unwrap();
         }
 
         // Profundidad máxima sobre una muestra de hasta 200 claves vivas,
@@ -3962,7 +4577,7 @@ mod delete_invariant_tests {
             let victim = live.swap_remove(idx);
             let (r, existed) = delete(&mut tx, root, &key_for(victim)).unwrap();
             assert!(existed, "clave {victim}");
-            root = put(&mut tx, r, &key_for(newest), b"v").unwrap();
+            root = put(&mut tx, r, &key_for(newest), b"v", None).unwrap();
             live.push(newest);
         }
 
@@ -4012,7 +4627,7 @@ mod overflow_tests {
         let db = db();
         let mut tx = db.begin_write().unwrap();
         let big: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
-        let root = put(&mut tx, 0, b"grande", &big).unwrap();
+        let root = put(&mut tx, 0, b"grande", &big, None).unwrap();
         assert_eq!(get(&tx, root, b"grande").unwrap().unwrap(), big);
     }
 
@@ -4020,7 +4635,7 @@ mod overflow_tests {
     fn an_empty_value_is_not_treated_as_overflow() {
         let db = db();
         let mut tx = db.begin_write().unwrap();
-        let root = put(&mut tx, 0, b"vacio", b"").unwrap();
+        let root = put(&mut tx, 0, b"vacio", b"", None).unwrap();
         assert_eq!(get(&tx, root, b"vacio").unwrap().as_deref(), Some(b"".as_slice()));
     }
 
@@ -4029,9 +4644,9 @@ mod overflow_tests {
         let db = db();
         let mut tx = db.begin_write().unwrap();
         let big = alloc::vec![7u8; 5000];
-        let root = put(&mut tx, 0, b"k", &big).unwrap();
+        let root = put(&mut tx, 0, b"k", &big, None).unwrap();
         let before = tx.pages_in_use();
-        let root = put(&mut tx, root, b"k", b"pequeno").unwrap();
+        let root = put(&mut tx, root, b"k", b"pequeno", None).unwrap();
         assert!(tx.pages_in_use() < before, "la cadena antigua se libera");
         assert_eq!(get(&tx, root, b"k").unwrap().as_deref(), Some(b"pequeno".as_slice()));
     }
@@ -4041,7 +4656,7 @@ mod overflow_tests {
         let db = db();
         let mut tx = db.begin_write().unwrap();
         let big = alloc::vec![7u8; 20_000];
-        let root = put(&mut tx, 0, b"k", &big).unwrap();
+        let root = put(&mut tx, 0, b"k", &big, None).unwrap();
         let before = tx.pages_in_use();
         let (root, _) = delete(&mut tx, root, b"k").unwrap();
         assert_eq!(root, 0);
@@ -4062,17 +4677,17 @@ mod overflow_tests {
         let baseline = tx.pages_in_use();
 
         let big1 = alloc::vec![1u8; 5000];
-        let root = put(&mut tx, 0, b"k", &big1).unwrap();
+        let root = put(&mut tx, 0, b"k", &big1, None).unwrap();
         let after_big1 = tx.pages_in_use();
         assert!(after_big1 > baseline, "la cadena de overflow de big1 debe consumir páginas");
 
-        let root = put(&mut tx, root, b"k", b"pequeno").unwrap();
+        let root = put(&mut tx, root, b"k", b"pequeno", None).unwrap();
         assert_eq!(get(&tx, root, b"k").unwrap().as_deref(), Some(b"pequeno".as_slice()));
         let after_small = tx.pages_in_use();
         assert!(after_small < after_big1, "la cadena de big1 debe liberarse al reemplazarlo");
 
         let big2 = alloc::vec![2u8; 9000];
-        let root = put(&mut tx, root, b"k", &big2).unwrap();
+        let root = put(&mut tx, root, b"k", &big2, None).unwrap();
         assert_eq!(get(&tx, root, b"k").unwrap().unwrap(), big2);
         let after_big2 = tx.pages_in_use();
         assert!(after_big2 > after_small, "la nueva cadena grande debe consumir páginas");
@@ -4102,7 +4717,7 @@ mod overflow_tests {
         let values: Vec<Vec<u8>> =
             (0..keys.len()).map(|i| alloc::vec![(i + 1) as u8; 3000]).collect();
         for (k, v) in keys.iter().zip(values.iter()) {
-            root = put(&mut tx, root, k, v).unwrap();
+            root = put(&mut tx, root, k, v, None).unwrap();
         }
         for (k, v) in keys.iter().zip(values.iter()) {
             assert_eq!(get(&tx, root, k).unwrap().as_deref(), Some(v.as_slice()));
@@ -4141,13 +4756,13 @@ mod overflow_tests {
         let mut tx = db.begin_write().unwrap();
         let baseline = tx.pages_in_use();
         let at_threshold = alloc::vec![9u8; 128];
-        let root = put(&mut tx, 0, b"k", &at_threshold).unwrap();
+        let root = put(&mut tx, 0, b"k", &at_threshold, None).unwrap();
         assert_eq!(get(&tx, root, b"k").unwrap().as_deref(), Some(at_threshold.as_slice()));
         let pages_inline = tx.pages_in_use();
         assert_eq!(pages_inline, baseline + 1, "128 bytes en línea: solo la página de la hoja");
 
         let over_threshold = alloc::vec![9u8; 129];
-        let root = put(&mut tx, root, b"k", &over_threshold).unwrap();
+        let root = put(&mut tx, root, b"k", &over_threshold, None).unwrap();
         assert_eq!(get(&tx, root, b"k").unwrap().unwrap(), over_threshold);
         let pages_overflow = tx.pages_in_use();
         assert!(
@@ -4164,7 +4779,7 @@ mod overflow_tests {
         let mut tx = db.begin_write().unwrap();
         let baseline = tx.pages_in_use();
         let under = alloc::vec![9u8; 127];
-        let root = put(&mut tx, 0, b"k", &under).unwrap();
+        let root = put(&mut tx, 0, b"k", &under, None).unwrap();
         assert_eq!(get(&tx, root, b"k").unwrap().as_deref(), Some(under.as_slice()));
         assert_eq!(tx.pages_in_use(), baseline + 1, "127 bytes en línea: solo la página de la hoja");
     }
@@ -5524,7 +6139,7 @@ mod range_accounting_tests {
         let mut root = 0;
         let n = 300u32;
         for i in 0..n {
-            root = put(&mut tx, root, &key_for(i), b"v").unwrap();
+            root = put(&mut tx, root, &key_for(i), b"v", None).unwrap();
         }
         tx.set_root(root);
 
@@ -5547,7 +6162,7 @@ mod range_accounting_tests {
             tx.set_root(r);
             let newest = n + step;
             let cur_root = tx.root();
-            let r = put(&mut tx, cur_root, &key_for(newest), b"v").unwrap();
+            let r = put(&mut tx, cur_root, &key_for(newest), b"v", None).unwrap();
             tx.set_root(r);
             live.push(newest);
 

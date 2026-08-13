@@ -1995,7 +1995,27 @@ impl<'db> WriteTxn<'db> {
     /// sin ser `pub`.
     pub(crate) fn put_raw(&mut self, ns: u8, key: &[u8], value: &[u8]) -> Result<()> {
         let full = scoped(ns, key);
-        let root = crate::tree::put(self, self.meta.root, &full, value)?;
+        // La cota de anexado del árbol (ver `tree::put`): el byte siguiente a
+        // `ns`, solo. `scoped` antepone `ns`, así que toda clave de ESTE
+        // espacio es `[ns] ++ algo` —estrictamente menor que `[ns + 1]`— y
+        // toda clave de un espacio superior empieza por un byte `>= ns + 1`,
+        // luego es mayor o igual que él. Es la traducción exacta de "el mayor
+        // de su espacio" al único vocabulario que `tree.rs` tiene, que es el
+        // de claves opacas ordenadas.
+        //
+        // `checked_add` y no `+ 1`: para `ns == 0xff` no existe cota (ninguna
+        // cadena de bytes es mayor que todas las que empiezan por `0xff`), y
+        // `None` es justo lo que `tree::put` entiende por "sin región", que
+        // para el espacio más alto es además la respuesta correcta — sus
+        // claves sí son las mayores del árbol.
+        let upper: Option<[u8; 1]> = ns.checked_add(1).map(|next| [next]);
+        let root = crate::tree::put(
+            self,
+            self.meta.root,
+            &full,
+            value,
+            upper.as_ref().map(|b| b.as_slice()),
+        )?;
         self.meta.root = root;
         Ok(())
     }

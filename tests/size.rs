@@ -146,11 +146,20 @@ fn synthetic_log(i: u32) -> (Vec<u8>, Vec<u8>) {
 /// Escribe `n` registros sintéticos en `path` en lotes de `batch`, como el
 /// escritor agrupado del edge.
 fn write_synthetic_log(db: &Db, n: u32, batch: usize) {
+    write_synthetic_log_in(db, n, batch, 0x01);
+}
+
+/// Igual, pero eligiendo el espacio de claves. Lo necesita
+/// `a_row_in_a_higher_namespace_does_not_double_the_file`, que compara la
+/// misma carga escrita con y sin algo por encima de ella: el espacio ya no es
+/// un detalle sin consecuencias del banco, es una de las dos variables que
+/// deciden el tamaño del fichero (ver `tree::SplitBias`).
+fn write_synthetic_log_in(db: &Db, n: u32, batch: usize, ns: u8) {
     for chunk in (0..n).collect::<Vec<_>>().chunks(batch) {
         let mut tx = db.begin_write().unwrap();
         for &i in chunk {
             let (k, v) = synthetic_log(i);
-            tx.put(0x01, &k, &v).unwrap();
+            tx.put(ns, &k, &v).unwrap();
         }
         tx.commit().unwrap();
     }
@@ -287,6 +296,92 @@ fn bytes_per_entry_reacts_to_shuffled_insertion_order() {
          barajado {shuf_per_entry:.2} B/entrada) — el orden de inserción no está moviendo la \
          medición de forma sustancial, así que `bytes_per_log_entry_stay_under_the_threshold` \
          podría no estar midiendo el llenado real de las páginas"
+    );
+}
+
+/// **La única prueba de este fichero que NO va `#[ignore]`, y el motivo por
+/// el que existe.**
+///
+/// `bytes_per_log_entry_stay_under_the_threshold`, arriba, escribe todos sus
+/// registros en un solo espacio de claves (`0x01`) y nada más en ninguna
+/// parte. Eso la dejaba ciega a la regresión de disco más cara que ha tenido
+/// este motor: el motor antepone el byte del espacio a cada clave
+/// (`tx::scoped`), así que el orden de los espacios ES el orden del árbol, y
+/// el sesgo de división que baja el crudo a ~34 B/entrada dependía de que la
+/// clave que entra fuera la mayor del ÁRBOL ENTERO. Con UNA sola fila en un
+/// espacio superior —una fila de agregado en `0x02`, una entrada de índice
+/// secundario en `0x80 | id`— ninguna clave del espacio inferior vuelve a
+/// serlo, el sesgo deja de dispararse y el llenado de hoja cae al ~50%.
+/// **Medido antes de la corrección, 200.000 registros y páginas de 4 KB:
+/// 34,98 B/entrada solo, 80,26 B/entrada con una fila en `0x02` — 2,29x, muy
+/// por encima del umbral de 40 que vigila la integración continua, y con
+/// TODOS los bancos en verde.**
+///
+/// Por eso esta prueba mide los DOS ficheros en la misma corrida y compara su
+/// COCIENTE, igual que `bytes_per_entry_reacts_to_shuffled_insertion_order`:
+/// una constante fija convertiría cualquier mejora futura del llenado en un
+/// fallo, mientras que el cociente solo se mueve si las dos disposiciones
+/// dejan de costar lo mismo, que es justo la propiedad que hay que defender.
+///
+/// **No lleva `#[ignore]`, a diferencia de las cuatro de arriba**: está
+/// dimensionada para caber en modo `debug`, que es el que usan los cinco
+/// comandos de verificación de este proyecto y las cuatro invocaciones de
+/// `cargo test` de la etapa `test`. Ponerla en la etapa `bench` la habría
+/// dejado corriendo una sola vez, después de la etapa que de verdad cierra el
+/// paso a una fusión — y el defecto que vigila se introduce escribiendo en un
+/// espacio de claves nuevo, algo que puede pasar en cualquier commit.
+/// 6.000 registros bastan, y está comprobado que bastan en vez de supuesto:
+/// con la corrección revertida esta prueba mide un cociente de **1,868**
+/// contra el umbral de 1,15 (51,88 → 96,94 B/entrada), así que discrimina con
+/// margen de sobra. Cuestan 4,5 s en modo `debug`, que es lo que la deja
+/// caber en los cinco comandos de verificación.
+#[test]
+fn a_row_in_a_higher_namespace_does_not_double_the_file() {
+    const N: u32 = 6_000;
+
+    /// Escribe `N` registros en `raw_ns` y devuelve los bytes por entrada.
+    /// Si `higher`, planta antes UNA entrada en un espacio POR ENCIMA de
+    /// `raw_ns` — una sola, para aislar el efecto sobre la política de
+    /// división del volumen de lo que se guarde ahí.
+    fn per_entry(path: &std::path::Path, raw_ns: u8, higher: bool) -> f64 {
+        let _ = std::fs::remove_file(path);
+        let db = Db::create(
+            Box::new(FileStorage::open(path).unwrap()),
+            Options { page_size: 4096, sync: Sync::Never, ..Options::default() },
+        )
+        .unwrap();
+        if higher {
+            let mut tx = db.begin_write().unwrap();
+            tx.put(raw_ns + 1, b"", b"una fila cualquiera").unwrap();
+            tx.commit().unwrap();
+        }
+        write_synthetic_log_in(&db, N, 1000, raw_ns);
+        drop(db);
+        let size = std::fs::metadata(path).unwrap().len();
+        let _ = std::fs::remove_file(path);
+        size as f64 / N as f64
+    }
+
+    let solo = per_entry(&std::env::temp_dir().join("inro-ns-solo.inro"), 0x01, false);
+    let con_fila = per_entry(&std::env::temp_dir().join("inro-ns-fila.inro"), 0x01, true);
+    println!("inro (crudo en 0x01, sin nada encima): {solo:.2} B/entrada");
+    println!("inro (crudo en 0x01, UNA fila en 0x02): {con_fila:.2} B/entrada");
+
+    // 1,15 y no 1,00: desgajar el bloque que queda por encima de la cota
+    // cuesta UNA hoja por frontera (ver `tree::SplitBias`), más el commit
+    // extra de plantar la fila. Medido tras la corrección: 34,98 contra 35,16
+    // B/entrada a 200.000 registros (cociente 1,005) y 51,88 contra 53,25 a
+    // los 6.000 de aquí (1,026 — a este volumen la holgura fija del fichero
+    // pesa más y el cociente se mueve algo en las dos direcciones). El margen
+    // deja sitio de sobra a esa constante sin dejar pasar nada que se parezca
+    // a perder el sesgo, que costaba 1,868 en esta misma prueba.
+    let ratio = con_fila / solo;
+    assert!(
+        ratio <= 1.15,
+        "una sola fila en el espacio 0x02 encarece el crudo de 0x01 de {solo:.2} a \
+         {con_fila:.2} B/entrada (cociente {ratio:.3}): el espacio inferior ha perdido su \
+         sesgo de anexado por existir algo por encima. Ver `tree::SplitBias` y la cota \
+         `upper` que `WriteTxn::put_raw` le pasa"
     );
 }
 

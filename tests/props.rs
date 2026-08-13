@@ -274,6 +274,86 @@ proptest! {
             );
         }
     }
+
+    /// **Propiedad añadida con la cota de anexado por región**
+    /// (`tree::SplitBias`, `WriteTxn::put_raw`): las cuatro propiedades de
+    /// arriba escriben TODAS en un solo espacio de claves, `0x01`, y ese es
+    /// exactamente el punto ciego que dejó pasar la regresión de disco de
+    /// 2,29x — el sesgo de división depende de qué haya por ENCIMA de la
+    /// clave que entra, y con un solo espacio nunca hay nada.
+    ///
+    /// Aquí cada operación elige además su espacio entre tres, de modo que
+    /// las tres regiones crecen entrelazadas y cada una tiene, en todo
+    /// momento, otra por encima y otra por debajo. Los espacios son `0x01`
+    /// (crudo), `0x02` (el de los agregados) y `0x7f` (el que recomendaba el
+    /// apaño): cubren la cota inferior, una intermedia y la superior de los
+    /// espacios de usuario.
+    ///
+    /// El oráculo es un `BTreeMap` con la clave YA prefijada por su espacio
+    /// —la misma transformación que `tx::scoped` hace por dentro— así que
+    /// compara el árbol entero contra el orden total real, no cada región por
+    /// su lado: si una división mezclara claves de dos regiones o perdiera un
+    /// separador entre ellas, el recorrido de la región afectada dejaría de
+    /// coincidir.
+    #[test]
+    fn three_namespaces_growing_at_once_always_match_a_btreemap(
+        ops in proptest::collection::vec((0usize..3, op_strategy()), 1..300)
+    ) {
+        const SPACES: [u8; 3] = [0x01, 0x02, 0x7f];
+        let db = Db::create(Box::new(MemStorage::new()), Options::default()).unwrap();
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        for (which, op) in &ops {
+            let ns = SPACES[*which];
+            let mut tx = db.begin_write().unwrap();
+            match op {
+                Op::Put(k, v) => tx.put(ns, k, v).unwrap(),
+                Op::Delete(k) => { tx.delete(ns, k).unwrap(); }
+                Op::DeleteRange(a, b) => tx.delete_range(ns, a, b).unwrap(),
+            }
+            tx.commit().unwrap();
+
+            // El modelo guarda `[ns] ++ clave`, igual que el árbol.
+            let scoped = |k: &[u8]| -> Vec<u8> {
+                let mut s = std::vec![ns];
+                s.extend_from_slice(k);
+                s
+            };
+            match op {
+                Op::Put(k, v) => { model.insert(scoped(k), v.clone()); }
+                Op::Delete(k) => { model.remove(&scoped(k)); }
+                Op::DeleteRange(a, b) => {
+                    let doomed: Vec<_> =
+                        model.range(scoped(a)..scoped(b)).map(|(k, _)| k.clone()).collect();
+                    for k in doomed {
+                        model.remove(&k);
+                    }
+                }
+            }
+
+            // Cada región se recorre entera y por separado; juntas tienen que
+            // dar el modelo completo, sin que ninguna se lleve claves de otra.
+            let r = db.begin_read();
+            let mut actual: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            for space in SPACES {
+                let mut cursor = r.scan(space, b"", &[0xffu8; 8]).unwrap();
+                while let Some((k, v)) = cursor.next().unwrap() {
+                    let mut full = std::vec![space];
+                    full.extend_from_slice(&k);
+                    actual.push((full, v));
+                }
+            }
+            let expected: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            prop_assert_eq!(actual, expected, "divergencia tras {:?} en 0x{:02x}", op, ns);
+
+            prop_assert!(
+                db.audit_pages().unwrap(),
+                "pagina perdida o contada dos veces tras {:?} en 0x{:02x}",
+                op,
+                ns
+            );
+        }
+    }
 }
 
 proptest! {
