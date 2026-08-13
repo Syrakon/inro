@@ -47,22 +47,24 @@
 //!   (la sección 12.4 de la especificación ya documenta que un commit por
 //!   fila cuesta bastante más).
 //!
-//!   **Medido: 67,72 bytes por entrada — supera el umbral de 40, y la
-//!   prueba falla de verdad, a propósito.** No se subió el umbral para que
-//!   pasara (ver el contexto de la tarea 21: "si el número medido supera
-//!   40, no se ajusta el umbral"). El informe de la tarea 21 explica dónde
-//!   van los bytes: el cálculo de la especificación (34-38 B, sección
-//!   12.2) es sobre el payload LÓGICO — clave más valor, con compresión de
-//!   prefijo y sin códigos de tipo — asumiendo páginas casi llenas; el
-//!   llenado real de una hoja construida por inserciones incrementales con
-//!   partición por el punto medio (`tree.rs`, sin ningún camino de carga
-//!   masiva en la fase 1) ronda un 50%, no un 100%, así que el cociente en
-//!   disco dobla al lógico. Que de verdad mide bytes en disco y no una
-//!   cifra calculada sobre los registros se demuestra en
+//!   **Medido: 34,14 bytes por entrada, por debajo del umbral de 40.** No
+//!   siempre lo estuvo, y la historia importa: la primera medición de este
+//!   banco (tarea 21) dio 67,72 B/entrada y la prueba fallaba a propósito,
+//!   sin subir el umbral para taparlo ("si el número medido supera 40, no
+//!   se ajusta el umbral"). El hueco era el llenado real de página: el
+//!   cálculo de la especificación (34-38 B, sección 12.2) es sobre el
+//!   payload LÓGICO — clave más valor, con compresión de prefijo y sin
+//!   códigos de tipo — asumiendo páginas casi llenas, mientras que una hoja
+//!   construida por inserciones ascendentes con partición por el punto
+//!   medio se congelaba al 49,5% de llenado medio. Lo cerró `SplitBias`
+//!   (`tree.rs`): partir sesgado al anexar cuando la clave que entra es la
+//!   mayor del árbol, que sube el llenado medio de hoja al 99,5%. Que de
+//!   verdad mide bytes en disco y no una cifra calculada sobre los
+//!   registros se demuestra en
 //!   `bytes_per_entry_reacts_to_shuffled_insertion_order`, más abajo:
 //!   cambiar SOLO el orden de inserción (mismo volumen, mismo lote, mismos
-//!   registros) mueve el cociente medido un 44% — si no se moviera, esta
-//!   prueba no estaría midiendo el llenado real de las páginas.
+//!   registros) multiplica el cociente medido por 8,16 — si no se moviera,
+//!   esta prueba no estaría midiendo el llenado real de las páginas.
 //! - `pruning_a_days_worth_is_orders_of_magnitude_cheaper_than_a_scan` mide
 //!   páginas LEÍDAS por el `Pager` durante un `delete_range` que descarta
 //!   la mitad más vieja de las entradas, contra páginas liberadas. No mide
@@ -219,13 +221,16 @@ fn size_per_entry_for_order(path: &std::path::Path, order: &[u32]) -> f64 {
 /// de lote y los mismos registros que `synthetic_log`. **Construye los DOS
 /// órdenes dentro de esta misma prueba** y compara su COCIENTE, en vez de
 /// fijar el resultado secuencial como una constante de otra corrida:
-/// codificar el número secuencial de hoy (~69 B/entrada) como umbral fijo
-/// convertiría un arreglo futuro del llenado de página (que baje ESE
-/// número) en un fallo de esta prueba de control con el mensaje "la
-/// medición no está reaccionando al orden" — exactamente lo contrario de lo
-/// que debe reportar una mejora real. El cociente entre los dos, medidos en
-/// la misma corrida, no tiene ese problema: se mueve con cualquier cambio
-/// real de llenado, en cualquier dirección.
+/// codificar el número secuencial del día como umbral fijo convertiría un
+/// arreglo futuro del llenado de página (que baje ESE número) en un fallo
+/// de esta prueba de control con el mensaje "la medición no está
+/// reaccionando al orden" — exactamente lo contrario de lo que debe
+/// reportar una mejora real. Y no es hipotético: la llegada de
+/// `SplitBias::Append` (`tree.rs`) bajó el lado secuencial de 82,00 a
+/// 49,50 B/entrada sin mover el barajado ni un byte, que es justo el caso
+/// que un umbral fijo habría reportado como avería. El cociente entre los
+/// dos, medidos en la misma corrida, no tiene ese problema: se mueve con
+/// cualquier cambio real de llenado, en cualquier dirección.
 ///
 /// **La hipótesis inicial de quien escribió este banco era la contraria a
 /// lo medido** — que la inserción ascendente de `synthetic_log` (con `ts`
@@ -234,13 +239,17 @@ fn size_per_entry_for_order(path: &std::path::Path, order: &[u32]) -> f64 {
 /// junto a `Split`: "...deja la mitad izquierda llena y la derecha
 /// con...") y con inserción estrictamente ascendente la mitad izquierda de
 /// cada partición queda congelada para siempre, sin que ningún `put`
-/// futuro caiga ya en ese rango. Medido, ES AL REVÉS: a igual `N`,
-/// secuencial da ~69 B/entrada, barajado ~99 — un 44% peor, no mejor. El
-/// mecanismo exacto queda sin aislar (candidatos: la compresión de prefijo
-/// aprovecha mucho mejor un `ts` que crece por pasos pequeños que una
-/// dispersión uniforme sobre todo el rango, o el patrón de escritura
-/// simultánea a hojas muy separadas del árbol interactúa peor con la
-/// política de partición) — lo que sí está confirmado, y es lo único que
+/// futuro caiga ya en ese rango. Medido, ES AL REVÉS, y por un margen que
+/// no deja lugar a dudas: a igual `N`, secuencial da 49,50 B/entrada y
+/// barajado 404,00 — 8,16 veces peor, no mejor. (Antes de que
+/// `SplitBias::Append` corrigiera la patología ascendente eran 82,00 y
+/// 404,00, cociente 4,93: el sesgo al anexar mejoró el lado secuencial y
+/// dejó el barajado intacto, que es exactamente lo que promete.) El
+/// mecanismo del lado barajado queda sin aislar (candidatos: la compresión
+/// de prefijo aprovecha mucho mejor un `ts` que crece por pasos pequeños
+/// que una dispersión uniforme sobre todo el rango, o el patrón de
+/// escritura simultánea a hojas muy separadas del árbol interactúa peor con
+/// la política de partición) — lo que sí está confirmado, y es lo único que
 /// esta prueba necesita establecer, es que el cociente medido REACCIONA al
 /// orden de inserción: si no reaccionara, la prueba de arriba no estaría
 /// midiendo el llenado real de las páginas en absoluto, sino algún
@@ -265,12 +274,12 @@ fn bytes_per_entry_reacts_to_shuffled_insertion_order() {
     println!("inro (barajado,   N={N}): {shuf_per_entry:.2} B/entrada");
 
     // Cociente, no una constante fija: cualquier lado puede moverse en el
-    // futuro (por ejemplo, un `emit` sesgado a anexar que suba el
-    // secuencial hacia ~99% de llenado — ver la sección 12.2 de la
-    // especificación sobre el camino identificado, no implementado). Lo
-    // único que esta prueba necesita es que los dos números difieran de
-    // forma sustancial — un 10% de margen sobre 1.0 en cualquier
-    // dirección — no que el secuencial gane ni que valga ~69.
+    // futuro, y ya se movió — el `emit` sesgado a anexar (`SplitBias`,
+    // `tree.rs`) subió el llenado secuencial al 99,5% y bajó ese lado de
+    // 82,00 a 49,50 B/entrada. Lo único que esta prueba necesita es que los
+    // dos números difieran de forma sustancial — un 10% de margen sobre 1.0
+    // en cualquier dirección — no que el secuencial gane ni que valga una
+    // cifra concreta.
     let ratio = shuf_per_entry / seq_per_entry;
     assert!(
         !(0.9..=1.1).contains(&ratio),
