@@ -733,10 +733,22 @@ Dos casos merecen mención aparte:
 
 - **La comparativa con SQLite se invierte.** El diseño concluye que «SQLite
   gana en tamaño de fichero» con 56,06 B/fila frente a 67,72. Con 34,14 la
-  conclusión se da la vuelta. **Aviso: el lado de SQLite no se ha vuelto a
-  medir** — el banco comparativo imprime pero no fija ningún umbral, así que
-  los 56,06 vienen de una corrida anterior. La comparación necesita volver a
-  ejecutarse entera antes de publicar la conclusión nueva.
+  conclusión se da la vuelta, y **la comparativa se volvió a ejecutar ENTERA
+  después del cambio**: los dos lados salen de la misma corrida de
+  `compare_against_sqlite_on_the_same_workload`, con la que ambos motores
+  escriben el mismo millón de registros a `page_size` 4096:
+
+  ```
+  inro:   34136064 bytes (34.14 B/entrada), poda 3.971431ms
+  sqlite: 56057856 bytes = 55992320 main + 0 wal + 65536 shm (56.06 B/entrada),
+          poda 235.133382ms
+  ```
+
+  Es decir 1,64× menos disco y 59× menos tiempo de poda. La cifra de SQLite no
+  cambió al rehacerla porque nada del lado de SQLite se tocó; lo que cambió fue
+  el lado de inro. La poda no es comparable de tú a tú: `delete_range` libera
+  subárboles sin leer las hojas, mientras SQLite ejecuta un `DELETE` con índice
+  y WAL.
 - **El control de orden de inserción.** El diseño dice que cambiar el orden
   mueve el cociente «de ~69 a ~99 bytes, un 44 %». Los valores actuales son
   **49,50 secuencial y 404,00 barajado, cociente 8,16**.

@@ -811,7 +811,7 @@ Para saber si un número que estás mirando es normal:
 
 | | |
 |---|---|
-| Bytes por entrada, un millón de registros, páginas de 4 KB | **34,14** (SQLite, misma carga: 56,06 — pero ese lado no se ha vuelto a medir) |
+| Bytes por entrada, un millón de registros, páginas de 4 KB | **34,14** (SQLite, misma carga y misma corrida: 56,06 — 1,64× más) |
 | `get` puntual | **6,12 µs** |
 | Recorrido completo, 300 000 entradas | **0,064 s** |
 | Lecturas de `Db::open` | **4, sea cual sea el tamaño de la base** — cabecera, dos metas y la cabeza de la cadena de libres. La prueba fija `<= 4` y exige el mismo número con 500 y con 200 000 entradas |
@@ -835,7 +835,6 @@ línea base de una alerta hasta medirlas**:
   el **proceso entero**, con los dos motores de la comparativa corriendo uno
   después del otro, y el propio documento de diseño lo marca como «sin medir»
   por motor. Medirlo de verdad exigiría un proceso por motor.
-- **Los 56,06 B/fila de SQLite.** Vienen de una corrida anterior. El banco
-  comparativo actual imprime pero no fija ningún umbral, y el lado de inro
-  cambió (67,72 → 34,14) sin que el de SQLite se volviera a medir. La
-  comparación entera necesita volver a ejecutarse antes de citarse.
+*(Los 56,06 B/fila de SQLite figuraban aquí como no verificados. Ya no lo son:
+la comparativa se reejecutó entera después del cambio a 34,14 y los dos lados
+salen de la misma corrida. Ver `formato-en-disco.md`, §12.)*

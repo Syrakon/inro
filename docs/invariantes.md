@@ -943,27 +943,45 @@ donde salen los incidentes.
 Cosas que parecen mejoras y destruyen datos. Ninguna es hipotética: las cuatro
 están hoy en el código, esperando a alguien con buenas intenciones.
 
-### `cargo clippy --fix` DESTRUYE TODAS LAS BASES DE LA FLOTA
+### El aviso de clippy sobre `FileStorage::open` propone vaciar la base
 
 `FileStorage::open` usa `.read(true).write(true).create(true)`. Clippy lo marca
-con `suspicious_open_options` y **su sugerencia es aplicable a máquina**:
+con `suspicious_open_options`, y **la PRIMERA de las tres alternativas que
+ofrece es la destructiva**:
 
 ```
-462 |                 .create(true)
-    |                  ^^^^^^^^^^^^- help: add: `.truncate(true)`
+= help: if you intend to overwrite an existing file entirely, call `.truncate(true)`
+= help: if you instead know that you may want to keep some parts of the old file, call `.truncate(false)`
+= help: alternatively, use `.append(true)` to append to the file instead of overwriting it
 ```
-
-El propio resumen de clippy invita a ello: *«run `cargo clippy --fix --lib -p
-inro` to apply 1 suggestion»*.
 
 **`.truncate(true)` haría que ABRIR una base la vaciase a cero bytes.** Todas
-las bases, en cada apertura, sin ningún error. Pérdida total, aplicada por una
-herramienta automática, en un motor donde hay un fichero por cliente.
+las bases, en cada apertura, sin ningún error. Pérdida total en un motor donde
+hay un fichero por cliente.
+
+**Precisión importante, comprobada y no deducida del texto del aviso:** esta
+sugerencia NO es aplicable a máquina, así que `cargo clippy --fix` **no** la
+aplica. Verificado con `cargo clippy --lib --message-format=json`:
+
+```
+clippy::new_without_default     | MachineApplicable | impl Default for MemStorage
+clippy::suspicious_open_options | MaybeIncorrect    | .truncate(true)
+```
+
+`cargo fix` solo aplica las `MachineApplicable`, así que la única que tocaría
+es el `impl Default` de `MemStorage`, que es inofensivo. El *«run `cargo clippy
+--fix --lib -p inro` to apply 1 suggestion»* del resumen se refiere a ESA, no a
+esta.
+
+El peligro, por tanto, no es la herramienta: es **la persona**. Quien limpie
+avisos a mano leerá tres alternativas y la primera —la que la redacción de
+clippy presenta como el caso normal— destruye la flota. Ese es el escenario
+realista, y es suficiente motivo para dejarlo escrito aquí.
 
 La corrección buena, si algún día se quiere silenciar el aviso, es
 `.truncate(false)` **explícito** — que es lo que el código ya hace de forma
-implícita. Nunca `--fix` a ciegas sobre este aviso. Es uno de los cuatro
-hallazgos de clippy adjudicados y conscientemente no suprimidos con `#[allow]`.
+implícita. Es uno de los cuatro hallazgos de clippy adjudicados y
+conscientemente no suprimidos con `#[allow]`.
 
 ### Los `.expect("validado en parse")` no son descuido
 
