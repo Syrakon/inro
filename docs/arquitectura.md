@@ -173,8 +173,13 @@ de la próxima apertura las recupera.
 Medido: abrir cuesta **4 lecturas del medio, sea cual sea el tamaño de la
 base** — cabecera, las dos metas y, si hay cadena de libres, su cabeza (la
 prueba fija `<= 4` y compara 500 contra 200 000 entradas exigiendo el mismo
-número). Una base recién creada ocupa menos de 2 KB; un asa abierta y ociosa
-ronda **2 KB de RSS**, y unos **10 KB** tras usarse.
+número). Una base recién creada ocupa menos de 2 KB.
+
+Se citan además unos 2 KB de RSS por asa abierta y ociosa y unos 10 KB tras
+usarse. **Sin verificar en este repositorio**: la RAM por base abierta no tiene
+ninguna medición aislada aquí, y el único banco que toca RSS mide el proceso
+entero, no un asa (ver §17.1 del documento de diseño, que lo dice con esas
+palabras). Trátalos como órdenes de magnitud, no como cifras medidas.
 
 ---
 

@@ -748,8 +748,8 @@ Para saber si un número que estás mirando es normal:
 | `get` puntual | **6,12 µs** |
 | Recorrido completo, 300 000 entradas | **0,064 s** |
 | Lecturas de `Db::open` | **4, sea cual sea el tamaño de la base** — cabecera, dos metas y la cabeza de la cadena de libres. La prueba fija `<= 4` y exige el mismo número con 500 y con 200 000 entradas |
-| RSS por asa abierta y ociosa | ~**2 KB** |
-| RSS por asa tras usarse | ~**10 KB** |
+| RSS por asa abierta y ociosa | ~2 KB — **SIN VERIFICAR aquí** (ver abajo) |
+| RSS por asa tras usarse | ~10 KB — **SIN VERIFICAR aquí** (ver abajo) |
 | Base recién creada | < **2 KB** (3 páginas de 512 B) |
 | Sobrecoste de `Sync::Never` frente a `Commit` | 84 páginas frente a 24; 23 % más escrituras; **31× menos `fsync`** |
 
@@ -757,3 +757,18 @@ Si el fichero de un cliente es mucho más grande de lo que estas cifras
 justifican, sospecha, en este orden: un lector de larga duración que bloquea el
 reciclado, índices mantenidos sin declarar (§7.2), o una lista de libres
 perdida (§6.3).
+
+### Dos cifras que NO están verificadas en este repositorio
+
+Se citan de todos modos porque son las que circulan, pero **no las uses como
+línea base de una alerta hasta medirlas**:
+
+- **RSS por asa abierta** (~2 KB ociosa, ~10 KB tras usarse). No existe ninguna
+  medición aislada de la RAM por base abierta: el único banco que toca RSS mide
+  el **proceso entero**, con los dos motores de la comparativa corriendo uno
+  después del otro, y el propio documento de diseño lo marca como «sin medir»
+  por motor. Medirlo de verdad exigiría un proceso por motor.
+- **Los 56,06 B/fila de SQLite.** Vienen de una corrida anterior. El banco
+  comparativo actual imprime pero no fija ningún umbral, y el lado de inro
+  cambió (67,72 → 34,14) sin que el de SQLite se volviera a medir. La
+  comparación entera necesita volver a ejecutarse antes de citarse.
