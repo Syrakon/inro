@@ -932,4 +932,57 @@ donde salen los incidentes.
 | **Compactación** | `reclaim_tail` recorta la **cola**; no mueve páginas vivas hacia abajo. Ver `runbook.md` |
 | **Fusión de páginas infrautilizadas** | `delete` colapsa nodos de un solo hijo, pero no funde. De ahí la deriva de profundidad de §3 |
 | **`audit_pages` como comprobación de corrección** | Solo comprueba propiedad única de página. Ver `runbook.md` |
+| **Que un `commit` que devolvió `Err` no haya tenido efecto** | Puede haber quedado **duradero**: un desgarro que deposite 152 bytes o más deja la ranura completa. Ver `runbook.md` §2 |
+| **Validación del espacio de claves en `put`/`delete`/`delete_range`** | **No existe.** Nada impide escribir o barrer los espacios reservados (`0x00`, `0x80\|id`). Ver `runbook.md` §7.6 |
 | **Horas de producción** | Cero. El motor tiene días de vida |
+
+---
+
+## 24. Trampas para quien venga a mantener esto
+
+Cosas que parecen mejoras y destruyen datos. Ninguna es hipotética: las cuatro
+están hoy en el código, esperando a alguien con buenas intenciones.
+
+### `cargo clippy --fix` DESTRUYE TODAS LAS BASES DE LA FLOTA
+
+`FileStorage::open` usa `.read(true).write(true).create(true)`. Clippy lo marca
+con `suspicious_open_options` y **su sugerencia es aplicable a máquina**:
+
+```
+462 |                 .create(true)
+    |                  ^^^^^^^^^^^^- help: add: `.truncate(true)`
+```
+
+El propio resumen de clippy invita a ello: *«run `cargo clippy --fix --lib -p
+inro` to apply 1 suggestion»*.
+
+**`.truncate(true)` haría que ABRIR una base la vaciase a cero bytes.** Todas
+las bases, en cada apertura, sin ningún error. Pérdida total, aplicada por una
+herramienta automática, en un motor donde hay un fichero por cliente.
+
+La corrección buena, si algún día se quiere silenciar el aviso, es
+`.truncate(false)` **explícito** — que es lo que el código ya hace de forma
+implícita. Nunca `--fix` a ciegas sobre este aviso. Es uno de los cuatro
+hallazgos de clippy adjudicados y conscientemente no suprimidos con `#[allow]`.
+
+### Los `.expect("validado en parse")` no son descuido
+
+Cada uno está respaldado por la pasada de `PageRef::parse` (§1). Añadir un
+camino que produzca un `PageRef` sin pasar por `parse` los convierte en pánicos
+de producción. Si alguna vez hace falta, el sitio a mirar es `ValidPage`, y el
+constructor `from_validated` debe seguir siendo **privado al módulo**.
+
+### El bit `children_plain` no se puede poner a `true` «por optimizar»
+
+Es una afirmación de certeza, no una pista (§21). Ponerlo sin haber comprobado
+de verdad los hijos hace que `free_subtree` libere subárboles enteros sin
+abrirlos: fuga permanente de páginas y de cadenas de overflow. La lectura
+conservadora por defecto es `false`.
+
+### Leer una meta a través de `Pager::read` rompe el argumento de la caché
+
+Hoy ninguna meta pasa por ahí, y esa es la única razón por la que las
+meta-páginas quedan a salvo de servirse obsoletas (§16). El argumento que
+protege a las páginas de datos —que el escritor nunca reescribe una página que
+un lector vivo pueda estar leyendo— **no cubre las metas**, que se reescriben en
+cada commit.

@@ -34,6 +34,10 @@ diagnóstico debería seguirlo también.
 
 ## 1. Triaje en un minuto
 
+**Antes de empezar, dos reglas que la intuición se salta**: un `commit` que
+devolvió `Err` **puede** haber quedado duradero (§2, última subsección), y
+`audit_pages() == true` **no** significa que la base esté sana (§5).
+
 ```
 ¿Db::open devuelve Ok?
 ├── SÍ, y las lecturas responden bien
@@ -122,6 +126,24 @@ fichero que **él mismo** escribió y nadie tocó.
 secuencia exacta de operaciones y la política de `Sync`, y escalar. Este motor
 tiene un solo autor humano: el fichero vale más que cualquier descripción del
 síntoma.
+
+### Un `commit` que devolvió `Err` PUEDE haber quedado duradero
+
+**No asumas que una transacción fallida no tuvo efecto.** La escritura de la
+meta es siempre la última del commit, y una ranura mide 152 bytes útiles: el
+resto de la página ya es relleno a cero en las dos versiones. Si un desgarro
+deposita un prefijo **igual o mayor que esos 152 bytes**, lo que llega al plato
+es **indistinguible de una escritura completa** — el commit es duradero de
+verdad — y aun así la llamada devuelve `Err`, porque la escritura falló.
+
+Correcto (los bytes llegaron), pero sorprendente para quien solo mire el
+`Result`. Está fijado por su propia prueba:
+`a_torn_write_of_the_meta_page_with_a_prefix_at_or_above_meta_size_lands_a_full_commit_anyway`.
+
+**Consecuencia operativa:** tras un `commit` que devolvió `Err`, **relee** el
+estado antes de decidir nada. Un reintento ciego puede duplicar el efecto de
+una operación que ya se aplicó. La regla «si `commit` falla, la transacción no
+ocurrió» **es falsa en este motor.**
 
 ---
 
@@ -738,6 +760,51 @@ recorte solo se lleva la cola.
 
 ---
 
+### 7.6 No escribir en los espacios de claves reservados — hueco vivo, sin arreglar
+
+**`put`, `delete` y `delete_range` NO validan el `ns`.** Y las defensas de
+índice no llegan aquí, por construcción: `define_index` rechaza `ns == 0x00` y
+`ns >= 0x80`, así que **ningún índice puede estar declarado sobre un espacio
+reservado**, y por tanto ni `refuse_undeclared` ni el rechazo
+`DeleteRangeIndexed` se disparan nunca sobre ellos.
+
+Lo que eso deja abierto:
+
+| Llamada | Efecto |
+|---|---|
+| `delete_range(0x80 \| id, ..)` | **Barre las entradas de un índice entero dejando todas las filas vivas.** Sin error, sin señal |
+| `delete_range(0x00, ..)` | Borra el **catálogo de índices** |
+| `put(0x00, ..)` / `put(0x80 \| id, ..)` | Escribe bytes arbitrarios en el catálogo o en un índice |
+
+Nada de esto es corrupción del árbol —las páginas siguen bien contabilizadas y
+`audit_pages` seguirá diciendo `true`— pero deja el índice mintiendo o el
+catálogo ilegible. El motor tolera la basura al leer (un registro de catálogo
+de menos de 6 bytes se ignora; una entrada de índice mal formada da
+`BadFormat` en vez de panicar), pero no la impide.
+
+**Qué debes garantizar tú:** que tu aplicación use únicamente `ns` de `0x01` a
+`0x7F`. Trátalo como parte del contrato, porque el motor no lo comprueba.
+
+### 7.7 Dos trampas de uso que parecen fallos del motor
+
+**Reintentar sobre un `Cursor` que devolvió `Err` es un bucle infinito.** Todo
+error envenena el cursor de forma permanente — es lo que impide devolver datos
+equivocados tras un fallo transitorio — así que cada `next()` posterior
+devuelve el mismo error para siempre. **Lo único que lo limpia es volver a
+llamar a `seek`**, aceptando perder la posición. Un bucle
+`while let Err(_) = cursor.next() { /* reintentar */ }` no termina nunca.
+
+**`mem::forget` sobre un `ReadTxn` bloquea el reciclado de páginas para
+siempre.** El lector se da de baja en su `Drop`; sin él, su `txn_id` se queda
+como el lector vivo más antiguo durante toda la vida del proceso, y ninguna
+página liberada desde entonces se puede reciclar ni recortar. El fichero crece
+sin cota. Un pánico **sí** ejecuta `Drop` con la configuración actual
+(`panic = unwind`), así que solo el olvido explícito lo provoca — pero si ves
+un fichero que crece y `reclaim_tail` devuelve 0, este es el segundo sitio
+donde mirar, después de un lector legítimamente longevo.
+
+---
+
 ## 8. Cifras de referencia (medidas)
 
 Para saber si un número que estás mirando es normal:
@@ -755,8 +822,8 @@ Para saber si un número que estás mirando es normal:
 
 Si el fichero de un cliente es mucho más grande de lo que estas cifras
 justifican, sospecha, en este orden: un lector de larga duración que bloquea el
-reciclado, índices mantenidos sin declarar (§7.2), o una lista de libres
-perdida (§6.3).
+reciclado (o uno olvidado con `mem::forget`, §7.7), índices mantenidos sin
+declarar (§7.2), o una lista de libres perdida (§6.3).
 
 ### Dos cifras que NO están verificadas en este repositorio
 
