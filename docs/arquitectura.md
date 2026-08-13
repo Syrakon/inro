@@ -2,7 +2,8 @@
 
 Corto a propósito: quien lea esto debería poder retenerlo entero en la cabeza.
 Para los bytes, ver `formato-en-disco.md`; para las reglas, `invariantes.md`;
-para qué hacer cuando algo falla, `runbook.md`.
+para qué hacer cuando algo falla, `runbook.md`; para la capa de agregación
+temporal que vive encima del motor, `agregacion.md`.
 
 `inro` es un motor de clave-valor empotrado con B+tree de **copia al escribir**,
 **un solo escritor** y **lectores sin bloqueos**. Cero dependencias de ejecución
@@ -16,6 +17,9 @@ mantenimiento periódico.
 
 ```
         API pública:  Db · WriteTxn · ReadTxn · Cursor · IndexDef
+                             │
+   rollup/ ────────  agregación temporal: buckets, histograma, top-K
+                     (encima del API pública, tras la feature `rollup`)
                              │
    tx.rs  ─────────  transacciones, commit, lectores, catálogo, auditoría
       │  │  │
@@ -72,6 +76,21 @@ por delante. Hay un único árbol para todo.
 | `0x00` | Catálogo de índices. Clave = `[id]`, valor = registro de `IndexDef` |
 | `0x01`..`0x7F` | Datos del usuario |
 | `0x80 \| id` | Entradas del índice `id` |
+
+`put`/`delete`/`delete_range` **rechazan** `0x00` y `0x80|id` con
+`Error::ReservedNamespace`. El motor escribe ahí por dentro con
+`put_raw`/`delete_raw`, que no pasan por esa comprobación.
+
+**El ORDEN de los espacios es el orden del árbol**, y eso tiene una
+consecuencia que cuesta disco si se ignora: `SplitBias::Append` —la partición
+sesgada al anexar que baja el crudo de un log de 67,72 a 34,14 bytes por
+entrada— solo se dispara cuando la clave que entra es la mayor de TODO el
+árbol. Si hay datos en un espacio POR ENCIMA del que recibe las inserciones
+ascendentes, el sesgo no salta nunca y el llenado de hoja vuelve al ~50%.
+Medido: una sola fila en `0x02` sube el crudo de `0x01` de 39,94 a 84,99
+bytes por entrada, un +112,8% (`tests/rollup_size.rs`). Quien mezcle un log
+creciente con otra cosa en el mismo fichero debe poner el log en el espacio
+más alto de los que use — ver `agregacion.md` §3.
 
 ---
 

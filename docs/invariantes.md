@@ -933,7 +933,7 @@ donde salen los incidentes.
 | **Fusión de páginas infrautilizadas** | `delete` colapsa nodos de un solo hijo, pero no funde. De ahí la deriva de profundidad de §3 |
 | **`audit_pages` como comprobación de corrección** | Solo comprueba propiedad única de página. Ver `runbook.md` |
 | **Que un `commit` que devolvió `Err` no haya tenido efecto** | Puede haber quedado **duradero**: un desgarro que deposite 152 bytes o más deja la ranura completa. Ver `runbook.md` §2 |
-| **Validación del espacio de claves en `put`/`delete`/`delete_range`** | **No existe.** Nada impide escribir o barrer los espacios reservados (`0x00`, `0x80\|id`). Ver `runbook.md` §7.6 |
+| **Validación del espacio de claves más allá de los RESERVADOS** | `put`/`delete`/`delete_range` sí rechazan `0x00` y `0x80\|id` (`Error::ReservedNamespace`) desde el arreglo de esa fuga — esta fila decía «no existe» y se quedó obsoleta con él. Lo que sigue sin existir es cualquier validación de los espacios de USUARIO (`0x01`..`0x7F`): el motor no sabe ni le importa qué significan, así que dos capas que se repartan ese rango se pisan sin que nadie avise. Ver `runbook.md` §7.6 y `agregacion.md` §9 |
 | **Horas de producción** | Cero. El motor tiene días de vida |
 
 ---
