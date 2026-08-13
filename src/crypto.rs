@@ -1790,7 +1790,20 @@ mod tests {
     struct Tear {
         skip: usize,
         prefix: usize,
+        /// Cuántas veces se ha APLAZADO este desgarro porque la escritura
+        /// que le tocaba no cambiaba ni un byte. Ver el aplazamiento en la
+        /// rama de cabecera de `write_at`. Solo sirve de tope: sin él, una
+        /// prueba cuyas escrituras de cabecera fueran TODAS inocuas pasaría
+        /// sin haber desgarrado nada, que es justo el fallo silencioso que
+        /// la guardia existe para impedir.
+        deferred: usize,
     }
+
+    /// Tope de aplazamientos antes de dar por perdido el desgarro. La
+    /// reubicación de meta B escribe espejo y principal, así que dos o tres
+    /// inocuas seguidas son concebibles; ocho ya significa que esta prueba
+    /// no va a desgarrar nunca.
+    const MAX_TEAR_DEFERRALS: usize = 8;
 
     /// Meta A (página 1), meta B en su posición inicial (página 2) y meta B
     /// en su posición final (página 8 con `page_size` de 512 B — misma
@@ -1858,7 +1871,7 @@ mod tests {
         ///
         /// `simulate_power_loss` es el "reinicio" que restaura esa foto.
         fn arm_meta_tear(&self, skip: usize, prefix: usize) {
-            *self.meta_tear.lock().unwrap() = Some(Tear { skip, prefix });
+            *self.meta_tear.lock().unwrap() = Some(Tear { skip, prefix, deferred: 0 });
         }
 
         /// Igual que `arm_meta_tear`, pero para la `skip`-ésima escritura de
@@ -1869,7 +1882,7 @@ mod tests {
         /// escrituras de 512 B (una ranura de meta), nunca las 64 B de una
         /// cabecera.
         fn arm_header_tear(&self, skip: usize, prefix: usize) {
-            *self.header_tear.lock().unwrap() = Some(Tear { skip, prefix });
+            *self.header_tear.lock().unwrap() = Some(Tear { skip, prefix, deferred: 0 });
         }
 
         /// Reinicio tras el corte. Restaura el plato a la foto del instante
@@ -1917,16 +1930,16 @@ mod tests {
 
         /// Igual que `take_meta_tear`, para las dos posiciones de cabecera
         /// (64 B exactos).
-        fn take_header_tear(&self, o: u64, len: usize) -> Option<(usize, usize)> {
+        fn take_header_tear(&self, o: u64, len: usize) -> Option<(usize, usize, usize)> {
             let i = HEADER_OFFSETS
                 .iter()
                 .position(|&m| m == o && len == crate::header::HEADER_SIZE)?;
             let mut tear = self.header_tear.lock().unwrap();
             match tear.as_mut() {
                 Some(t) if t.skip == 0 => {
-                    let prefix = t.prefix;
+                    let (prefix, deferred) = (t.prefix, t.deferred);
                     *tear = None;
-                    Some((i, prefix))
+                    Some((i, prefix, deferred))
                 }
                 Some(t) => {
                     t.skip -= 1;
@@ -1990,39 +2003,60 @@ mod tests {
                 return Ok(());
             }
 
-            if let Some((i, prefix)) = self.take_header_tear(o, b.len()) {
+            if let Some((i, prefix, deferred)) = self.take_header_tear(o, b.len()) {
+                // Una escritura que no cambia NI UN BYTE no se puede
+                // desgarrar: quede el prefijo donde quede, el resultado es
+                // lo que ya había, y `Geometry::decode` lo acepta con razón.
+                // Ocurre de verdad — el espejo de cabecera se reescribe
+                // idéntico— y era la causa del parpadeo residual de 1 de
+                // cada 24 corridas que el alargado de prefijo de `e7bfdc9`
+                // NO cubría: aquel arregló «el prefijo pedido deja la
+                // cabecera legible», no «esta escritura es inocua». Se
+                // aplaza el desgarro a la siguiente escritura de cabecera
+                // que sí cambie algo, en vez de abortar; y se lleva la
+                // cuenta para que aplazar no se convierta en no desgarrar
+                // nunca.
+                // El prefijo pedido es el PUNTO DE PARTIDA, no la última
+                // palabra: se alarga hasta que el desgarro deje de verdad
+                // la cabecera ilegible.
+                let requested = prefix;
+                let mut prefix = prefix;
                 self.inner.write_at(o, &b[..prefix])?;
                 let mut landed = [0u8; crate::header::HEADER_SIZE];
                 self.inner.read_at(o, &mut landed)?;
-                // Misma comprobación de premisa que la de meta, arriba:
-                // si el prefijo elegido deja la cabecera todavía legible
-                // (p. ej. 8 o 40 — ver el comentario de
-                // `a_torn_header_rewrite_...` en `tx.rs`, los bytes que no
-                // difieren nunca entre la cabecera vieja y la nueva), esta
-                // prueba no está modelando ningún desgarro.
-                // El prefijo pedido es el PUNTO DE PARTIDA, no la última
-                // palabra: se alarga hasta que el desgarro de verdad deja
-                // la cabecera ilegible. Sin esto la prueba parpadeaba una
-                // de cada ~14 corridas, y por la razón de siempre en este
-                // arnés — conocimiento fijado a mano en vez de derivado.
-                // El CRC de la cabecera depende de `db_id`, que se sortea
-                // al crear la base, así que para algunos sorteos los bytes
-                // nuevos por debajo del corte coincidían con los que ya
-                // había y el desgarro no desgarraba nada. La guardia hacía
-                // bien en saltar; lo que estaba mal era el prefijo.
-                let mut prefix = prefix;
                 while crate::header::Geometry::decode(&landed).is_ok() && prefix < b.len() {
                     prefix += 1;
                     self.inner.write_at(o, &b[..prefix])?;
                     self.inner.read_at(o, &mut landed)?;
                 }
-                assert!(
-                    crate::header::Geometry::decode(&landed).is_err(),
-                    "ningun prefijo entre {prefix} y {} deja ilegible la cabecera en {o}: \
-                     los bytes nuevos no difieren de los que ya habia, asi que esta \
-                     escritura no cambia nada y desgarrarla no modela nada",
-                    b.len()
-                );
+
+                // Hay escrituras de cabecera que NINGÚN prefijo puede
+                // desgarrar, y no es un fallo del arnés: si la vieja y la
+                // nueva solo difieren en los últimos bytes, todo prefijo
+                // por debajo deja la vieja (válida) y el prefijo completo
+                // deja la nueva (válida también). El caso extremo es la
+                // reescritura idéntica del espejo de cabecera, que ocurre
+                // de verdad. Era la causa del parpadeo residual de 1 de
+                // cada 24 corridas: el alargado de prefijo que introduje en
+                // `e7bfdc9` arregló «el prefijo PEDIDO deja la cabecera
+                // legible», pero no «esta escritura no se puede desgarrar
+                // en absoluto», y abortaba en vez de seguir. Se aplaza a la
+                // siguiente escritura de cabecera, con tope para que
+                // aplazar no acabe siendo no desgarrar nunca. El bucle de
+                // arriba ya dejó los bytes completos escritos, que es
+                // exactamente lo que debe quedar en una escritura que no se
+                // desgarra.
+                if crate::header::Geometry::decode(&landed).is_ok() {
+                    assert!(
+                        deferred < MAX_TEAR_DEFERRALS,
+                        "el desgarro de cabecera se ha aplazado {deferred} veces seguidas \
+                         en {o}: ninguna escritura de cabecera de esta prueba se puede \
+                         desgarrar, asi que no esta modelando nada"
+                    );
+                    *self.header_tear.lock().unwrap() =
+                        Some(Tear { skip: 0, prefix: requested, deferred: deferred + 1 });
+                    return Ok(());
+                }
                 self.last_synced_header.lock().unwrap()[i] = landed;
                 *self.dead.lock().unwrap() = Some(self.inner.snapshot());
                 return Ok(());
