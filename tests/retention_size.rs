@@ -178,8 +178,20 @@ fn obs<'a>(i: u64, ts: u64, ep: &'a str, user: &'a str, country: &'a str) -> Obs
     }
 }
 
+/// Ruta temporal **con el pid dentro**, y no es cosmético.
+///
+/// Estas mediciones se lanzan a mano, en segundo plano y a menudo varias a la
+/// vez para repartirlas por los núcleos. Con un nombre fijo, dos corridas del
+/// mismo tier comparten fichero: la segunda hace `remove_file` sobre el de la
+/// primera —que sigue escribiendo por su descriptor, ya sobre un inodo sin
+/// nombre— y a partir de ahí **`file_kb` de la primera mide el fichero de la
+/// segunda**. Ocurrió: una corrida de *pro* informó de una caída de 1,26 MB en
+/// un día que no era suya, y solo se descubrió porque `pager::truncate` tiene
+/// un único llamador y ninguno de los dos `reclaim_tail` de esos días había
+/// devuelto nada. Un número creíble y falso, que es exactamente lo que este
+/// proyecto trata peor que un error.
 fn tmp(name: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(name);
+    let p = std::env::temp_dir().join(format!("{}-{name}", std::process::id()));
     let _ = std::fs::remove_file(&p);
     p
 }
