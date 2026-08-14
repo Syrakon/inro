@@ -1000,3 +1000,30 @@ fn every_active_resolution_gets_its_own_cutoff() {
         );
     }
 }
+
+/// Un reloj imposible con la clave en milisegundos haría saturar el corte, y
+/// un corte saturado **borra el log entero**. Se rechaza antes de tocar nada.
+#[test]
+fn an_impossible_clock_is_refused_before_the_cycle_touches_anything() {
+    let db = db();
+    let mut r = Rollup::new(Config::default());
+    let now = T0 + 12 * 3_600;
+    let n = write_and_observe(&db, &mut r, now, 12, 30, RawTime::Millis);
+
+    let mut tx = db.begin_write().unwrap();
+    let err = r
+        .retain(&mut tx, u64::MAX, Some(RawWindow::six_hours(RAW_NS, RawTime::Millis)))
+        .unwrap_err();
+    assert_eq!(err, Error::BadFormat);
+    tx.commit().unwrap();
+    assert_eq!(raw_live(&db).0, n, "el reloj roto se llevó registros");
+
+    // El mismo reloj en segundos NO desborda, así que sí poda — y podar todo
+    // es la respuesta correcta a ese reloj, no un desbordamiento.
+    let mut tx = db.begin_write().unwrap();
+    let st =
+        r.retain(&mut tx, u64::MAX, Some(RawWindow::six_hours(RAW_NS, RawTime::Seconds))).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(st.raw_cutoff, Some((u64::MAX - RawWindow::SIX_HOURS).to_be_bytes()));
+    assert_eq!(raw_live(&db).0, 0);
+}

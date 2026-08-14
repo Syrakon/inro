@@ -149,6 +149,12 @@ error**:
 Si tu clave cruda **no** empieza por el instante, pasa `None` y haz tu propio
 `delete_range` en la misma transacción, después de `retain`.
 
+Por lo mismo, `retain` **rechaza un reloj imposible** con `Error::BadFormat` en
+vez de saturar: con `RawTime::Millis` y un `now` por encima de 1,8·10¹⁶ la
+conversión de unidad desborda, y un corte saturado borra el log entero. Eso sí
+se distingue de una política legítima de «bórralo todo», que se escribe con
+`RawWindow::new(ns, 0, unidad)` y no desborda nada.
+
 ### Contrato de error, y no es opcional
 
 **Si la transacción NO llega a confirmar después de un `flush` —porque
@@ -551,6 +557,86 @@ apagar el minuto y acortar retenciones, que `Reports` conserva. `Reports` cuesta
 `Config::minimal()` sigue disponible y es defendible si de los agregados solo se
 esperan totales, percentiles y códigos de estado, que son exactos y no dependen
 de `K`.
+
+### 8.5 La meseta medida, y por qué §8.3 se queda corta
+
+**Las cifras de §8.3 están compuestas** —crudo a 34,14 B/entrada más un fichero
+de agregados escrito aparte— y **no se sostienen contra una corrida real**.
+`tests/retention_size.rs::the_file_reaches_a_plateau_under_a_steady_tenant`
+simula un inquilino día a día con el ciclo de retención completo (`retain` cada
+hora simulada, `reclaim_tail` cada día), volumen del tope mensual del plan,
+perfil por defecto, `Sync::Never`:
+
+<!--TABLA-->
+
+**Forma del crecimiento**, idéntica en los cuatro tiers:
+
+| | |
+|---|---|
+| Hora 6 | El crudo vivo llega a su ventana y **no vuelve a crecer nunca** |
+| Días 1-7 | Rampa: 2.800 filas de agregado por día |
+| **Día 8** | Entra la retención de hora (7 d): el agregado horario se congela en 18.816 filas |
+| Días 8-90 | Solo crece el día: **+112 filas ≈ +5 KB al día** |
+| **Día 90** | Entra la retención de día: el agregado se congela en **28.896 filas** |
+| Días 90-120 | **Meseta plana**, con una ligera bajada al asentarse la lista de libres |
+
+**A los 30 días la meseta todavía no está**: falta un 13-15 %. Quien mida un mes
+y lo llame régimen permanente se equivoca en esa cantidad.
+
+**Las 28.896 filas de agregado son las mismas en los cuatro tiers**, lo que
+confirma la lectura central de §8.3: el coste de esta capa lo pone el número de
+celdas × filas por celda, no el tráfico.
+
+### 8.6 Dónde se va la diferencia
+
+Dos causas, las dos medidas por separado.
+
+**1. El llenado de hoja del espacio de agregados es del ~50 %, no del ~96 %.**
+La proyección escribió las filas **una vez y en orden de clave**; un `Rollup`
+real las emite por ranura de dimensión y, dentro, en el orden de la tabla del
+top-K. Sobre exactamente las mismas 28.896 filas de la meseta
+(`where_the_aggregate_space_loses_its_leaf_fill`):
+
+| Orden de escritura | Páginas | Llenado |
+|---|---|---|
+| Orden de clave, una pasada (**el de la proyección**) | 248 | **96,1 %** |
+| Revuelto dentro de la celda | 459 | **51,9 %** |
+| Revuelto y con el día intercalado (**el real**) | 352 | **67,7 %** |
+| Corrida viva de 120 días | ~346 | **~49 %** |
+
+El sesgo de anexado de `tree.rs` solo se dispara con inserciones estrictamente
+ascendentes. El crudo lo consigue (96 %); los agregados no. Es la misma trampa
+que cuenta `RAW_NS_RECOMMENDED` un nivel más abajo, salvo que **dentro de un
+espacio de claves no hay ninguna cota de anexado más fina**.
+
+**2. El margen de `Sync::Never`.** Con la misma carga y `Sync::Commit`, micro se
+queda en **1.684 KB** en vez de 2.328, con **las mismas 361 páginas vivas**: la
+diferencia entera son páginas libres que el modo relajado no puede reutilizar
+hasta que el punto durable las alcanza. Es el «margen constante» que documenta
+el `enum Sync`, y aquí vale un **+38 %**.
+
+### 8.7 `reclaim_tail` no ayuda en régimen permanente
+
+Medido (`what_blocks_reclaim_tail_in_the_steady_state`): en régimen,
+`reclaim_tail` devuelve **4 KB**. Borrar **todo** el crudo y volver a llamarla
+devuelve **16 KB**. Borrar además los agregados devuelve el fichero entero (932
+KB en micro, 1.872 en starter).
+
+**Lo que está arriba son los agregados**: sobreviven al crudo y crecen de forma
+monótona 90 días, así que sus páginas se asignan tarde mientras las del crudo se
+liberan y se vuelven a pedir por abajo. `reclaim_tail` solo se lleva el sufijo
+libre, y esa capa viva en lo alto lo bloquea entero. **Sirve para un cambio de
+plan, no para la poda diaria** (`runbook.md` §7.5).
+
+### 8.8 Lo que la poda repetida NO estropea
+
+`delete_rec` no funde hojas medio vacías (`invariantes.md` §3), así que la
+sospecha razonable era que miles de ciclos de poda dejaran el crudo lleno de
+hojas raquíticas. **No pasa.** Con un ciclo de poda por hora simulada durante
+103 días —2.472 ciclos— el crudo de un nodo starter se queda entre **33,68 y
+34,17 bytes por entrada viva**, sin ninguna deriva
+(`raw_leaf_fill_across_repeated_prune_cycles`). El sesgo de anexado y la cota
+`[ns+1]` sobreviven a la poda pesada.
 
 ## 9. Límites conocidos
 

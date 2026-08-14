@@ -583,24 +583,30 @@ impl RawWindow {
     /// Cota superior **exclusiva** del `delete_range` que poda esta ventana
     /// vista desde `now_secs`: se borra `[b"", cutoff_key)`.
     ///
-    /// `saturating_sub` y `saturating_mul`, y las dos saturaciones no son
-    /// igual de inocentes:
+    /// `None` **solo cuando el reloj es imposible**: ver `checked_cutoff`.
     ///
-    /// - Por abajo (`now_secs < secs`, un arranque en frío o un reloj sin
-    ///   sincronizar) el corte sale cero y **no se borra nada**. Es lo
-    ///   conservador y no hace falta avisar de ello.
-    /// - Por arriba solo se llega con un reloj disparatado —`now_secs` por
-    ///   encima de 1,8·10¹⁶ segundos, el año 584 millones— y el corte
-    ///   saturado sería `u64::MAX`, **que borra el log entero**. No hay forma
-    ///   de distinguirlo aquí de una política legítima de «bórralo todo», así
-    ///   que no se rechaza: se informa. `RetentionStats::raw_cutoff` devuelve
-    ///   el corte APLICADO, y quien registre esa cifra verá `ffff…` y sabrá
-    ///   que su reloj miente.
-    pub fn cutoff_key(&self, now_secs: u64) -> [u8; 8] {
-        now_secs
-            .saturating_sub(self.secs)
-            .saturating_mul(self.time.per_second())
-            .to_be_bytes()
+    /// Por abajo no falla nunca. Con `now_secs < secs` —un arranque en frío,
+    /// un reloj sin sincronizar— el corte sale cero y no se borra nada, que es
+    /// lo conservador y no merece un error.
+    pub fn cutoff_key(&self, now_secs: u64) -> Option<[u8; 8]> {
+        self.checked_cutoff(now_secs).map(u64::to_be_bytes)
+    }
+
+    /// El corte en las unidades de la clave, o `None` si la conversión de
+    /// unidad desborda.
+    ///
+    /// **Desbordar aquí es la peor cosa que le puede pasar a esta aritmética**,
+    /// y por eso se rechaza en vez de saturar. Con `RawTime::Millis` el
+    /// producto pasa de `u64` cuando `now_secs` supera 1,8·10¹⁶ —el año 584
+    /// millones—, y un corte saturado a `u64::MAX` **borra el log entero**.
+    ///
+    /// Se rechaza y no se informa porque **sí se puede distinguir** de una
+    /// política legítima: quien quiera borrarlo todo escribe `secs: 0`, que da
+    /// un corte igual a `now` y no desborda nada. Un desbordamiento aquí solo
+    /// puede venir de un reloj roto, y contra un reloj roto la respuesta
+    /// correcta no es borrar más de lo que nadie pidió.
+    pub fn checked_cutoff(&self, now_secs: u64) -> Option<u64> {
+        now_secs.saturating_sub(self.secs).checked_mul(self.time.per_second())
     }
 }
 
@@ -978,23 +984,37 @@ mod engine {
         /// de cada resolución activa por su propia retención, podar el crudo
         /// por la suya.
         ///
-        /// # El orden, que es todo el motivo de que esto exista
+        /// # El orden, y qué parte de él es la que de verdad protege
         ///
-        /// Los agregados se derivan del crudo y **no se pueden reconstruir
-        /// una vez el crudo se ha ido**. La secuencia peligrosa es podar el
-        /// crudo antes de que su agregado esté escrito: lo que la celda en
+        /// Los agregados se derivan del crudo y **no se pueden reconstruir una
+        /// vez el crudo se ha ido**, así que la secuencia peligrosa es podar
+        /// el crudo antes de que su resumen esté escrito: lo que la celda en
         /// curso lleva acumulado vive solo en RAM (ver el contrato de
-        /// `flush`), así que un `delete_range` del crudo confirmado antes de
-        /// un `flush` deja una ventana en la que un corte se lleva las dos
-        /// copias. Aquí el `flush` va primero y **todo ocurre en la misma
-        /// transacción**, de modo que el borrado del crudo y la escritura de
-        /// su resumen son atómicos: o los dos, o ninguno. Ni siquiera hay un
-        /// orden que el llamante pueda equivocar.
+        /// `flush`), y un `delete_range` del crudo **confirmado en otra
+        /// transacción** antes del volcado deja una ventana en la que un
+        /// corte se lleva las dos copias.
         ///
-        /// Entre las dos podas el orden es indiferente para la corrección
-        /// —una transacción es atómica— y se hace primero el agregado y
-        /// después el crudo por la misma razón que se cuenta arriba: lo
-        /// derivado se resuelve antes que su origen.
+        /// Lo que cierra esa ventana **no es el orden de las llamadas: es que
+        /// las dos vayan en la MISMA transacción**. Dentro de una transacción
+        /// no hay «antes»: o se confirma el volcado con la poda, o no se
+        /// confirma ninguno de los dos. Conviene decirlo así de claro porque
+        /// invita a un error de razonamiento: reordenar las tres operaciones
+        /// de aquí dentro no cambia el resultado, y una prueba que intentara
+        /// vigilar ese orden pasaría siempre.
+        ///
+        /// Dicho eso, el orden escrito **sí** es el que se lee mejor —hacer
+        /// durable lo derivado y después soltar el origen— y se conserva por
+        /// eso. La protección de verdad son dos:
+        ///
+        /// 1. **Una sola transacción**, que es lo que el llamante ya no puede
+        ///    equivocar porque no la parte él.
+        /// 2. **El recorte por celda abierta** (más abajo), sin el cual el
+        ///    orden interno sí importaría: con el corte por encima de una
+        ///    celda abierta, volcar-y-luego-podar la borra (el volcado ya
+        ///    limpió sus marcas de sucia, así que no se reescribe) y
+        ///    podar-y-luego-volcar la resucita entera por debajo de la línea
+        ///    de retención. Las dos son respuestas equivocadas; el recorte
+        ///    hace que la condición no pueda darse.
         ///
         /// # Lo que NO hace
         ///
@@ -1046,6 +1066,11 @@ mod engine {
         ///   a `AGG_NS`. Sería el borrado de los agregados que este mismo
         ///   ciclo acaba de volcar, y **con el crudo ya podado detrás no habría
         ///   nada con qué rehacerlos**.
+        /// - `Error::BadFormat` si el reloj es imposible: con
+        ///   `RawTime::Millis` y un `now_secs` por encima de 1,8·10¹⁶ la
+        ///   conversión de unidad desborda, y un corte saturado **borra el log
+        ///   entero**. Ver `RawWindow::checked_cutoff` para por qué esto sí se
+        ///   puede distinguir de una política legítima de «bórralo todo».
         /// - `Error::DeleteRangeIndexed { ns }` si el espacio del crudo tiene
         ///   índices declarados — la negativa es de `WriteTxn::delete_range`,
         ///   no de aquí, y el remedio está en su comentario.
@@ -1060,11 +1085,16 @@ mod engine {
             now_secs: u64,
             raw: Option<RawWindow>,
         ) -> Result<RetentionStats> {
-            if let Some(w) = raw
-                && w.ns == AGG_NS
-            {
-                return Err(Error::ReservedNamespace { ns: w.ns });
-            }
+            // Las dos negativas van ANTES de tocar nada: una transacción
+            // abortada no deja rastro, pero un ciclo que empieza y no acaba
+            // gasta un volcado entero para nada.
+            let raw_cut = match raw {
+                None => None,
+                Some(w) if w.ns == AGG_NS => return Err(Error::ReservedNamespace { ns: w.ns }),
+                // Reloj imposible: ver `RawWindow::checked_cutoff`. Saturar
+                // aquí borraría el log entero.
+                Some(w) => Some(w.cutoff_key(now_secs).ok_or(Error::BadFormat)?),
+            };
 
             let mut stats = RetentionStats { flush: self.flush(tx)?, ..Default::default() };
 
@@ -1089,8 +1119,7 @@ mod engine {
                 stats.aggregate_cutoff[ri] = Some(cut);
             }
 
-            if let Some(w) = raw {
-                let cut = w.cutoff_key(now_secs);
+            if let (Some(w), Some(cut)) = (raw, raw_cut) {
                 tx.delete_range(w.ns, &[], &cut)?;
                 stats.raw_cutoff = Some(cut);
             }
@@ -1177,9 +1206,9 @@ mod window_tests {
     fn the_cutoff_key_is_the_instant_in_big_endian_in_the_declared_unit() {
         let now = 1_786_320_000u64;
         let s = RawWindow::six_hours(0x01, RawTime::Seconds);
-        assert_eq!(s.cutoff_key(now), (now - 6 * 3_600).to_be_bytes());
+        assert_eq!(s.cutoff_key(now), Some((now - 6 * 3_600).to_be_bytes()));
         let m = RawWindow::six_hours(0x01, RawTime::Millis);
-        assert_eq!(m.cutoff_key(now), ((now - 6 * 3_600) * 1_000).to_be_bytes());
+        assert_eq!(m.cutoff_key(now), Some(((now - 6 * 3_600) * 1_000).to_be_bytes()));
         // Las dos unidades sobre el MISMO instante dan cortes que difieren en
         // tres órdenes de magnitud: es justo el fallo que el enum evita.
         assert!(m.cutoff_key(now) > s.cutoff_key(now));
@@ -1191,18 +1220,29 @@ mod window_tests {
         // y `[b"", 0u64)` es un rango vacío.
         for unit in [RawTime::Seconds, RawTime::Millis] {
             let w = RawWindow::six_hours(0x01, unit);
-            assert_eq!(w.cutoff_key(0), [0u8; 8]);
-            assert_eq!(w.cutoff_key(RawWindow::SIX_HOURS), [0u8; 8]);
-            assert_eq!(w.cutoff_key(RawWindow::SIX_HOURS - 1), [0u8; 8]);
+            assert_eq!(w.cutoff_key(0), Some([0u8; 8]));
+            assert_eq!(w.cutoff_key(RawWindow::SIX_HOURS), Some([0u8; 8]));
+            assert_eq!(w.cutoff_key(RawWindow::SIX_HOURS - 1), Some([0u8; 8]));
         }
     }
 
+    /// Un reloj imposible se **rechaza** en vez de saturar: saturar borra el
+    /// log entero, y esto sí se distingue de una política legítima de «bórralo
+    /// todo», que se escribe con `secs: 0` y no desborda.
     #[test]
-    fn an_impossible_clock_saturates_upward_and_the_stats_can_show_it() {
-        // Nadie puede distinguir esto de «bórralo todo», así que no se
-        // rechaza: se informa. Ver `RawWindow::cutoff_key`.
-        let w = RawWindow::six_hours(0x01, RawTime::Millis);
-        assert_eq!(w.cutoff_key(u64::MAX), [0xff; 8]);
+    fn an_impossible_clock_is_refused_instead_of_wiping_the_log() {
+        let m = RawWindow::six_hours(0x01, RawTime::Millis);
+        assert_eq!(m.cutoff_key(u64::MAX), None);
+        assert_eq!(m.checked_cutoff(u64::MAX), None);
+        // El último instante que todavía cabe, y el primero que ya no.
+        let limite = u64::MAX / 1_000;
+        assert_eq!(m.checked_cutoff(limite + RawWindow::SIX_HOURS), Some(limite * 1_000));
+        assert_eq!(m.checked_cutoff(limite + 1 + RawWindow::SIX_HOURS), None);
+        // En segundos no puede desbordar nunca: el factor es 1.
+        let s = RawWindow::six_hours(0x01, RawTime::Seconds);
+        assert_eq!(s.cutoff_key(u64::MAX), Some((u64::MAX - RawWindow::SIX_HOURS).to_be_bytes()));
+        // Y borrarlo todo a propósito NO desborda.
+        assert_eq!(RawWindow::new(0x01, 0, RawTime::Millis).checked_cutoff(1_000), Some(1_000_000));
     }
 
     #[test]
@@ -1216,7 +1256,7 @@ mod window_tests {
     #[test]
     fn a_zero_window_is_a_legitimate_policy_and_cuts_at_now() {
         let w = RawWindow::new(0x01, 0, RawTime::Seconds);
-        assert_eq!(w.cutoff_key(1_000), 1_000u64.to_be_bytes());
+        assert_eq!(w.cutoff_key(1_000), Some(1_000u64.to_be_bytes()));
     }
 }
 
