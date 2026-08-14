@@ -90,7 +90,36 @@ for fila in &top {
 let serie = read_range(&rd, Resolution::Hour, desde, hasta, 10_000)?;
 ```
 
-Poda (la política —cuándo— es del llamante):
+Poda (la política —cuándo— sigue siendo del llamante):
+
+```rust
+use inro::rollup::{RawTime, RawWindow};
+
+let ventana = RawWindow::six_hours(0x01, RawTime::Seconds);   // el ns de tu crudo
+
+let mut tx = db.begin_write()?;                    // 1
+let st = rollup.retain(&mut tx, ahora, Some(ventana))?;  // 2  vuelca + poda todo
+tx.commit()?;                                      // 3
+let devueltos = db.reclaim_tail()?;                // 4  fuera de la transacción
+```
+
+**Los cuatro pasos son el ciclo entero**, y el orden importa por una razón que
+no es de estilo: los agregados se derivan del crudo y **no se pueden
+reconstruir cuando el crudo ya no está**. Lo que cierra esa ventana no es el
+orden de las llamadas sino que el volcado y la poda vayan en **la misma
+transacción**, que es justo lo que `retain` deja de poder equivocar. El paso 4
+va fuera porque `reclaim_tail` toma el candado de escritor y abre sus propias
+transacciones.
+
+`retain` devuelve `RetentionStats` con lo **aplicado**, no lo pedido: el corte
+de cada resolución, la cota del crudo, y si algún corte hubo que recortarlo
+porque una celda seguía abierta en RAM (`clamped`, el caso de quien reprocesa
+historia hacia atrás). Poda menos, nunca más, y lo dice.
+
+Las piezas sueltas siguen ahí para quien quiera montar otra cosa —
+`Config::cutoff_bucket`, `prune_before`, `WriteTxn::delete_range`,
+`Db::reclaim_tail`—; `retain` no es más que las cuatro en el único orden que no
+destruye datos:
 
 ```rust
 let corte = rollup.config().cutoff_bucket(Resolution::Hour, ahora).unwrap();
@@ -104,6 +133,21 @@ versión anterior tenía `Resolution::default_retention_secs()`: con dos perfile
 que retienen la hora 7 y 30 días, una función que no sabe cuál está en uso
 devuelve la retención del perfil equivocado sin decirlo, y podar de más borra
 informes que nadie puede reconstruir.
+
+### La unidad del instante de la clave cruda, que sí puede destruir datos
+
+`RawWindow` pide `RawTime::Seconds` o `RawTime::Millis` porque la clave cruda
+del esquema de referencia es `[ts BE u64][seq u16]` y el `ts` va en
+milisegundos en unos sitios y en segundos en otros. Confundirlos **no da un
+error**:
+
+| | Efecto |
+|---|---|
+| Claves en ms, corte en segundos | El corte sale 1.000× pequeño: **no borra nada**, el fichero crece sin cota |
+| Claves en segundos, corte en ms | El corte sale 1.000× grande: **borra el log entero**, incluido lo de hace un segundo |
+
+Si tu clave cruda **no** empieza por el instante, pasa `None` y haz tu propio
+`delete_range` en la misma transacción, después de `retain`.
 
 ### Contrato de error, y no es opcional
 
