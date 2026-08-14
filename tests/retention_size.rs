@@ -528,6 +528,7 @@ fn the_retention_cycle_stops_the_file_from_growing() {
     let mut counter = 0u64;
     let per_hour = 240u64;
     let mut sizes = Vec::new();
+    let mut live_per_hour = Vec::new();
     for h in 0..24u64 {
         let hour_start = T0 + h * 3_600;
         write_hour(&db, &mut r, hour_start, per_hour, &mut counter, true);
@@ -536,12 +537,20 @@ fn the_retention_cycle_stops_the_file_from_growing() {
             .unwrap();
         tx.commit().unwrap();
         sizes.push(file_kb(&path));
+        live_per_hour.push(live(&db, RAW_NS).0);
     }
     let (rows, _) = live(&db, RAW_NS);
     drop(db);
     let _ = std::fs::remove_file(&path);
 
-    // El crudo vivo es exactamente la ventana, ni un registro más.
+    // Hora a hora: la ventana se llena en seis y a partir de ahí no se mueve.
+    // Es la invariante fuerte del ciclo, y comprobarla en CADA hora atrapa
+    // tanto una poda que no borra como una que borra de mas.
+    for (h, n) in live_per_hour.iter().enumerate() {
+        let esperado = (h as u64 + 1).min(RAW_SECS / 3_600) * per_hour;
+        assert_eq!(*n, esperado, "hora {h}: {n} registros crudos vivos, esperados {esperado}");
+    }
+    // El crudo vivo es exactamente la ventana, ni un registro mas.
     assert_eq!(rows, per_hour * RAW_SECS / 3_600, "el crudo vivo no es la ventana de 6 h");
 
     // Y el fichero de la segunda mitad del día crece mucho menos que el de la
