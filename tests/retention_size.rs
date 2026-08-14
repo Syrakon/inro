@@ -444,7 +444,7 @@ fn raw_leaf_fill_across_repeated_prune_cycles() {
             for h in 0..24u64 {
                 let hour_start = T0 + (d * 24 + h) * 3_600;
                 write_hour(&db, &mut r, hour_start, per_hour, &mut counter, false);
-                let cut = RawWindow::six_hours(RAW_NS, RawTime::Seconds).cutoff_key(hour_start + 3_600);
+                let cut = RawWindow::six_hours(RAW_NS, RawTime::Seconds).cutoff_key(hour_start + 3_600).unwrap();
                 let mut tx = db.begin_write().unwrap();
                 tx.delete_range(RAW_NS, b"", &cut).unwrap();
                 tx.commit().unwrap();
