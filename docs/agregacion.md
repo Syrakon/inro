@@ -26,8 +26,8 @@ Tras la *feature* `rollup`, activada por defecto.
 |---|---|
 | Codificación de agregados, histograma de latencia, top-K acotado | Cadena de hashes de facturación (sección 12.3, tarea aparte) |
 | Agregación en la MISMA transacción que el crudo | Diccionarios de interning (`0x03`) |
-| Lectura de agregados por rango de tiempo | Planificador de poda: la política es del llamante |
-| Lo que una poda necesita (`prune_before`, `cutoff_bucket`) | Poda del espacio crudo: la hace el llamante con `delete_range` |
+| Lectura de agregados por rango de tiempo | Planificador de poda: **cuándo** sigue siendo del llamante |
+| El ciclo de retención entero en una transacción (`retain`): volcar, podar agregados, podar crudo | Recuperar el espacio del sistema de ficheros: es `Db::reclaim_tail`, y va **después** del `commit` |
 
 **No hay hilo de fondo ni tarea programada.** El agregado en curso vive en RAM
 y se escribe en la transacción del llamante, así que hereda tal cual las

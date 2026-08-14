@@ -120,8 +120,24 @@
 //!
 //! **La política de cuándo podar sigue siendo del llamante**, no de esta capa:
 //! aquí están la aritmética (`Config::cutoff_bucket`,
-//! `Resolution::cutoff_bucket`) y `prune_before`, que es todo lo que una poda
-//! necesita. No hay ningún planificador, y no lo habrá desde aquí.
+//! `Resolution::cutoff_bucket`), `prune_before` para una resolución suelta, y
+//! `Rollup::retain`, que es el ciclo entero —volcar, podar cada resolución
+//! activa, podar el crudo— **en una sola transacción**, que es lo que impide
+//! el único orden capaz de destruir datos. No hay ningún planificador, y no lo
+//! habrá desde aquí.
+//!
+//! ```ignore
+//! let mut tx = db.begin_write()?;                                          // 1
+//! rollup.retain(&mut tx, ahora, Some(RawWindow::six_hours(0x01, RawTime::Seconds)))?;
+//! tx.commit()?;                                                            // 3
+//! let devueltos = db.reclaim_tail()?;   // 4, fuera de la transacción
+//! ```
+//!
+//! **`reclaim_tail` devuelve prácticamente cero en régimen permanente**, y no
+//! es un síntoma: los agregados sobreviven al crudo, así que sus páginas vivas
+//! acaban en lo alto del fichero y bloquean el recorte de la cola. Medido en
+//! `docs/runbook.md` §7.5. Sirve para un cambio de plan, no para la poda
+//! diaria.
 
 pub mod bucket;
 pub mod hist;
