@@ -758,6 +758,31 @@ cuando esperabas espacio.
 **Lo que no arregla:** las páginas huérfanas por debajo de `n_pages` (§6.3). El
 recorte solo se lleva la cola.
 
+**En un ciclo de retención en régimen permanente devuelve prácticamente cero, y
+eso es lo normal, no un síntoma.** Medido sobre la carga de referencia — crudo
+de 6 horas podado cada hora, agregados con el perfil por defecto,
+`tests/retention_size.rs::what_blocks_reclaim_tail_in_the_steady_state`:
+
+| | micro | starter |
+|---|---|---|
+| Fichero en régimen | 964 KB | 1.904 KB |
+| `reclaim_tail` | **4 KB** | **4 KB** |
+| Y después de borrar **todo el crudo** | 16 KB | 16 KB |
+| Y después de borrar **también los agregados** | **932 KB** | **1.872 KB** |
+
+Borrar el log entero devuelve 16 KB; borrar además los agregados devuelve el
+fichero completo. **Lo que está arriba son los agregados**, y la razón es
+estructural: sobreviven al crudo y crecen de forma monótona durante 90 días, así
+que sus páginas se asignan tarde —números altos— mientras las del crudo se
+liberan y se vuelven a pedir por abajo sin parar. Como `reclaim_tail` solo se
+lleva el **sufijo** libre, una capa de páginas vivas de agregado en lo alto lo
+bloquea entero.
+
+Consecuencia operativa: **`reclaim_tail` sirve para un cambio de plan, no para
+la poda diaria.** Llamarla cada día en régimen permanente cuesta tres `fsync` y
+devuelve cuatro kilobytes. Donde sí paga es cuando el pico no vuelve — un
+inquilino que baja de plan, o uno cuyos agregados se acortan de 90 días a 30.
+
 ---
 
 ### 7.6 No escribir en los espacios de claves reservados — hueco vivo, sin arreglar

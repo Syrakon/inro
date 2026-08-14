@@ -691,3 +691,71 @@ fn where_the_aggregate_space_loses_its_leaf_fill() {
     assert_eq!(chrono.len(), total, "C tiene que escribir exactamente las filas de A y B");
     measure("C dia intercalado (real)", chrono, total);
 }
+
+/// **Qué bloquea `reclaim_tail` en régimen permanente**, medido en vez de
+/// razonado.
+///
+/// La sospecha era concreta: los agregados sobreviven al crudo, crecen de
+/// forma monótona durante 90 días y por tanto sus páginas se asignan **tarde**
+/// —números de página altos— mientras las del crudo se liberan y se vuelven a
+/// pedir sin parar por abajo. `reclaim_tail` solo se lleva el **sufijo** libre
+/// del fichero (`docs/runbook.md` §7.5), así que una sola página viva alta
+/// basta para que no devuelva nada.
+///
+/// El experimento distingue las dos causas sin ambigüedad: se llega al régimen
+/// permanente, se recorta; luego se borra **todo el crudo** y se recorta otra
+/// vez; luego **todos los agregados** y se recorta una tercera. Si lo que está
+/// arriba fuera el crudo, el segundo recorte devolvería el grueso. Si son los
+/// agregados, no devuelve casi nada y el tercero sí.
+#[test]
+#[ignore]
+fn what_blocks_reclaim_tail_in_the_steady_state() {
+    for ti in env_tiers() {
+        let t = &TIERS[ti];
+        let per_hour = t.monthly / 30 / 24;
+        let path = tmp(&format!("inro-block-{}.inro", t.name));
+        let db = open(path.as_path());
+        let mut r = Rollup::new(Config::default());
+        let mut counter = 0u64;
+        // Tres días: la ventana de crudo lleva mucho girando y hay agregado de
+        // hora y de día en disco.
+        for h in 0..72u64 {
+            let hour_start = T0 + h * 3_600;
+            write_hour(&db, &mut r, hour_start, per_hour, &mut counter, true);
+            let mut tx = db.begin_write().unwrap();
+            r.retain(&mut tx, hour_start + 3_600, Some(RawWindow::six_hours(RAW_NS, RawTime::Seconds)))
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let steady = file_kb(&path);
+        let r1 = db.reclaim_tail().unwrap() as f64 / 1024.0;
+        let after1 = file_kb(&path);
+        let live1 = pages_in_use(&db);
+
+        // Fuera TODO el crudo.
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(RAW_NS, b"", &[0xff; 12]).unwrap();
+        tx.commit().unwrap();
+        let r2 = db.reclaim_tail().unwrap() as f64 / 1024.0;
+        let after2 = file_kb(&path);
+        let live2 = pages_in_use(&db);
+
+        // Y ahora TODO el agregado.
+        r.reset();
+        let mut tx = db.begin_write().unwrap();
+        tx.delete_range(AGG_NS, b"", &[0xff; 12]).unwrap();
+        tx.commit().unwrap();
+        let r3 = db.reclaim_tail().unwrap() as f64 / 1024.0;
+        let after3 = file_kb(&path);
+        let live3 = pages_in_use(&db);
+
+        println!(
+            "  {:<11} regimen {steady:>9.0} KB -> reclaim {r1:>8.0} KB -> {after1:>9.0} KB ({live1} pag. vivas)\n\
+             {:<13} sin crudo:     reclaim {r2:>8.0} KB -> {after2:>9.0} KB ({live2} pag. vivas)\n\
+             {:<13} sin agregados: reclaim {r3:>8.0} KB -> {after3:>9.0} KB ({live3} pag. vivas)",
+            t.name, "", ""
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+}
