@@ -10,11 +10,17 @@ horas y los agregados sobreviviéndolos, un informe de noventa días se sirve si
 que exista ni uno solo de los registros que lo respaldan (de dos años, con el
 perfil `Realtime`).
 
-**El perfil por defecto ya no es el de la sección 12.3**: es el mínimo —sin
-resolución de minuto y con `K = 4`—, porque el de la especificación le costaba
-disco a un nodo pequeño en vez de ahorrárselo. La elección tiene un coste de
-precisión que está medido en §8.4 y que conviene leer antes de aceptar el
-valor por defecto. Los tres perfiles están en §7.
+**El perfil por defecto ya no es el de la sección 12.3**: es `Reports` —sin
+resolución de minuto y con retenciones cortas, pero con `K = 32`—, porque el de
+la especificación le costaba disco a un nodo pequeño en vez de ahorrárselo y
+`Minimal` (`K = 4`) dejaba el desglose por dimensión inservible. Las dos
+decisiones están medidas en §8.3 y §8.4. Los tres perfiles están en §7.
+
+**Y el ahorro no existe hasta que el crudo se poda.** Mientras los registros
+crudos no se borren, los agregados solo SUMAN disco. El ciclo completo —volcar,
+podar agregados, podar crudo— es `Rollup::retain` (§2), y lo que de verdad
+ocupa un inquilino en régimen permanente está medido día a día en §8.5: **no
+es lo que proyectaba §8.3**.
 
 Tras la *feature* `rollup`, activada por defecto.
 
@@ -567,25 +573,54 @@ simula un inquilino día a día con el ciclo de retención completo (`retain` ca
 hora simulada, `reclaim_tail` cada día), volumen del tope mensual del plan,
 perfil por defecto, `Sync::Never`:
 
-<!--TABLA-->
+| Tier | Crudo vivo | Días medidos | **Meseta** | A 30 días | Proyección §8.3 | Medido/proyectado |
+|---|---|---|---|---|---|---|
+| micro | 1.662 filas | 120 | **2.328 KB** | 2.028 KB | 1.052 KB | **2,21×** |
+| starter | 16.662 | 100 | **3.160 KB** | 2.784 KB | 1.628 KB | **1,94×** |
+| pro | 124.998 | 100 | **7.348 KB (día 95)** | 6.992 KB | 5.367 KB | **1,37×** |
+| enterprise | 416.664 | 30 | ~18.100 KB (extrapolada) | **17.732 KB** | 15.140 KB | **~1,19×** |
 
-**Forma del crecimiento**, idéntica en los cuatro tiers:
+*Enterprise* se corrió los 30 días que caben en un presupuesto razonable —50
+millones de registros, 4.879 s de reloj; los 90 días serían 150 millones y unas
+cuatro horas y media. Lo que falta de ahí a la meseta **no depende del tier**
+(la resolución de día suma 112 filas diarias hasta el día 90 y luego se para;
+las 28.896 filas de la meseta son idénticas en los cuatro), y con la pendiente
+medida del propio tier son +342 KB, un 2 %.
+
+**Forma del crecimiento**, la misma en los cuatro tiers:
 
 | | |
 |---|---|
 | Hora 6 | El crudo vivo llega a su ventana y **no vuelve a crecer nunca** |
 | Días 1-7 | Rampa: 2.800 filas de agregado por día |
 | **Día 8** | Entra la retención de hora (7 d): el agregado horario se congela en 18.816 filas |
-| Días 8-90 | Solo crece el día: **+112 filas ≈ +5 KB al día** |
+| Días 8-90 | Solo crece el día: **+112 filas ≈ +5,5 KB al día** |
 | **Día 90** | Entra la retención de día: el agregado se congela en **28.896 filas** |
 | Días 90-120 | **Meseta plana**, con una ligera bajada al asentarse la lista de libres |
 
-**A los 30 días la meseta todavía no está**: falta un 13-15 %. Quien mida un mes
-y lo llame régimen permanente se equivoca en esa cantidad.
+**A los 30 días la meseta todavía no está.** Lo que cambia entre tiers es cuánto
+importa: en micro faltan 300 KB de 2.328 (**13 %**), en enterprise 342 de
+17.732 (**2 %**), porque ahí el crudo domina.
 
 **Las 28.896 filas de agregado son las mismas en los cuatro tiers**, lo que
 confirma la lectura central de §8.3: el coste de esta capa lo pone el número de
 celdas × filas por celda, no el tráfico.
+
+**La mitad cruda de la proyección sí se sostiene**, con menos de un 1 % de
+error: 56 / 560 / 4.202 / 14.007 KB medidos frente a 55,6 / 555,5 / 4.167 /
+13.892 compuestos. **Todo el error está en el lado del agregado**, y por eso
+duele más donde menos crudo hay — que es justo donde está el 85 % de la flota.
+
+Con la mezcla 55/30/13/2 y las mesetas medidas:
+
+| | Proyección §8.3 | Medido | |
+|---|---|---|---|
+| Flota de 1.360 | 2,68 GB | **4,60 GB** | 1,72× |
+| Flota de 2.700 | 5,32 GB | **9,13 GB** | 1,72× |
+
+Sigue siendo **muy inferior a los 58 GB del crudo sin agregar**: la poda hace su
+trabajo y el orden de magnitud de la decisión no cambia. Lo que no se sostiene
+es la cifra concreta.
 
 ### 8.6 Dónde se va la diferencia
 
