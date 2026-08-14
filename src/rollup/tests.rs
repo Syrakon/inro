@@ -951,3 +951,52 @@ fn the_live_raw_count_reaches_a_plateau_across_many_cycles() {
         assert_eq!(*n, steady, "hora {h}: {n} registros vivos, esperados {steady}");
     }
 }
+
+/// El podador que **no observa nada**: un `Rollup` recién construido, sin
+/// ninguna celda abierta, poda por el corte del perfil sin recortar nada. Es
+/// el caso del proceso de retención separado del escritor.
+#[test]
+fn a_rollup_that_never_observed_still_runs_a_complete_cycle() {
+    let db = db();
+    // Un escritor deja datos.
+    let mut writer = Rollup::new(Config::default());
+    let now = T0 + 30 * 86_400;
+    let n = write_and_observe(&db, &mut writer, now, 3, 20, RawTime::Seconds);
+    // Y el podador, que es otro objeto y no ha observado jamás.
+    let mut pruner = Rollup::new(Config::default());
+    let mut tx = db.begin_write().unwrap();
+    let st = pruner
+        .retain(&mut tx, now, Some(RawWindow::six_hours(RAW_NS, RawTime::Seconds)))
+        .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(st.flush, FlushStats::default(), "no tenía nada que volcar");
+    assert_eq!(st.clamped, [false; 3], "sin celdas abiertas no hay nada que recortar");
+    assert_eq!(
+        st.aggregate_cutoff[Resolution::Hour.code() as usize],
+        Config::default().cutoff_bucket(Resolution::Hour, now)
+    );
+    // Tres horas de crudo dentro de una ventana de seis: no se borra nada.
+    assert_eq!(raw_live(&db).0, n);
+}
+
+/// Con el perfil de tiempo real las TRES resoluciones se podan, cada una por
+/// su retención. Es lo que distingue `retain` de tres `prune_before` a mano:
+/// no hay forma de olvidarse de una.
+#[test]
+fn every_active_resolution_gets_its_own_cutoff() {
+    let db = db();
+    let cfg = Config::realtime();
+    let mut r = Rollup::new(cfg);
+    let now = T0 + 800 * 86_400;
+    let mut tx = db.begin_write().unwrap();
+    r.observe(&mut tx, &obs(now, b"/a", 200, 5)).unwrap();
+    let st = r.retain(&mut tx, now, None).unwrap();
+    tx.commit().unwrap();
+    for res in [Resolution::Minute, Resolution::Hour, Resolution::Day] {
+        assert_eq!(
+            st.aggregate_cutoff[res.code() as usize],
+            cfg.cutoff_bucket(res, now),
+            "{res:?} no se podó por su propia retención"
+        );
+    }
+}
