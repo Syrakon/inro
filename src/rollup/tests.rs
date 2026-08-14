@@ -650,3 +650,304 @@ fn a_value_evicted_after_it_reached_disk_loses_its_row_too() {
     assert_eq!(total.requests, n);
     assert_eq!(sum, n, "las filas de endpoint suman {sum} para {n} peticiones reales");
 }
+
+// ---------------------------------------------------------------------------
+// Ciclo de retención (`Rollup::retain`).
+// ---------------------------------------------------------------------------
+
+/// Espacio de claves del crudo en estas pruebas.
+const RAW_NS: u8 = RAW_NS_RECOMMENDED;
+
+/// Clave cruda del esquema de referencia: `[ts BE u64][seq u16]`.
+fn raw_key(ts: u64, seq: u16) -> Vec<u8> {
+    let mut k = Vec::with_capacity(10);
+    k.extend_from_slice(&ts.to_be_bytes());
+    k.extend_from_slice(&seq.to_be_bytes());
+    k
+}
+
+/// Escribe `n` registros crudos por hora durante `hours` horas terminando en
+/// `end_secs`, observándolos en la misma transacción. `unit` es la unidad del
+/// instante en la CLAVE; la observación siempre va en segundos.
+fn write_and_observe(
+    db: &Db,
+    r: &mut Rollup,
+    end_secs: u64,
+    hours: u64,
+    per_hour: u16,
+    unit: RawTime,
+) -> u64 {
+    let mut n = 0u64;
+    for h in 0..hours {
+        let base = end_secs - (hours - h) * 3_600;
+        let mut tx = db.begin_write().unwrap();
+        for s in 0..per_hour {
+            let ts = base + (s as u64 * 3_600) / per_hour as u64;
+            let k = raw_key(ts * unit.per_second(), s);
+            tx.put(RAW_NS, &k, b"v").unwrap();
+            r.observe(&mut tx, &obs(ts, b"/a", 200, 5)).unwrap();
+            n += 1;
+        }
+        r.flush(&mut tx).unwrap();
+        tx.commit().unwrap();
+    }
+    n
+}
+
+/// Cuenta las claves vivas del crudo y devuelve el `ts` de la más antigua.
+fn raw_live(db: &Db) -> (u64, Option<u64>) {
+    let rd = db.begin_read();
+    let mut cur = rd.scan(RAW_NS, b"", &[0xff; 12]).unwrap();
+    let (mut n, mut first) = (0u64, None);
+    while let Some((k, _)) = cur.next().unwrap() {
+        if first.is_none() {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&k[..8]);
+            first = Some(u64::from_be_bytes(b));
+        }
+        n += 1;
+    }
+    (n, first)
+}
+
+/// El ciclo completo: el crudo fuera de la ventana desaparece y el agregado
+/// que lo resume sobrevive.
+#[test]
+fn a_full_cycle_drops_the_raw_and_keeps_the_aggregate_that_summarises_it() {
+    let db = db();
+    let mut r = Rollup::new(Config::default());
+    let now = T0 + 12 * 3_600;
+    let n = write_and_observe(&db, &mut r, now, 12, 60, RawTime::Seconds);
+    let (before, _) = raw_live(&db);
+    assert_eq!(before, n);
+
+    let mut tx = db.begin_write().unwrap();
+    let st = r.retain(&mut tx, now, Some(RawWindow::six_hours(RAW_NS, RawTime::Seconds))).unwrap();
+    tx.commit().unwrap();
+
+    let (after, oldest) = raw_live(&db);
+    assert_eq!(st.raw_cutoff, Some((now - RawWindow::SIX_HOURS).to_be_bytes()));
+    assert!(after < before, "la poda no se llevó nada: {after} de {before}");
+    assert_eq!(after, n / 2, "la ventana de 6 h de 12 h de crudo tenía que dejar la mitad");
+    assert!(
+        oldest.unwrap() >= now - RawWindow::SIX_HOURS,
+        "sobrevivió un registro de {} anterior al corte {}",
+        oldest.unwrap(),
+        now - RawWindow::SIX_HOURS
+    );
+
+    // Y el agregado de las horas ya podadas sigue ahí, con su cuenta entera.
+    let rd = db.begin_read();
+    let mut summed = 0u64;
+    for h in 0..12u64 {
+        let tsb = Resolution::Hour.bucket_of(now - (12 - h) * 3_600).unwrap();
+        let total = read_total(&rd, Resolution::Hour, tsb)
+            .unwrap()
+            .unwrap_or_else(|| panic!("falta el agregado de la hora {h}, cuyo crudo ya no existe"));
+        summed += total.requests;
+    }
+    assert_eq!(summed, n, "los agregados suman {summed} para {n} peticiones");
+}
+
+/// `retain` vuelca ANTES de podar: sin ese orden, la celda en curso —que solo
+/// vive en RAM— se quedaría sin fila mientras su crudo ya no existe.
+#[test]
+fn retain_flushes_before_it_prunes_so_the_open_cell_survives_its_own_raw() {
+    let db = db();
+    let mut r = Rollup::new(Config::default());
+    let now = T0 + 3_600;
+    // A mano y SIN `flush`: todo lo observado se queda en RAM.
+    let mut n = 0u64;
+    let mut tx = db.begin_write().unwrap();
+    for s in 0..120u16 {
+        let ts = now - 3_600 + s as u64 * 30;
+        tx.put(RAW_NS, &raw_key(ts, s), b"v").unwrap();
+        r.observe(&mut tx, &obs(ts, b"/a", 200, 5)).unwrap();
+        n += 1;
+    }
+    // Ventana de cero segundos: se lleva TODO el crudo escrito hasta `now`.
+    let st = r.retain(&mut tx, now, Some(RawWindow::new(RAW_NS, 0, RawTime::Seconds))).unwrap();
+    tx.commit().unwrap();
+
+    assert!(st.flush.rows_written > 0, "el ciclo no volcó nada antes de podar");
+    let (live, _) = raw_live(&db);
+    assert_eq!(live, 0, "quedaron {live} registros crudos tras una ventana de cero");
+
+    let rd = db.begin_read();
+    let mut seen = 0u64;
+    for tsb in [
+        Resolution::Hour.bucket_of(now - 3_600).unwrap(),
+        Resolution::Hour.bucket_of(now).unwrap(),
+    ] {
+        if let Some(t) = read_total(&rd, Resolution::Hour, tsb).unwrap() {
+            seen += t.requests;
+        }
+    }
+    assert_eq!(seen, n, "el agregado retiene {seen} de {n} peticiones cuyo crudo ya no existe");
+}
+
+/// Podar el espacio de los agregados «como si fuera el crudo» borraría lo que
+/// el propio ciclo acaba de volcar, y con el crudo detrás no habría con qué
+/// rehacerlo.
+#[test]
+fn retain_refuses_the_aggregate_namespace_as_a_raw_window() {
+    let db = db();
+    let mut r = Rollup::new(Config::default());
+    let mut tx = db.begin_write().unwrap();
+    r.observe(&mut tx, &obs(T0, b"/a", 200, 5)).unwrap();
+    let err = r
+        .retain(&mut tx, T0 + 86_400, Some(RawWindow::six_hours(AGG_NS, RawTime::Seconds)))
+        .unwrap_err();
+    assert_eq!(err, Error::ReservedNamespace { ns: AGG_NS });
+    // Y el rechazo es ANTES de tocar nada: ni volcó ni podó.
+    r.flush(&mut tx).unwrap();
+    tx.commit().unwrap();
+    let rd = db.begin_read();
+    let tsb = Resolution::Hour.bucket_of(T0).unwrap();
+    assert!(read_total(&rd, Resolution::Hour, tsb).unwrap().is_some());
+}
+
+/// Rellenando historia hacia atrás, el corte de retención cae POR ENCIMA de
+/// una celda todavía abierta. Se recorta hasta ella y se dice.
+#[test]
+fn retain_clamps_the_cutoff_to_the_oldest_open_cell_instead_of_erasing_it() {
+    let db = db();
+    let mut r = Rollup::new(Config::default());
+    // La celda abierta es la de T0; `now` va un año por delante, así que el
+    // corte de la hora (7 días) y el del día (90) quedan muy por encima.
+    let mut tx = db.begin_write().unwrap();
+    r.observe(&mut tx, &obs(T0, b"/a", 200, 5)).unwrap();
+    let now = T0 + 365 * 86_400;
+    let st = r.retain(&mut tx, now, None).unwrap();
+    tx.commit().unwrap();
+
+    let hour = Resolution::Hour.code() as usize;
+    let day = Resolution::Day.code() as usize;
+    assert!(st.clamped[hour] && st.clamped[day], "el corte no se recortó: {st:?}");
+    assert_eq!(st.aggregate_cutoff[hour], Some(Resolution::Hour.bucket_of(T0).unwrap()));
+    assert_eq!(st.aggregate_cutoff[day], Some(Resolution::Day.bucket_of(T0).unwrap()));
+
+    let rd = db.begin_read();
+    for res in [Resolution::Hour, Resolution::Day] {
+        let tsb = res.bucket_of(T0).unwrap();
+        assert!(
+            read_total(&rd, res, tsb).unwrap().is_some(),
+            "{res:?}: la poda se llevó la celda que sigue abierta en RAM"
+        );
+    }
+}
+
+/// Sin recorte no habría nada que recortar: con el corte por debajo de toda
+/// celda abierta, `clamped` está en falso y el corte es el del perfil.
+#[test]
+fn the_normal_cycle_does_not_clamp_anything() {
+    let db = db();
+    let mut r = Rollup::new(Config::default());
+    let now = T0 + 8 * 86_400;
+    let mut tx = db.begin_write().unwrap();
+    r.observe(&mut tx, &obs(now, b"/a", 200, 5)).unwrap();
+    let st = r.retain(&mut tx, now, None).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(st.clamped, [false; 3]);
+    let hour = Resolution::Hour.code() as usize;
+    assert_eq!(st.aggregate_cutoff[hour], Config::default().cutoff_bucket(Resolution::Hour, now));
+    // El día también se poda, aunque no haya nada tan viejo: el corte es un
+    // instante unix absoluto (`now − 90 d`), no una cuenta desde el arranque,
+    // así que un `delete_range` vacío se emite igual y cuesta un descenso.
+    assert_eq!(
+        st.aggregate_cutoff[Resolution::Day.code() as usize],
+        Config::default().cutoff_bucket(Resolution::Day, now)
+    );
+    // El minuto está apagado en el perfil por defecto: ni se mira.
+    assert_eq!(st.aggregate_cutoff[Resolution::Minute.code() as usize], None);
+}
+
+/// La unidad del instante de la clave decide cuánto se borra, y equivocarla es
+/// la única forma de que este ciclo destruya datos.
+#[test]
+fn the_raw_time_unit_decides_how_much_the_cycle_deletes() {
+    for unit in [RawTime::Seconds, RawTime::Millis] {
+        let db = db();
+        let mut r = Rollup::new(Config::default());
+        let now = T0 + 12 * 3_600;
+        let n = write_and_observe(&db, &mut r, now, 12, 30, unit);
+
+        // La unidad CORRECTA deja media ventana.
+        let mut tx = db.begin_write().unwrap();
+        r.retain(&mut tx, now, Some(RawWindow::six_hours(RAW_NS, unit))).unwrap();
+        tx.commit().unwrap();
+        let (after, _) = raw_live(&db);
+        assert_eq!(after, n / 2, "unidad {unit:?}: sobreviven {after} de {n}");
+
+        // La EQUIVOCADA, en el sentido peligroso, se lo lleva todo; en el otro,
+        // nada. Se comprueban las dos direcciones porque no son simétricas.
+        let wrong = match unit {
+            RawTime::Seconds => RawTime::Millis,
+            RawTime::Millis => RawTime::Seconds,
+        };
+        let mut tx = db.begin_write().unwrap();
+        r.retain(&mut tx, now, Some(RawWindow::six_hours(RAW_NS, wrong))).unwrap();
+        tx.commit().unwrap();
+        let (after_wrong, _) = raw_live(&db);
+        match unit {
+            // Claves en segundos, corte en milisegundos: barre el log entero.
+            RawTime::Seconds => assert_eq!(after_wrong, 0),
+            // Claves en milisegundos, corte en segundos: no borra nada.
+            RawTime::Millis => assert_eq!(after_wrong, after),
+        }
+    }
+}
+
+/// El rechazo del motor sobre un espacio indexado llega tal cual al ciclo, sin
+/// que este haya podado ya la mitad.
+#[test]
+fn retain_propagates_the_engines_refusal_over_an_indexed_raw_namespace() {
+    let db = db();
+    fn extract(k: &[u8], _v: &[u8]) -> Vec<Vec<u8>> {
+        vec![k.to_vec()]
+    }
+    db.define_index(crate::index::IndexDef {
+        id: 4,
+        name: "raw",
+        version: 1,
+        ns: RAW_NS,
+        unique: false,
+        extract,
+    })
+    .unwrap();
+    let mut r = Rollup::new(Config::default());
+    let now = T0 + 12 * 3_600;
+    let mut tx = db.begin_write().unwrap();
+    r.observe(&mut tx, &obs(now, b"/a", 200, 5)).unwrap();
+    let err = r
+        .retain(&mut tx, now, Some(RawWindow::six_hours(RAW_NS, RawTime::Seconds)))
+        .unwrap_err();
+    assert_eq!(err, Error::DeleteRangeIndexed { ns: RAW_NS });
+}
+
+/// Muchos ciclos seguidos en régimen permanente: el número de registros vivos
+/// se queda quieto, que es lo que hace que el fichero pueda estabilizarse.
+#[test]
+fn the_live_raw_count_reaches_a_plateau_across_many_cycles() {
+    let db = db();
+    let mut r = Rollup::new(Config::default());
+    let per_hour = 60u16;
+    let mut live = Vec::new();
+    for h in 0..24u64 {
+        let now = T0 + (h + 1) * 3_600;
+        let mut tx = db.begin_write().unwrap();
+        for s in 0..per_hour {
+            let ts = T0 + h * 3_600 + (s as u64 * 3_600) / per_hour as u64;
+            tx.put(RAW_NS, &raw_key(ts, s), b"v").unwrap();
+            r.observe(&mut tx, &obs(ts, b"/a", 200, 5)).unwrap();
+        }
+        r.retain(&mut tx, now, Some(RawWindow::six_hours(RAW_NS, RawTime::Seconds))).unwrap();
+        tx.commit().unwrap();
+        live.push(raw_live(&db).0);
+    }
+    // Desde la sexta hora en adelante, exactamente seis horas de crudo vivo.
+    let steady = 6 * per_hour as u64;
+    for (h, n) in live.iter().enumerate().skip(6) {
+        assert_eq!(*n, steady, "hora {h}: {n} registros vivos, esperados {steady}");
+    }
+}

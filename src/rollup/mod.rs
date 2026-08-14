@@ -501,6 +501,126 @@ impl FlushStats {
     }
 }
 
+/// En qué unidad va el instante que encabeza la clave del crudo.
+///
+/// **Es la única parte de la aritmética de poda que puede destruir datos si
+/// se equivoca**, y por eso se pide explícitamente en vez de suponerse. La
+/// clave cruda del esquema de referencia es `[ts BE u64][seq u16]`, pero el
+/// `ts` va en milisegundos en unos sitios (`synthetic_log`, `tests/size.rs`)
+/// y en segundos en otros (`Observation::ts`, esta misma capa). Confundirlos
+/// no da un error: da un borrado del tamaño equivocado, y los dos sentidos
+/// son asimétricos.
+///
+/// - Claves en milisegundos, corte calculado en segundos: el corte sale mil
+///   veces demasiado pequeño, no borra nada y el fichero crece sin cota. Se
+///   nota, tarde.
+/// - Claves en segundos, corte calculado en milisegundos: el corte sale mil
+///   veces demasiado grande y **borra el log entero, incluido lo de hace un
+///   segundo**. No se nota hasta que alguien pregunta por un dato que ya no
+///   existe.
+///
+/// Pedirlo como un dato del llamante hace que la elección se lea en el sitio
+/// donde se construye la ventana, que es donde alguien puede compararla con
+/// el esquema.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RawTime {
+    /// El `ts` de la clave va en segundos unix.
+    Seconds,
+    /// El `ts` de la clave va en milisegundos unix.
+    Millis,
+}
+
+impl RawTime {
+    /// Cuántas unidades de estas hay en un segundo.
+    pub const fn per_second(self) -> u64 {
+        match self {
+            RawTime::Seconds => 1,
+            RawTime::Millis => 1_000,
+        }
+    }
+}
+
+/// La ventana de vida del crudo dentro de un ciclo de retención.
+///
+/// Describe un log cuya clave **empieza por el instante en big-endian**, que
+/// es la disposición que hace que una poda por tiempo sea un solo
+/// `delete_range` sobre un rango contiguo. Lo que venga detrás del instante
+/// —un número de secuencia, un identificador— no importa: una clave de 8
+/// bytes es prefijo de cualquier clave más larga que empiece igual, así que
+/// ordena antes que ella y el corte cae exactamente entre dos instantes.
+///
+/// **Si tu clave cruda NO empieza por el instante**, esta ventana no te
+/// sirve: pasa `None` a `Rollup::retain` y haz tu propio `delete_range`
+/// **dentro de la misma transacción**, después de `retain`. El orden es lo
+/// que importa, no quién emite el borrado.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RawWindow {
+    /// Espacio de claves del crudo. **No puede ser `AGG_NS`**: `retain`
+    /// escribe los agregados ahí mismo en la transacción en curso, y borrarle
+    /// un rango destruiría lo que acaba de volcar.
+    pub ns: u8,
+    /// Cuánto vive un registro crudo, en segundos.
+    pub secs: u64,
+    /// Unidad del instante que encabeza la clave.
+    pub time: RawTime,
+}
+
+impl RawWindow {
+    /// Las **6 horas** que decidió el dueño de la carga de referencia. No es
+    /// una política del motor: es el valor que esta capa documenta y que
+    /// `docs/agregacion.md` usa en todas sus proyecciones por tier.
+    pub const SIX_HOURS: u64 = 6 * 3_600;
+
+    pub const fn new(ns: u8, secs: u64, time: RawTime) -> RawWindow {
+        RawWindow { ns, secs, time }
+    }
+
+    /// La ventana de 6 horas sobre `ns`.
+    pub const fn six_hours(ns: u8, time: RawTime) -> RawWindow {
+        RawWindow::new(ns, RawWindow::SIX_HOURS, time)
+    }
+
+    /// Cota superior **exclusiva** del `delete_range` que poda esta ventana
+    /// vista desde `now_secs`: se borra `[b"", cutoff_key)`.
+    ///
+    /// `saturating_sub` y `saturating_mul`, y las dos saturaciones no son
+    /// igual de inocentes:
+    ///
+    /// - Por abajo (`now_secs < secs`, un arranque en frío o un reloj sin
+    ///   sincronizar) el corte sale cero y **no se borra nada**. Es lo
+    ///   conservador y no hace falta avisar de ello.
+    /// - Por arriba solo se llega con un reloj disparatado —`now_secs` por
+    ///   encima de 1,8·10¹⁶ segundos, el año 584 millones— y el corte
+    ///   saturado sería `u64::MAX`, **que borra el log entero**. No hay forma
+    ///   de distinguirlo aquí de una política legítima de «bórralo todo», así
+    ///   que no se rechaza: se informa. `RetentionStats::raw_cutoff` devuelve
+    ///   el corte APLICADO, y quien registre esa cifra verá `ffff…` y sabrá
+    ///   que su reloj miente.
+    pub fn cutoff_key(&self, now_secs: u64) -> [u8; 8] {
+        now_secs
+            .saturating_sub(self.secs)
+            .saturating_mul(self.time.per_second())
+            .to_be_bytes()
+    }
+}
+
+/// Qué hizo un ciclo de retención. Todo lo que devuelve es lo **aplicado**,
+/// no lo pedido: si un corte se recortó, aquí está el que de verdad se usó.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct RetentionStats {
+    /// Lo que escribió el volcado que precede a toda poda.
+    pub flush: FlushStats,
+    /// Celda de corte aplicada a cada resolución, indexada por
+    /// `Resolution::code()`. `None` si la resolución está apagada o si el
+    /// corte salía en cero (nada anterior que borrar).
+    pub aggregate_cutoff: [Option<u32>; 3],
+    /// Resoluciones cuyo corte hubo que **recortar** porque una celda todavía
+    /// abierta en RAM caía por debajo de él. Ver `Rollup::retain`.
+    pub clamped: [bool; 3],
+    /// Cota superior exclusiva aplicada al crudo, si se pidió ventana.
+    pub raw_cutoff: Option<[u8; 8]>,
+}
+
 /// Una fila de agregado leída del disco.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Row {
@@ -852,6 +972,130 @@ mod engine {
             }
             Ok(stats)
         }
+
+        /// Un ciclo de retención completo, **en una sola transacción y en el
+        /// único orden que no destruye datos**: volcar, podar los agregados
+        /// de cada resolución activa por su propia retención, podar el crudo
+        /// por la suya.
+        ///
+        /// # El orden, que es todo el motivo de que esto exista
+        ///
+        /// Los agregados se derivan del crudo y **no se pueden reconstruir
+        /// una vez el crudo se ha ido**. La secuencia peligrosa es podar el
+        /// crudo antes de que su agregado esté escrito: lo que la celda en
+        /// curso lleva acumulado vive solo en RAM (ver el contrato de
+        /// `flush`), así que un `delete_range` del crudo confirmado antes de
+        /// un `flush` deja una ventana en la que un corte se lleva las dos
+        /// copias. Aquí el `flush` va primero y **todo ocurre en la misma
+        /// transacción**, de modo que el borrado del crudo y la escritura de
+        /// su resumen son atómicos: o los dos, o ninguno. Ni siquiera hay un
+        /// orden que el llamante pueda equivocar.
+        ///
+        /// Entre las dos podas el orden es indiferente para la corrección
+        /// —una transacción es atómica— y se hace primero el agregado y
+        /// después el crudo por la misma razón que se cuenta arriba: lo
+        /// derivado se resuelve antes que su origen.
+        ///
+        /// # Lo que NO hace
+        ///
+        /// - **No confirma.** La transacción es del llamante, como en todo el
+        ///   resto de esta capa.
+        /// - **No llama a `Db::reclaim_tail`**, y no puede: `reclaim_tail`
+        ///   toma el candado de escritor y abre sus propias transacciones, así
+        ///   que va **después** del `commit`. El ciclo completo son cuatro
+        ///   pasos y el cuarto es de otro objeto:
+        ///
+        /// ```ignore
+        /// let mut tx = db.begin_write()?;                       // 1
+        /// let st = rollup.retain(&mut tx, ahora, Some(ventana))?; // 2
+        /// tx.commit()?;                                         // 3
+        /// let devueltos = db.reclaim_tail()?;                   // 4
+        /// ```
+        ///
+        /// - **No decide cuándo.** La política sigue siendo del llamante
+        ///   (`docs/agregacion.md` §1): esto es la aritmética y el orden, no
+        ///   un planificador.
+        ///
+        /// # El recorte por celda abierta
+        ///
+        /// Podar una celda que sigue abierta en RAM la corrompe: el volcado
+        /// siguiente la reescribiría a medias (o, peor, no la reescribiría en
+        /// absoluto, porque `flush` ya limpió sus marcas de sucia). No puede
+        /// pasar con las retenciones de ningún perfil —la más corta son 48
+        /// horas y las celdas abiertas son las de ahora mismo— pero **sí puede
+        /// pasar rellenando historia hacia atrás**: quien reprocesa logs de
+        /// hace un mes tiene celdas abiertas muy por debajo del corte.
+        ///
+        /// En vez de rechazar el ciclo entero, el corte se **recorta** hasta
+        /// la celda abierta más antigua de esa resolución. Poda menos, nunca
+        /// más, y lo dice: `RetentionStats::clamped` marca la resolución y
+        /// `aggregate_cutoff` lleva el corte que de verdad se aplicó.
+        ///
+        /// # Lo que sigue siendo responsabilidad del llamante
+        ///
+        /// **Que todo registro crudo que se va a podar haya sido observado.**
+        /// Esta capa no puede saber si un `put` en el espacio del crudo pasó
+        /// también por `observe`: si tu escritor mete filas que nunca observa,
+        /// `retain` las borra igual y no quedará resumen de ellas. Es el mismo
+        /// contrato que la propia agregación ya tiene (`observe` en el mismo
+        /// bucle que el `put`), llevado a la poda.
+        ///
+        /// # Errores
+        ///
+        /// - `Error::ReservedNamespace { ns }` si la ventana del crudo apunta
+        ///   a `AGG_NS`. Sería el borrado de los agregados que este mismo
+        ///   ciclo acaba de volcar, y **con el crudo ya podado detrás no habría
+        ///   nada con qué rehacerlos**.
+        /// - `Error::DeleteRangeIndexed { ns }` si el espacio del crudo tiene
+        ///   índices declarados — la negativa es de `WriteTxn::delete_range`,
+        ///   no de aquí, y el remedio está en su comentario.
+        /// - Lo que devuelvan `flush` o el propio motor. En cualquier caso la
+        ///   transacción no se confirma, así que el ciclo no deja nada a
+        ///   medias; y como ha habido un `flush`, **hay que llamar a
+        ///   `Rollup::reset`** antes de reutilizar el agregador, exactamente
+        ///   igual que con un `flush` suelto.
+        pub fn retain(
+            &mut self,
+            tx: &mut WriteTxn<'_>,
+            now_secs: u64,
+            raw: Option<RawWindow>,
+        ) -> Result<RetentionStats> {
+            if let Some(w) = raw
+                && w.ns == AGG_NS
+            {
+                return Err(Error::ReservedNamespace { ns: w.ns });
+            }
+
+            let mut stats = RetentionStats { flush: self.flush(tx)?, ..Default::default() };
+
+            for res in RESOLUTIONS {
+                if !self.cfg.keeps(res) {
+                    continue;
+                }
+                let ri = res.code() as usize;
+                let Some(mut cut) = self.cfg.cutoff_bucket(res, now_secs) else {
+                    continue;
+                };
+                if let Some(oldest) = self.cells[ri].keys().next().copied()
+                    && oldest < cut
+                {
+                    cut = oldest;
+                    stats.clamped[ri] = true;
+                }
+                if cut == 0 {
+                    continue;
+                }
+                prune_before(tx, res, cut)?;
+                stats.aggregate_cutoff[ri] = Some(cut);
+            }
+
+            if let Some(w) = raw {
+                let cut = w.cutoff_key(now_secs);
+                tx.delete_range(w.ns, &[], &cut)?;
+                stats.raw_cutoff = Some(cut);
+            }
+            Ok(stats)
+        }
     }
 
     /// Fila de totales de una celda.
@@ -921,6 +1165,60 @@ mod engine {
 
 #[cfg(feature = "std")]
 pub use engine::{prune_before, read_dimension, read_range, read_total};
+
+/// La aritmética del corte del crudo, que es `alloc` a secas y por tanto
+/// corre también bajo `--no-default-features --features rollup`. El ciclo
+/// completo (`Rollup::retain`) necesita un `Db` vivo y vive en `tests.rs`.
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn the_cutoff_key_is_the_instant_in_big_endian_in_the_declared_unit() {
+        let now = 1_786_320_000u64;
+        let s = RawWindow::six_hours(0x01, RawTime::Seconds);
+        assert_eq!(s.cutoff_key(now), (now - 6 * 3_600).to_be_bytes());
+        let m = RawWindow::six_hours(0x01, RawTime::Millis);
+        assert_eq!(m.cutoff_key(now), ((now - 6 * 3_600) * 1_000).to_be_bytes());
+        // Las dos unidades sobre el MISMO instante dan cortes que difieren en
+        // tres órdenes de magnitud: es justo el fallo que el enum evita.
+        assert!(m.cutoff_key(now) > s.cutoff_key(now));
+    }
+
+    #[test]
+    fn a_clock_below_the_window_yields_a_cutoff_that_deletes_nothing() {
+        // Arranque en frío: `now` por debajo de la ventana. El corte es cero,
+        // y `[b"", 0u64)` es un rango vacío.
+        for unit in [RawTime::Seconds, RawTime::Millis] {
+            let w = RawWindow::six_hours(0x01, unit);
+            assert_eq!(w.cutoff_key(0), [0u8; 8]);
+            assert_eq!(w.cutoff_key(RawWindow::SIX_HOURS), [0u8; 8]);
+            assert_eq!(w.cutoff_key(RawWindow::SIX_HOURS - 1), [0u8; 8]);
+        }
+    }
+
+    #[test]
+    fn an_impossible_clock_saturates_upward_and_the_stats_can_show_it() {
+        // Nadie puede distinguir esto de «bórralo todo», así que no se
+        // rechaza: se informa. Ver `RawWindow::cutoff_key`.
+        let w = RawWindow::six_hours(0x01, RawTime::Millis);
+        assert_eq!(w.cutoff_key(u64::MAX), [0xff; 8]);
+    }
+
+    #[test]
+    fn the_six_hour_window_is_the_documented_one() {
+        assert_eq!(RawWindow::SIX_HOURS, 21_600);
+        let w = RawWindow::six_hours(0x7f, RawTime::Seconds);
+        assert_eq!(w, RawWindow::new(0x7f, 21_600, RawTime::Seconds));
+        assert_eq!(w.ns, 0x7f);
+    }
+
+    #[test]
+    fn a_zero_window_is_a_legitimate_policy_and_cuts_at_now() {
+        let w = RawWindow::new(0x01, 0, RawTime::Seconds);
+        assert_eq!(w.cutoff_key(1_000), 1_000u64.to_be_bytes());
+    }
+}
 
 #[cfg(test)]
 mod tests;
