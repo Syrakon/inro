@@ -618,9 +618,10 @@ el `enum Sync`, y aquí vale un **+38 %**.
 ### 8.7 `reclaim_tail` no ayuda en régimen permanente
 
 Medido (`what_blocks_reclaim_tail_in_the_steady_state`): en régimen,
-`reclaim_tail` devuelve **4 KB**. Borrar **todo** el crudo y volver a llamarla
-devuelve **16 KB**. Borrar además los agregados devuelve el fichero entero (932
-KB en micro, 1.872 en starter).
+`reclaim_tail` devuelve **0-4 KB**. Borrar **todo** el crudo y volver a llamarla
+devuelve 16 KB (micro, starter) o 180 KB (pro). Borrar además los agregados
+devuelve el fichero entero: 932 KB en micro, 1.872 en starter, **5.908 de 6.100
+KB en pro** — donde el crudo era el 88 % de las páginas vivas.
 
 **Lo que está arriba son los agregados**: sobreviven al crudo y crecen de forma
 monótona 90 días, así que sus páginas se asignan tarde mientras las del crudo se
@@ -637,6 +638,25 @@ hojas raquíticas. **No pasa.** Con un ciclo de poda por hora simulada durante
 34,17 bytes por entrada viva**, sin ninguna deriva
 (`raw_leaf_fill_across_repeated_prune_cycles`). El sesgo de anexado y la cota
 `[ns+1]` sobreviven a la poda pesada.
+
+### 8.9 La meseta no es el peor caso: la ráfaga sí
+
+Las cifras de arriba reparten el tope **mensual** del plan. El limitador de
+`quota` deja pasar un rps mucho mayor, y **el crudo vivo lo fija el ritmo, no el
+mes**. Seis horas seguidas al tope de ráfaga, con el ciclo de retención
+corriendo (`the_burst_ceiling_of_a_plan_bounds_the_live_raw`):
+
+| Tier | rps | Crudo vivo | Fichero | vs. su meseta |
+|---|---|---|---|---|
+| micro | 5 | 108.000 | 3.804 KB | ×1,6 |
+| starter | 25 | 540.000 | 17.396 KB | ×5,5 |
+| pro | 150 | 3.240.000 | 100.780 KB | ×15 |
+| enterprise | 500 | 10.800.000 | **325.148 KB** | **×18** |
+
+A ese ritmo el mes entero se gasta en 11-28 horas, así que nadie lo sostiene —
+pero es lo que cabe en la ventana si un inquilino quema su mes en un día, y es
+lo que hay que aprovisionar. **La palanca es la ventana, no esta capa**: con 1
+hora en vez de 6 el peor caso baja al sexto.
 
 ## 9. Límites conocidos
 
