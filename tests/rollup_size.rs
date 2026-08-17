@@ -36,6 +36,13 @@
 #![cfg(all(feature = "std", feature = "rollup"))]
 
 use inro::rollup::{Bucket, Config, Dimension, Observation, Resolution, Rollup, key};
+
+/// Las cuatro dimensiones encendidas: la forma que estos bancos midieron antes
+/// de que existiera el eje `Config::dims`.
+const DIMS_ALL: u8 = Dimension::Status.bit()
+    | Dimension::Endpoint.bit()
+    | Dimension::Country.bit()
+    | Dimension::User.bit();
 use inro::storage::FileStorage;
 use inro::{Db, Options, Storage, Sync};
 use std::sync::Arc;
@@ -398,8 +405,32 @@ fn rows_per_cell_measured_against_a_real_rollup() {
         } else {
             assert_eq!(counts[0], 0, "el perfil no retiene el minuto y escribió {} filas", counts[0]);
         }
-        assert!(counts[1] <= 1 + 4 * (k + 1), "hora: {} filas", counts[1]);
-        assert_eq!(counts[1], counts[2], "hora y día guardan las mismas dimensiones");
+        // Cota y suelo POR RESOLUCIÓN, derivados de `cfg.dims`. Antes esto
+        // era `counts[1] == counts[2]`, "hora y día guardan las mismas
+        // dimensiones", que dejó de ser cierto el 17-08-2026: el día guarda
+        // solo la fila de totales (sección 12.3 de la especificación). Un
+        // igualdad entre dos resoluciones ya no dice nada; lo que hay que
+        // vigilar es que cada una escriba lo que su máscara dice.
+        for res in [Resolution::Hour, Resolution::Day] {
+            let i = res.code() as usize;
+            if !cfg.keeps(res) {
+                continue;
+            }
+            let n_dims = res.dimensions().iter().filter(|d| cfg.dims[i] & d.bit() != 0).count();
+            assert!(
+                counts[i] <= 1 + n_dims * (k + 1),
+                "{res:?}: {} filas con {n_dims} dimensiones y K = {k}",
+                counts[i]
+            );
+            if n_dims == 0 {
+                assert_eq!(
+                    counts[i], 1,
+                    "{res:?} no lleva ninguna dimensión, así que debe escribir solo el total"
+                );
+            } else {
+                assert!(counts[i] > 1, "{res:?} lleva {n_dims} dimensiones y no escribió ninguna");
+            }
+        }
     }
 }
 
@@ -515,6 +546,10 @@ const PROFILES: [Prof; 5] = [
             hour: true,
             day: true,
             max_open_cells: 2,
+            // Las cuatro dimensiones, que es lo que estas filas midieron
+            // siempre: el eje `dims` es posterior y estas dos existen para
+            // comparar K y retenciones, no dimensiones.
+            dims: [DIMS_ALL, DIMS_ALL, DIMS_ALL],
             retention_secs: [48 * 3_600, 7 * 86_400, 90 * 86_400],
         },
     },
@@ -531,6 +566,10 @@ const PROFILES: [Prof; 5] = [
             hour: true,
             day: true,
             max_open_cells: 2,
+            // Las cuatro dimensiones, que es lo que estas filas midieron
+            // siempre: el eje `dims` es posterior y estas dos existen para
+            // comparar K y retenciones, no dimensiones.
+            dims: [DIMS_ALL, DIMS_ALL, DIMS_ALL],
             retention_secs: [6 * 3_600, 30 * 86_400, 365 * 86_400],
         },
     },
