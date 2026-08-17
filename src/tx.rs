@@ -123,11 +123,30 @@ pub struct Options {
     /// así (ver su comentario), en vez de cifrar en silencio con una
     /// implementación que no está compilada.
     pub encryption: Option<Encryption>,
+    /// Tope de tamaño de la base, en PÁGINAS. `None` (el valor por defecto)
+    /// es el comportamiento de siempre: el único límite es el contador de
+    /// 32 bits, 2 TB con páginas de 512 B.
+    ///
+    /// **En páginas y no en bytes** porque es la única unidad que el motor
+    /// cuenta: `Meta::n_pages` ya existe y ya es el número contra el que se
+    /// comprueba el desbordamiento. Un tope en bytes habría que redondearlo
+    /// a la baja al múltiplo de página en cada asignación.
+    ///
+    /// **Se compara contra el máximo histórico, no contra las páginas
+    /// vivas.** El fichero no encoge al podar: las páginas vuelven a la
+    /// lista de libres y se reutilizan, pero `n_pages` solo lo baja
+    /// `Db::reclaim_tail`. Un tope contra el espacio en uso daría por bueno
+    /// un fichero que ya ocupa el doble en disco.
+    ///
+    /// Reciclar nunca choca contra el tope: solo lo comprueba la rama de
+    /// `WriteTxn::alloc` que extiende el fichero. Ver ahí la reserva que
+    /// mantiene podable una base llena.
+    pub max_pages: Option<u32>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { page_size: 512, sync: Sync::Commit, cache_pages: 32, encryption: None }
+        Self { page_size: 512, sync: Sync::Commit, cache_pages: 32, encryption: None, max_pages: None }
     }
 }
 
@@ -210,6 +229,18 @@ pub struct Db {
     write_lock: Mutex<Option<WriterState>>,
     readers: Mutex<BTreeMap<TxnId, u32>>,
     sync: Sync,
+    /// Tope de páginas de esta apertura (`Options::max_pages`). Es política
+    /// del proceso que abre, no del fichero: no se escribe en la meta ni se
+    /// hereda al reabrir, así que una base que llegó a su tope se puede
+    /// abrir sin él —para leerla, para migrarla, para subirle el plan— sin
+    /// tocar un solo byte del formato.
+    ///
+    /// **`page_cap` y no `max_pages`**, aunque la opción pública se llame
+    /// así: `PageSource::max_pages` ya existe en este mismo fichero y
+    /// significa lo contrario —cuántas páginas TIENE el fichero, la cota
+    /// para leer— y dos campos con el mismo nombre y sentidos opuestos es
+    /// una trampa que alguien pisa.
+    page_cap: Option<u32>,
     last_sync: Mutex<Instant>,
     /// Índices registrados en este proceso (tarea 16). Vacío hasta que el
     /// llamante invoca `define_index`; nunca se relee solo de disco — cada
@@ -810,6 +841,7 @@ impl Db {
             write_lock: Mutex::new(Some(writer_state)),
             readers: Mutex::new(BTreeMap::new()),
             sync: opts.sync,
+            page_cap: opts.max_pages,
             last_sync: Mutex::new(Instant::now()),
             indexes: Mutex::new(Vec::new()),
             // `None`, no `Some(Vec::new())`: "todavía no lo he leído" y "lo
@@ -1330,6 +1362,9 @@ pub struct WriteTxn<'db> {
     /// memoria: en una transacción de 45 000 `put` esto llegaba a costar
     /// del orden de 1,6 MB, sin dar ninguna protección real a una base SIN
     /// cifrar, donde no se sella nada). Ver `write_page`.
+    /// Reserva abierta: solo lo está mientras corre una operación que reduce
+    /// el árbol (`with_reserve`). Ver `RESERVE_PAGES`.
+    reserve: bool,
     written: BTreeSet<u64>,
     /// Escrituras físicas (`write_page`) emitidas por esta transacción hasta
     /// ahora — tarea 20. A diferencia de `written`, se lleva SIEMPRE, con o
@@ -1433,6 +1468,7 @@ impl Db {
             guard,
             meta,
             slot,
+            reserve: false,
             written: BTreeSet::new(),
             write_count: 0,
             pre_freelist,
@@ -1776,6 +1812,45 @@ impl<'db> WriteTxn<'db> {
     /// liberarla de nuevo (dentro de la misma transacción) es siempre
     /// seguro y debe ir a `own_free`, no a la lista persistente — ver
     /// `free`.
+    /// Páginas que el tope se guarda para que una base llena todavía se
+    /// pueda vaciar.
+    ///
+    /// **Sin esto, el tope es una condena.** El copy-on-write reescribe el
+    /// camino raíz-hoja en cada commit, así que `delete`/`delete_range`
+    /// ASIGNAN antes de liberar nada: una base clavada en su límite no
+    /// podría podarse, y el remedio para estar llena exigiría justo lo que
+    /// estar llena impide.
+    ///
+    /// 64 y no la altura exacta del árbol: el peor commit de poda son el
+    /// camino raíz-hoja (5 niveles medidos en la sección 12.4 de la
+    /// especificación, con 2,5 millones de entradas) más las páginas de
+    /// lista de libres que toque y la meta. 64 cubre eso con holgura de
+    /// sobra y cuesta 32 KiB con páginas de 512 B — entre el 0,03% y el
+    /// 0,2% de los topes por tier. Ser tacaño aquí solo compra bytes y
+    /// puede costar una base irrecuperable.
+    pub(crate) const RESERVE_PAGES: u32 = 64;
+
+    /// Rechaza el crecimiento que pasaría del tope de esta apertura.
+    ///
+    /// La reserva la abre `with_reserve`, que solo envuelve a las
+    /// operaciones que REDUCEN el árbol. Todo lo demás se para
+    /// `RESERVE_PAGES` antes del tope de verdad.
+    fn check_page_cap(&self, grown: PageNo) -> Result<()> {
+        let Some(cap) = self.db.page_cap else { return Ok(()) };
+        let limit = if self.reserve { cap } else { cap.saturating_sub(Self::RESERVE_PAGES) };
+        if grown > limit { Err(Error::Full) } else { Ok(()) }
+    }
+
+    /// Ejecuta `f` con la reserva abierta. Solo para operaciones que dejan
+    /// el árbol más pequeño de lo que estaba.
+    fn with_reserve<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let before = self.reserve;
+        self.reserve = true;
+        let out = f(self);
+        self.reserve = before;
+        out
+    }
+
     pub(crate) fn alloc(&mut self) -> Result<PageNo> {
         if let Some(p) = self.own_free.pop() {
             return Ok(p);
@@ -1791,7 +1866,21 @@ impl<'db> WriteTxn<'db> {
             // recibió nunca — así que este único salto basta para que jamás
             // aparezca como dato en ningún camino que pase por `alloc`.
             let p = Self::skip_meta_b_target(self.meta.n_pages, self.page_size())?;
-            self.meta.n_pages = p.checked_add(1).ok_or(Error::Full)?;
+            let grown = p.checked_add(1).ok_or(Error::Full)?;
+            if self.check_page_cap(grown).is_err() {
+                // Antes de rendirse: forzar el `fsync` que desbloquea el
+                // suelo de reutilización. Es caro, pero al llegar al tope
+                // la alternativa no es crecer un poco más, es fallar — ver
+                // `recycle_inner`.
+                match self.recycle_inner(true)? {
+                    Some(p) => {
+                        self.self_allocated.insert(p);
+                        return Ok(p);
+                    }
+                    None => return Err(Error::Full),
+                }
+            }
+            self.meta.n_pages = grown;
             p
         };
         self.self_allocated.insert(p);
@@ -1828,12 +1917,31 @@ impl<'db> WriteTxn<'db> {
     /// referencia todavía, y la meta de esta transacción aún no se ha
     /// escrito.
     fn recycle(&mut self) -> Result<Option<PageNo>> {
+        self.recycle_inner(false)
+    }
+
+    /// `forced`: paga el `fsync` que desbloquea el suelo de reutilización
+    /// aunque el presupuesto de `reclaim_needs_a_sync` diga que todavía sale
+    /// más barato dejar crecer el fichero.
+    ///
+    /// **Existe por el tope de páginas, y el matiz importa.** Ese
+    /// presupuesto compara el coste de un `fsync` contra el de dejar crecer
+    /// el fichero unas páginas más — un intercambio que asume que crecer
+    /// siempre es posible. Con `Options::max_pages` deja de serlo: al llegar
+    /// al tope, "crecer un poco más" no es la alternativa barata, es la
+    /// alternativa inexistente. Sin este camino, una base tope-llena
+    /// devolvía `Full` con la lista de libres llena de páginas servibles y
+    /// podar no servía de nada — lo detectaron
+    /// `pruning_gives_the_space_back_for_new_writes` y
+    /// `the_cap_counts_the_high_water_mark_and_not_the_live_pages` en
+    /// `tests/cap.rs`, y es justo el modo (`Sync::Never`) que usa el edge.
+    fn recycle_inner(&mut self, forced: bool) -> Result<Option<PageNo>> {
         let pager = &self.db.pager;
         let floor = self.db.reuse_floor();
         if let Some(p) = self.state().freelist.pop_refill(pager, Some(floor))? {
             return Ok(Some(p));
         }
-        if !self.db.reclaim_needs_a_sync() {
+        if !forced && !self.db.reclaim_needs_a_sync() {
             return Ok(None);
         }
         let upto = self.db.committed.read().unwrap().0.txn_id;
@@ -2275,7 +2383,10 @@ impl<'db> WriteTxn<'db> {
             return Err(Error::DeleteRangeIndexed { ns });
         }
         let (a, b) = (scoped(ns, from), scoped(ns, to));
-        let root = crate::tree::delete_range(self, self.meta.root, &a, &b)?;
+        // Con la reserva abierta: desenganchar un subárbol reescribe el
+        // camino hasta la raíz, así que esto ASIGNA aunque su efecto sea
+        // liberar. Ver `RESERVE_PAGES`.
+        let root = self.with_reserve(|tx| crate::tree::delete_range(tx, tx.meta.root, &a, &b))?;
         self.meta.root = root;
         Ok(())
     }
