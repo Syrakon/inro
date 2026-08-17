@@ -96,8 +96,10 @@ bench:
     - mkdir -p target
     # Sin esto, `cmd | tee fichero` reporta el código de salida de `tee`
     # (casi siempre 0), no el de `cargo test` — y esta etapa EXISTE para
-    # fallar cuando el umbral de 40 B/entrada no se cumple (medido: 67,72
-    # B, ver más abajo). Sin `pipefail` la orden de abajo fallaría en el
+    # fallar cuando el umbral de 40 B/entrada no se cumple. Lo hizo durante
+    # todo el tiempo que la medición estuvo en 67,72 B/entrada; hoy pasa,
+    # con 34,14 medidos tras `SplitBias`, porque bajó el número y no el
+    # listón. Sin `pipefail` la orden de abajo fallaría en el
     # texto impreso pero la etapa `bench` quedaría en verde de todos modos,
     # ocultando exactamente el hallazgo que este fichero existe para
     # exponer. Requiere bash (lo es por defecto en las imágenes de `rust`
@@ -114,18 +116,25 @@ bench:
     # tarea 21: la prueba de apertura va PRIMERO, la del umbral de
     # bytes/entrada va SEGUNDA — al revés de como estaban originalmente. El
     # umbral de 40 B/entrada (`bytes_per_log_entry_stay_under_the_threshold`)
-    # FALLA a propósito (medido: 67,72 B/entrada, ver la sección 12.2 de la
-    # especificación) — no se ha subido el umbral para que pase — y una
+    # falló a propósito mientras el hueco de llenado estuvo abierto, y una
     # orden de `script` de GitLab CI que falla detiene las que le siguen. Con
     # el umbral primero, la prueba de apertura de más abajo NUNCA llegaría a
     # ejecutarse en una corrida real de integración continua, solo en local
     # (donde nadie nota que la segunda orden se saltó). Con la apertura
-    # primero, corre siempre, pase lo que pase con el umbral.
-    - cargo test --release --test size -- --ignored opening_costs --nocapture 2>&1 | tee target/bench-report.txt
+    # primero, corre siempre, pase lo que pase con el umbral. Hoy el umbral
+    # está en verde, pero el orden se conserva: la próxima regresión de
+    # llenado volvería a ponerlo en rojo.
+    #
+    # `--exact` con el nombre COMPLETO, no el prefijo `opening_costs`: desde
+    # que existe `..._at_two_gigabytes` ese prefijo casa con DOS pruebas, y
+    # la de 2 GB tarda una hora de reloj y escribe 2 GB de disco temporal.
+    # No entra en integración continua a propósito — es un banco de mano,
+    # ver su comentario en `tests/size.rs`.
+    - cargo test --release --test size -- --ignored --exact opening_costs_the_same_at_thirty_kilobytes_and_at_two_hundred_thousand_entries --nocapture 2>&1 | tee target/bench-report.txt
     # Bytes/entrada + poda + control de orden de inserción, en la misma
-    # orden. `--skip opening_costs` deja fuera la prueba de arriba (ya
-    # corrida). `tee -a` para que las dos corridas queden en el mismo
-    # artefacto.
+    # orden. `--skip opening_costs` deja fuera las DOS pruebas de apertura:
+    # la de arriba, ya corrida, y la de 2 GB, que no debe correr aquí.
+    # `tee -a` para que las dos corridas queden en el mismo artefacto.
     - cargo test --release --test size -- --ignored --skip opening_costs --nocapture 2>&1 | tee -a target/bench-report.txt
   artifacts:
     paths: [target/bench-report.txt]
