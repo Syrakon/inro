@@ -45,14 +45,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 struct Counting<S> {
     inner: S,
     reads: AtomicU64,
+    writes: AtomicU64,
+    written_bytes: AtomicU64,
 }
 
 impl<S: Storage> Counting<S> {
     fn new(inner: S) -> Self {
-        Self { inner, reads: AtomicU64::new(0) }
+        Self {
+            inner,
+            reads: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            written_bytes: AtomicU64::new(0),
+        }
     }
     fn count(&self) -> u64 {
         self.reads.load(Ordering::Relaxed)
+    }
+    fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+    fn written_bytes(&self) -> u64 {
+        self.written_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -62,6 +75,8 @@ impl<S: Storage> Storage for Counting<S> {
         self.inner.read_at(offset, buf)
     }
     fn write_at(&self, offset: u64, buf: &[u8]) -> inro::Result<()> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.written_bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
         self.inner.write_at(offset, buf)
     }
     fn sync(&self) -> inro::Result<()> {
@@ -304,4 +319,63 @@ fn what_each_cache_budget_costs_in_reads() {
         );
     }
     let _ = std::fs::remove_file(&path);
+}
+
+/// La otra mitad de la curva: qué cuesta cada presupuesto de caché **en el
+/// camino de escritura**.
+///
+/// `what_each_cache_budget_costs_in_reads` mide lecturas y sale que cuatro
+/// páginas bastan. De ahí salía la conclusión tentadora —bajar el defecto a 4
+/// y cumplir el criterio de RAM de la fase 2 sin tocar el motor— pero medida
+/// solo sobre lectura. Una caché pequeña puede salir cara al escribir: el
+/// copy-on-write reescribe el camino raíz-hoja en cada commit, y dentro de un
+/// mismo commit ese camino se toca una vez por fila.
+///
+/// Si la amplificación de escritura sube al bajar la caché, bajar el defecto
+/// sería cambiar un criterio de salida de la fase 2 por el otro. Esta prueba
+/// es la que lo dice.
+#[test]
+#[ignore]
+fn what_each_cache_budget_costs_in_writes() {
+    let n = entries();
+    const PAGE: u32 = 4096;
+
+    println!("(carga: {n} entradas en lotes de mil, páginas de {PAGE} B)");
+    println!(
+        "{:>12}  {:>14}  {:>14}  {:>16}  {:>12}",
+        "cache_pages", "escrituras", "MB escritos", "amplificación", "lecturas"
+    );
+    for cache_pages in [0usize, 4, 8, 32, 64] {
+        let path = std::env::temp_dir()
+            .join(format!("inro-wcurve-{}-{cache_pages}.inro", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let counting = Arc::new(Counting::new(FileStorage::open(&path).unwrap()));
+        let db = Db::create(
+            Box::new(counting.clone()),
+            Options { page_size: PAGE, sync: Sync::Never, cache_pages, ..Options::default() },
+        )
+        .unwrap();
+
+        let mut useful = 0u64;
+        for chunk in (0..n).collect::<Vec<_>>().chunks(1000) {
+            let mut tx = db.begin_write().unwrap();
+            for &i in chunk {
+                let (k, v) = synthetic(i);
+                useful += (k.len() + v.len()) as u64;
+                tx.put(0x01, &k, &v).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let writes = counting.writes();
+        let bytes = counting.written_bytes();
+        let reads = counting.count();
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+
+        println!(
+            "{cache_pages:>12}  {writes:>14}  {:>14.1}  {:>16.2}  {reads:>12}",
+            bytes as f64 / 1e6,
+            bytes as f64 / useful as f64,
+        );
+    }
 }
