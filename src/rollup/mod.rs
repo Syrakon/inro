@@ -243,6 +243,9 @@ impl Resolution {
     /// de celdas que ya es sesenta veces el horario. **Está apagada en el
     /// perfil por defecto** (`Profile::Reports`); la enciende
     /// `Config::realtime()`.
+    /// Dimensiones que esta resolución **puede** llevar. Cuáles lleva de
+    /// verdad lo decide `Config::dims`, que es lo que permite dejar el día en
+    /// totales o apagar una dimensión entera sin tocar el formato.
     pub fn dimensions(self) -> &'static [Dimension] {
         match self {
             Resolution::Minute => &[Dimension::Status],
@@ -268,6 +271,19 @@ const DIM_SLOTS: usize = 5;
 impl Dimension {
     pub fn code(self) -> u8 {
         self as u8
+    }
+
+    /// Bit de esta dimensión dentro de la máscara de `Config::dims`.
+    /// `Total` no tiene bit: la fila de totales se escribe siempre y no pasa
+    /// por el top-K.
+    pub const fn bit(self) -> u8 {
+        match self {
+            Dimension::Total => 0,
+            Dimension::Status => 1 << 1,
+            Dimension::Endpoint => 1 << 2,
+            Dimension::Country => 1 << 3,
+            Dimension::User => 1 << 4,
+        }
     }
 
     pub fn from_code(c: u8) -> Result<Dimension> {
@@ -396,6 +412,29 @@ impl Profile {
             hour: true,
             day: true,
             max_open_cells: 2,
+            dims: match self {
+                // El minuto solo lleva estado en cualquier perfil (ver
+                // `Resolution::dimensions`), y en los dos primeros ni
+                // siquiera se escribe.
+                Profile::Minimal | Profile::Reports => [
+                    Dimension::Status.bit(),
+                    Dimension::Status.bit()
+                        | Dimension::Endpoint.bit()
+                        | Dimension::Country.bit(),
+                    0,
+                ],
+                Profile::Realtime => [
+                    Dimension::Status.bit(),
+                    Dimension::Status.bit()
+                        | Dimension::Endpoint.bit()
+                        | Dimension::Country.bit()
+                        | Dimension::User.bit(),
+                    Dimension::Status.bit()
+                        | Dimension::Endpoint.bit()
+                        | Dimension::Country.bit()
+                        | Dimension::User.bit(),
+                ],
+            },
             retention_secs: [
                 self.retention_secs(Resolution::Minute),
                 self.retention_secs(Resolution::Hour),
@@ -425,6 +464,22 @@ pub struct Config {
     /// `Resolution::code()`. **Un valor por defecto, no una política**: quien
     /// poda decide. Se lee con `Config::retention`.
     pub retention_secs: [u64; 3],
+    /// Dimensiones que cada resolución escribe, como máscara de
+    /// `Dimension::bit()`, indexada por `Resolution::code()`. La fila de
+    /// totales no entra aquí: se escribe siempre.
+    ///
+    /// **Es el eje que faltaba.** Antes, qué dimensiones llevaba cada
+    /// resolución era una constante del código (`Resolution::dimensions`), así
+    /// que "el día solo con totales" o "sin desglose por usuario" no se podían
+    /// pedir. Los dos son decisiones de producto, no de motor: mantener el
+    /// top-32 de cuatro dimensiones noventa días es mantener noventa días de
+    /// todo, y 32 huecos para diez mil usuarios no dan el informe de nadie.
+    /// Ver la sección 12.3 de la especificación.
+    ///
+    /// Poner un bit que la resolución no admite no hace nada: la lista de
+    /// candidatas sigue siendo `Resolution::dimensions()`, y la máscara solo
+    /// puede quitar.
+    pub dims: [u8; 3],
 }
 
 impl Default for Config {
@@ -831,6 +886,11 @@ mod engine {
                 cell.total.record(obs.latency_ms, obs.bytes_in, obs.bytes_out, obs.error)?;
                 cell.total_dirty = true;
                 for d in res.dimensions() {
+                    // La máscara del perfil manda sobre las candidatas de la
+                    // resolución: ver `Config::dims`.
+                    if self.cfg.dims[ri] & d.bit() == 0 {
+                        continue;
+                    }
                     let value: &[u8] = match d {
                         Dimension::Status => &status_bytes,
                         Dimension::Endpoint => obs.endpoint,
