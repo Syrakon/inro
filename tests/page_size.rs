@@ -527,3 +527,78 @@ fn how_much_of_the_file_is_transient_garbage() {
         );
     }
 }
+
+/// La curva de caché con una carga que SÍ tiene localidad.
+///
+/// `what_each_cache_budget_costs_in_reads` mide el peor caso a propósito:
+/// claves repartidas por todo el espacio, sin reutilizar ninguna hoja. Sobre
+/// esa curva se decidió bajar el defecto a 4 páginas, y la decisión tiene un
+/// punto ciego evidente: una carga con claves calientes —el panel del edge
+/// pidiendo una y otra vez las últimas horas— sí podría aprovechar una caché
+/// mayor, y con 4 páginas se estaría pagando en lecturas lo que se ahorra en
+/// RAM.
+///
+/// Esta prueba cierra ese hueco. Mismo fichero, misma medición, pero las
+/// búsquedas se concentran: el 90% caen sobre el 1% más reciente del espacio
+/// de claves, que es la forma real de un panel mirando "lo de ahora".
+#[test]
+#[ignore]
+fn what_each_cache_budget_costs_with_a_hot_working_set() {
+    let n = entries();
+    const PAGE: u32 = 4096;
+    const LOOKUPS: u32 = 2_000;
+
+    let path = std::env::temp_dir().join(format!("inro-hotset-{}.inro", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let db = Db::create(
+            Box::new(FileStorage::open(&path).unwrap()),
+            Options { page_size: PAGE, sync: Sync::Never, ..Options::default() },
+        )
+        .unwrap();
+        for chunk in (0..n).collect::<Vec<_>>().chunks(1000) {
+            let mut tx = db.begin_write().unwrap();
+            for &i in chunk {
+                let (k, v) = synthetic(i);
+                tx.put(0x01, &k, &v).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+    }
+
+    println!("(carga: {n} entradas · 90% de las búsquedas sobre el 1% más reciente)");
+    println!("{:>12}  {:>10}  {:>22}", "cache_pages", "RAM aprox", "lecturas/búsqueda");
+    for cache_pages in [0usize, 4, 8, 16, 32, 64] {
+        let counting = Arc::new(Counting::new(FileStorage::open(&path).unwrap()));
+        let db = Db::open(
+            Box::new(counting.clone()),
+            Options { page_size: PAGE, cache_pages, ..Options::default() },
+        )
+        .unwrap();
+        let base = counting.count();
+        {
+            let tx = db.begin_read();
+            let hot_from = n - n / 100;
+            for j in 0..LOOKUPS {
+                // Permutación multiplicativa dentro de la zona caliente, y un
+                // 10% de las búsquedas fuera de ella: una carga 100% caliente
+                // sería tan poco realista como una 100% dispersa.
+                let i = if j % 10 == 0 {
+                    j.wrapping_mul(2_654_435_761) % n
+                } else {
+                    hot_from + (j.wrapping_mul(48_271) % (n / 100))
+                };
+                assert!(tx.get(0x01, &synthetic(i).0).unwrap().is_some());
+            }
+        }
+        let reads = counting.count() - base;
+        drop(db);
+        let ram = 1_856.0 + cache_pages as f64 * (f64::from(PAGE) + 100.0);
+        println!(
+            "{cache_pages:>12}  {:>8.0} KB  {:>22.2}",
+            ram / 1024.0,
+            f64::from(reads as u32) / f64::from(LOOKUPS)
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
