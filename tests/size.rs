@@ -90,6 +90,16 @@
 //!   lista no está vacía. No mide el coste de recorrer el árbol después de
 //!   abrir. El caso "grande" es 200.000 entradas, no ~2 GB/50 millones — ver
 //!   el comentario de la propia prueba sobre por qué eso basta.
+//! - `opening_costs_the_same_at_thirty_kilobytes_and_at_two_gigabytes` mide
+//!   lo mismo a la escala que pide literalmente el criterio de salida de la
+//!   fase 1. No sustituye a la de 200.000 entradas —que es la que corre en
+//!   integración continua, en segundos— sino que cierra el hueco entre "el
+//!   mecanismo no depende del tamaño" y "medido a esa escala". Del orden de
+//!   una hora de reloj y ~2 GB de disco temporal: se ejecuta a mano.
+//! - `a_freshly_created_database_stays_under_two_kilobytes` es el otro
+//!   criterio de la sección 1 que hasta ahora no vigilaba nadie: 1.536
+//!   bytes con `Options::default()`, tres páginas de 512 B. Cuesta
+//!   microsegundos, así que NO va `#[ignore]`.
 #![cfg(feature = "std")]
 
 use inro::storage::FileStorage;
@@ -299,8 +309,9 @@ fn bytes_per_entry_reacts_to_shuffled_insertion_order() {
     );
 }
 
-/// **La única prueba de este fichero que NO va `#[ignore]`, y el motivo por
-/// el que existe.**
+/// **Una de las dos pruebas de este fichero que NO van `#[ignore]`** (la otra
+/// es `a_freshly_created_database_stays_under_two_kilobytes`, más abajo), **y
+/// el motivo por el que existe.**
 ///
 /// `bytes_per_log_entry_stay_under_the_threshold`, arriba, escribe todos sus
 /// registros en un solo espacio de claves (`0x01`) y nada más en ninguna
@@ -323,7 +334,7 @@ fn bytes_per_entry_reacts_to_shuffled_insertion_order() {
 /// fallo, mientras que el cociente solo se mueve si las dos disposiciones
 /// dejan de costar lo mismo, que es justo la propiedad que hay que defender.
 ///
-/// **No lleva `#[ignore]`, a diferencia de las cuatro de arriba**: está
+/// **No lleva `#[ignore]`, a diferencia de las de arriba**: está
 /// dimensionada para caber en modo `debug`, que es el que usan los cinco
 /// comandos de verificación de este proyecto y las cuatro invocaciones de
 /// `cargo test` de la etapa `test`. Ponerla en la etapa `bench` la habría
@@ -544,6 +555,145 @@ fn opening_costs_the_same_at_thirty_kilobytes_and_at_two_hundred_thousand_entrie
         "cabecera, dos meta-páginas y como mucho cabeza/cola de la lista de libres — \
          nunca más; ver `Db::open`, `Meta::load` y `Freelist::load` en freelist.rs"
     );
+}
+
+/// La corrida a ~2 GB que la tarea 21 dejó sin hacer, y que el criterio de
+/// salida de la fase 1 pide literalmente ("apertura de coste constante con
+/// ficheros de 30 KB y de 2 GB").
+///
+/// **No sustituye a la prueba de arriba, la complementa.** La de 200.000
+/// entradas es la que corre en integración continua: tarda segundos y
+/// atrapa cualquier regresión que haga depender la apertura del tamaño del
+/// árbol. Esta de aquí existe para cerrar el hueco entre "el mecanismo no
+/// depende del tamaño" (un argumento) y "se ha medido a la escala que pide
+/// la especificación" (un dato). Del orden de una hora de reloj en
+/// `--release` y ~2 GB de disco temporal, así que **no entra en ninguna
+/// corrida automática**: se ejecuta a mano cuando el formato en disco o el
+/// camino de apertura cambian, y su resultado se anota en la sección 12.2
+/// de la especificación.
+///
+/// El lote es de mil registros, igual que el resto de bancos de este
+/// fichero, para que el fichero construido tenga la misma forma —mismo
+/// llenado de hoja, misma holgura de lista de libres— que el que mide
+/// `bytes_per_log_entry_stay_under_the_threshold`. Un lote mayor
+/// terminaría antes y mediría otro fichero.
+#[test]
+#[ignore]
+fn opening_costs_the_same_at_thirty_kilobytes_and_at_two_gigabytes() {
+    const TARGET: u64 = 2 * 1024 * 1024 * 1024;
+    const BATCH: u32 = 1_000;
+
+    /// Escribe hasta pasar de `TARGET` bytes y devuelve entradas y tamaño.
+    /// Comprueba la longitud UNA vez por lote, no por registro: `metadata`
+    /// es una llamada al sistema y a este volumen se haría notar.
+    fn build_to_target(path: &std::path::Path) -> (u32, u64) {
+        let _ = std::fs::remove_file(path);
+        let db = Db::create(
+            Box::new(FileStorage::open(path).unwrap()),
+            Options { page_size: 4096, sync: Sync::Never, ..Options::default() },
+        )
+        .unwrap();
+        let mut written: u32 = 0;
+        loop {
+            let mut tx = db.begin_write().unwrap();
+            for i in written..written + BATCH {
+                let (k, v) = synthetic_log(i);
+                tx.put(0x01, &k, &v).unwrap();
+            }
+            tx.commit().unwrap();
+            written += BATCH;
+            if std::fs::metadata(path).unwrap().len() >= TARGET {
+                break;
+            }
+        }
+        let size = std::fs::metadata(path).unwrap().len();
+        drop(db);
+        (written, size)
+    }
+
+    fn reads_to_open(path: &std::path::Path) -> u64 {
+        let counting = Arc::new(CountingStorage::new(FileStorage::open(path).unwrap()));
+        let db =
+            Db::open(Box::new(counting.clone()), Options { page_size: 4096, ..Options::default() })
+                .unwrap();
+        let reads = counting.read_count();
+        drop(db);
+        reads
+    }
+
+    let pid = std::process::id();
+    let small_path = std::env::temp_dir().join(format!("inro-bench-open-small-{pid}.inro"));
+    let big_path = std::env::temp_dir().join(format!("inro-bench-open-2gb-{pid}.inro"));
+
+    let _ = std::fs::remove_file(&small_path);
+    {
+        let db = Db::create(
+            Box::new(FileStorage::open(&small_path).unwrap()),
+            Options { page_size: 4096, sync: Sync::Never, ..Options::default() },
+        )
+        .unwrap();
+        write_synthetic_log(&db, 500, 1000); // decenas de KB
+    }
+    let small = reads_to_open(&small_path);
+    let _ = std::fs::remove_file(&small_path);
+
+    let (entries, size) = build_to_target(&big_path);
+    let big = reads_to_open(&big_path);
+    let _ = std::fs::remove_file(&big_path);
+
+    println!(
+        "apertura a 2 GB: {small} lecturas (Storage) en pequeño, {big} en grande; \
+         fichero de {size} bytes con {entries} entradas ({:.2} B/entrada)",
+        size as f64 / entries as f64
+    );
+    assert_eq!(
+        small, big,
+        "la apertura debe costar lo mismo a 2 GB que a 30 KB — ver el comentario \
+         de la prueba de 200.000 entradas sobre por qué, si difiere, la causa no \
+         es el tamaño del fichero"
+    );
+    assert!(
+        small <= 4,
+        "cabecera, dos meta-páginas y como mucho cabeza/cola de la lista de libres — \
+         nunca más; ver `Db::open`, `Meta::load` y `Freelist::load` en freelist.rs"
+    );
+}
+
+/// El primer criterio de éxito de la especificación (sección 1): **una base
+/// recién creada ocupa menos de 2 KB**. Hasta ahora no lo vigilaba ninguna
+/// prueba: era un número que se derivaba del formato (cabecera + meta A +
+/// meta B, tres páginas) en vez de leerse del disco.
+///
+/// Se mide con `Options::default()` a propósito, no con las páginas de 4 KB
+/// que usan los bancos de esta tarea: el suelo de 1,5 KB es exactamente
+/// tres páginas del tamaño MÍNIMO (512 B, `header::MIN_PAGE_SIZE`), que es
+/// el valor por defecto — una base creada con páginas de 4 KB ocupa 12 KB
+/// recién nacida y no contradice nada, porque el criterio es sobre la
+/// configuración por defecto, la que se lleva un nodo micro. Ver
+/// `INITIAL_META_B_PAGE` en `tx.rs` para por qué la meta B es la página 2 y
+/// no depende de `page_size`.
+///
+/// **No lleva `#[ignore]`**: crear una base vacía cuesta microsegundos, así
+/// que este criterio de salida sí puede vigilarse en cada `cargo test`, a
+/// diferencia de los que necesitan un millón de registros.
+#[test]
+fn a_freshly_created_database_stays_under_two_kilobytes() {
+    let path =
+        std::env::temp_dir().join(format!("inro-bench-fresh-{}.inro", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let _db =
+            Db::create(Box::new(FileStorage::open(&path).unwrap()), Options::default()).unwrap();
+    }
+    let size = std::fs::metadata(&path).unwrap().len();
+    let _ = std::fs::remove_file(&path);
+    println!("base recién creada: {size} bytes");
+    assert_eq!(
+        size, 1536,
+        "el suelo son tres páginas de 512 B — cabecera, meta A y meta B; si esto \
+         cambia, cambió el formato y hay que revisar la sección 4 de la especificación"
+    );
+    assert!(size < 2048, "{size} bytes: el criterio de la sección 1 son menos de 2 KB");
 }
 
 /// Comparativa con SQLite (tarea 21, sección 17.1 de la especificación).
