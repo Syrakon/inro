@@ -406,7 +406,6 @@ fn what_each_cache_budget_costs_in_writes() {
 #[test]
 #[ignore]
 fn how_many_distinct_pages_a_commit_touches() {
-    use std::collections::BTreeSet;
     const PAGE: u32 = 4096;
     const BATCH: u32 = 1_000;
 
