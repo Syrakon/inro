@@ -47,6 +47,7 @@ struct Counting<S> {
     reads: AtomicU64,
     writes: AtomicU64,
     written_bytes: AtomicU64,
+    syncs: AtomicU64,
     /// Offsets distintos escritos desde el último `reset_offsets`. Es lo que
     /// separa "cuántas escrituras" de "cuántas páginas".
     offsets: std::sync::Mutex<std::collections::BTreeSet<u64>>,
@@ -59,6 +60,7 @@ impl<S: Storage> Counting<S> {
             reads: AtomicU64::new(0),
             writes: AtomicU64::new(0),
             written_bytes: AtomicU64::new(0),
+            syncs: AtomicU64::new(0),
             offsets: std::sync::Mutex::new(Default::default()),
         }
     }
@@ -70,6 +72,9 @@ impl<S: Storage> Counting<S> {
     }
     fn written_bytes(&self) -> u64 {
         self.written_bytes.load(Ordering::Relaxed)
+    }
+    fn syncs(&self) -> u64 {
+        self.syncs.load(Ordering::Relaxed)
     }
     fn reset_offsets(&self) {
         self.offsets.lock().unwrap().clear();
@@ -91,6 +96,7 @@ impl<S: Storage> Storage for Counting<S> {
         self.inner.write_at(offset, buf)
     }
     fn sync(&self) -> inro::Result<()> {
+        self.syncs.fetch_add(1, Ordering::Relaxed);
         self.inner.sync()
     }
     fn len(&self) -> inro::Result<u64> {
@@ -601,4 +607,54 @@ fn what_each_cache_budget_costs_with_a_hot_working_set() {
         );
     }
     let _ = std::fs::remove_file(&path);
+}
+
+/// `Sync::Never` contra `Sync::Commit`: qué cuesta cada política de verdad.
+///
+/// La medición anterior (`docs/agregacion.md` §8.6) daba **+38% de fichero**
+/// para `Never` en un nodo micro: las páginas liberadas no se pueden reutilizar
+/// hasta que el punto durable las alcanza, y sin `fsync` ese punto no avanza.
+/// Se midió **antes del buffer de páginas sucias**, que cambió cuándo llegan
+/// las páginas al medio, así que hay que rehacerla antes de decidir con ella.
+///
+/// Lo que decide es real: el edge tiene que elegir una, y las dos cifras que
+/// importan —fichero y `fsync` por unidad de trabajo— van en direcciones
+/// opuestas.
+#[test]
+#[ignore]
+fn what_each_sync_policy_costs() {
+    let n = entries();
+    const PAGE: u32 = 4096;
+
+    println!("(carga: {n} entradas en lotes de mil, páginas de {PAGE} B)");
+    println!("{:>10}  {:>12}  {:>12}  {:>14}  {:>12}", "política", "fichero KB", "escrituras", "sync", "B/entrada");
+    for (label, sync) in [("Never", Sync::Never), ("Commit", Sync::Commit)] {
+        let path =
+            std::env::temp_dir().join(format!("inro-sync-{}-{label}.inro", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let counting = Arc::new(Counting::new(FileStorage::open(&path).unwrap()));
+        let db = Db::create(
+            Box::new(counting.clone()),
+            Options { page_size: PAGE, sync, ..Options::default() },
+        )
+        .unwrap();
+        for chunk in (0..n).collect::<Vec<_>>().chunks(1000) {
+            let mut tx = db.begin_write().unwrap();
+            for &i in chunk {
+                let (k, v) = synthetic(i);
+                tx.put(0x01, &k, &v).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        let writes = counting.writes();
+        let syncs = counting.syncs();
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        println!(
+            "{label:>10}  {:>12}  {writes:>12}  {syncs:>14}  {:>12.2}",
+            bytes / 1024,
+            bytes as f64 / f64::from(n)
+        );
+    }
 }
