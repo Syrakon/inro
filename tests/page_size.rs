@@ -203,3 +203,105 @@ fn what_each_page_size_costs() {
         );
     }
 }
+
+/// **La curva que abre la fase 2**: qué cuesta en LECTURAS cada presupuesto de
+/// caché.
+///
+/// `tests/ram_size.rs` mide la otra mitad —lo que cada presupuesto cuesta en
+/// RAM— y sale que la RAM por base es el suelo fijo (1.856 B) más la caché.
+/// De ahí salía la tentación evidente: bajar `cache_pages` a 8 y cumplir el
+/// criterio de la fase 2 sin escribir una línea. Esta prueba pone el precio a
+/// esa tentación, que es el número que faltaba para poder decidir.
+///
+/// Mide lecturas FÍSICAS al nivel del `Storage`, que es donde se cuenta lo que
+/// de verdad toca el medio, sobre dos cargas distintas:
+///
+/// - **Búsqueda puntual** con claves repartidas por todo el espacio: sin
+///   localidad, cada una desciende el árbol entero. Es el peor caso para la
+///   caché y el que enseña la altura efectiva.
+/// - **Recorrido de rango**, que es lo que hace de verdad un informe del edge:
+///   claves contiguas, localidad máxima.
+///
+/// La hipótesis de la fase 2 —"caché limitada a nodos internos"— predice que
+/// un presupuesto pequeño se lleva casi todo el ahorro, porque los nodos
+/// internos son pocos y se reusan en cada descenso mientras que las hojas no
+/// se repiten. Si la curva se aplana pronto, `cache_pages` bajo es gratis; si
+/// no, la fase 2 tiene que trabajar.
+#[test]
+#[ignore]
+fn what_each_cache_budget_costs_in_reads() {
+    // Escala ajustable (`INRO_PAGE_N`) por el mismo motivo que en el banco de
+    // tamaño de página: el árbol crece de altura con las entradas, y lo que
+    // esta curva mide es justo cuántos niveles caben en la caché.
+    let n = entries();
+    const LOOKUPS: u32 = 500;
+    const PAGE: u32 = 4096;
+
+    let path = std::env::temp_dir().join(format!("inro-cachecurve-{}.inro", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let db = Db::create(
+            Box::new(FileStorage::open(&path).unwrap()),
+            Options { page_size: PAGE, sync: Sync::Never, ..Options::default() },
+        )
+        .unwrap();
+        for chunk in (0..n).collect::<Vec<_>>().chunks(1000) {
+            let mut tx = db.begin_write().unwrap();
+            for &i in chunk {
+                let (k, v) = synthetic(i);
+                tx.put(0x01, &k, &v).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+    }
+
+    println!("(carga: {n} entradas)");
+    println!(
+        "{:>12}  {:>10}  {:>20}  {:>18}",
+        "cache_pages", "RAM aprox", "lecturas/búsqueda", "lecturas/1000 filas"
+    );
+    for cache_pages in [0usize, 4, 8, 16, 32, 64, 128, 256] {
+        let counting = Arc::new(Counting::new(FileStorage::open(&path).unwrap()));
+        let db = Db::open(
+            Box::new(counting.clone()),
+            Options { page_size: PAGE, cache_pages, ..Options::default() },
+        )
+        .unwrap();
+
+        let base = counting.count();
+        {
+            let tx = db.begin_read();
+            let stride = n / LOOKUPS;
+            for j in 0..LOOKUPS {
+                let (k, _) = synthetic(j * stride);
+                assert!(tx.get(0x01, &k).unwrap().is_some());
+            }
+        }
+        let lookup_reads = counting.count() - base;
+
+        let base = counting.count();
+        {
+            let tx = db.begin_read();
+            let (from, _) = synthetic(n / 2);
+            let (to, _) = synthetic(n / 2 + 1000);
+            let mut c = tx.scan(0x01, &from, &to).unwrap();
+            let mut seen = 0;
+            while c.next().unwrap().is_some() {
+                seen += 1;
+            }
+            assert!(seen > 900, "el recorrido solo vio {seen} filas");
+        }
+        let scan_reads = counting.count() - base;
+        drop(db);
+
+        // RAM: el suelo fijo medido en `ram_size.rs` más la caché a su coste
+        // real (unos 100 B de contabilidad por página, también medido).
+        let ram = 1_856.0 + cache_pages as f64 * (f64::from(PAGE) + 100.0);
+        println!(
+            "{cache_pages:>12}  {:>8.0} KB  {:>20.2}  {scan_reads:>18}",
+            ram / 1024.0,
+            f64::from(lookup_reads as u32) / f64::from(LOOKUPS),
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
