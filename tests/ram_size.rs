@@ -418,3 +418,31 @@ fn ram_per_open_database_follows_the_cache_budget_and_not_the_file_size() {
          (ver el comentario del módulo sobre el sesgo del asignador)"
     );
 }
+
+/// El defecto de `cache_pages`, fijado por prueba.
+///
+/// Era 32 y pasa a 4, con las dos mitades de la curva medidas:
+///
+/// - **Lecturas** (`tests/page_size.rs`): de 4 en adelante la caché no evita
+///   ni una sola lectura más. 1,02 por búsqueda con 200.000 entradas y 1,26
+///   con 2,5 millones, iguales con 4 que con 256. Las hojas no se reutilizan
+///   —cada búsqueda cae en una distinta— y los nodos internos que sí se
+///   reutilizan caben en cuatro páginas.
+/// - **Escrituras** (mismo fichero): el tamaño de caché no cambia NADA en el
+///   camino de escritura, ni un byte. El copy-on-write escribe cada página en
+///   un número nuevo, así que no hay nada que cachear.
+///
+/// Con 4, la RAM por base queda en 4,3 KB con páginas de 512 B y 18,6 KB con
+/// las de 4 KB — por debajo de los 8 y 40 KB que la fase 2 pone como criterio
+/// de salida, y sin tocar una línea de motor.
+///
+/// **Si alguien sube este número, que sea con una medición nueva delante**:
+/// la que hay dice que por encima de 4 se paga RAM sin comprar nada.
+#[test]
+fn the_default_cache_is_four_pages() {
+    assert_eq!(
+        Options::default().cache_pages,
+        4,
+        "el defecto de caché cambió sin que la curva de lecturas lo respalde"
+    );
+}

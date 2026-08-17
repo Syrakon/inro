@@ -146,7 +146,20 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { page_size: 512, sync: Sync::Commit, cache_pages: 32, encryption: None, max_pages: None }
+        // `cache_pages: 4`, no 32 (17-08-2026). Medida la curva entera en
+        // `tests/page_size.rs`, de la cuarta página en adelante la caché no
+        // evita ni una sola lectura más —1,02 por búsqueda con 200.000
+        // entradas, 1,26 con 2,5 millones, iguales con 4 que con 256— porque
+        // las hojas no se reutilizan y los nodos internos que sí caben en
+        // cuatro páginas. Y en el camino de escritura el tamaño de caché no
+        // cambia nada, ni un byte: el copy-on-write escribe cada página en un
+        // número nuevo, así que no hay nada que cachear.
+        //
+        // Con 4, la RAM por base baja de 22,3 a 4,3 KB con páginas de 512 B y
+        // de 271 a 18,6 KB con las de 4 KB, que es lo que pone los dos
+        // criterios de salida de RAM de la fase 2 por debajo del tope sin
+        // tocar una línea de motor. Ver `the_default_cache_is_four_pages`.
+        Self { page_size: 512, sync: Sync::Commit, cache_pages: 4, encryption: None, max_pages: None }
     }
 }
 
