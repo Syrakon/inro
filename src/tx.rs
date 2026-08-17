@@ -1365,6 +1365,30 @@ pub struct WriteTxn<'db> {
     /// Reserva abierta: solo lo está mientras corre una operación que reduce
     /// el árbol (`with_reserve`). Ver `RESERVE_PAGES`.
     reserve: bool,
+    /// Páginas sucias de esta transacción, sin sellar y sin escribir.
+    ///
+    /// **Por qué existe.** El copy-on-write obliga a copiar el camino
+    /// raíz-hoja en cada `put` —eso no se negocia, es lo que da la seguridad
+    /// ante cortes sin WAL y los lectores sin bloqueo—, pero NO obliga a
+    /// mandar ese camino al medio en cada `put`. Escribiendo a través, un
+    /// commit de mil filas emitía 2.009 escrituras para 13 páginas distintas:
+    /// cada página viajaba al disco 154 veces y solo la última contaba.
+    /// Medido en `how_many_distinct_pages_a_commit_touches`: 242× de
+    /// amplificación física, plana con cualquier tamaño de lote.
+    ///
+    /// Acumular y escribir una vez al cerrar el commit lo deja en 1,57× con
+    /// lotes de mil y 1,10× con lotes de cinco mil, y de paso hace que
+    /// agrupar escrituras —que la sección 12.4 ya exige al llamante— por fin
+    /// sirva de algo en el motor.
+    ///
+    /// `BTreeMap` y no `HashMap`: al volcar se escribe en orden de página, que
+    /// es secuencial en el fichero.
+    /// Tope del buffer. Al pasarlo se derrama la página más baja al medio,
+    /// así que la RAM de una transacción sigue acotada pase lo que pase — que
+    /// es la promesa de la sección 1 y el motivo por el que este buffer no
+    /// existía. 512 páginas son 2 MB con páginas de 4 KB y 256 KB con las de
+    /// 512 B; un commit del edge toca 13.
+    spill_at: usize,
     written: BTreeSet<u64>,
     /// Escrituras físicas (`write_page`) emitidas por esta transacción hasta
     /// ahora — tarea 20. A diferencia de `written`, se lleva SIEMPRE, con o
@@ -1469,6 +1493,7 @@ impl Db {
             meta,
             slot,
             reserve: false,
+            spill_at: 512,
             written: BTreeSet::new(),
             write_count: 0,
             pre_freelist,
@@ -1494,6 +1519,20 @@ impl Drop for WriteTxn<'_> {
         {
             state.freelist = core::mem::replace(&mut self.pre_freelist, Freelist::empty());
         }
+        // Las páginas aparcadas se tiran SIEMPRE, se haya confirmado o no.
+        //
+        // Tras un commit el buffer ya está vacío (`flush_dirty` se lo lleva),
+        // así que esto solo actúa cuando la transacción se abandona — y ahí es
+        // obligatorio: una transacción abandonada no deja rastro, y con el
+        // buffer «no dejar rastro» dejó de ser automático. Sin esto, la
+        // transacción que se lleva un `Error::Full` deja sus páginas aparcadas
+        // y la SIGUIENTE las lee como si fueran válidas: `Corrupt { PageType }`
+        // en cuanto una de ellas cae donde antes había otra cosa. Lo cazaron
+        // `pruning_gives_the_space_back_for_new_writes` y
+        // `the_cap_counts_the_high_water_mark_and_not_the_live_pages` en
+        // `tests/cap.rs`, que son las dos que abandonan transacciones a
+        // propósito.
+        self.db.pager.drop_pending();
     }
 }
 
@@ -1988,7 +2027,38 @@ impl<'db> WriteTxn<'db> {
     /// El guardián `written`, que sí cuesta memoria real en una transacción
     /// grande, solo se puebla si la base está cifrada (segunda ronda de
     /// revisión, hallazgo sobre coste de memoria — ver su comentario).
+    /// Acumula una página sucia. Solo llega al medio en `flush_dirty`, al
+    /// cerrar el commit — ver el campo `dirty`.
     pub(crate) fn write_page(&mut self, page: PageNo, bytes: &[u8]) -> Result<()> {
+        self.db.pager.stage(page, bytes);
+        self.write_count += 1;
+        if self.db.pager.pending_len() > self.spill_at {
+            // Derrame: la página más baja sale al medio para que el buffer no
+            // crezca sin cota. Sigue siendo correcto —solo cambia CUÁNDO se
+            // escribe, no qué— y una transacción normal no llega aquí.
+            // Derrame: se vacía entero en vez de gota a gota. Vaciar una sola
+            // página dejaría el buffer justo en el tope y derramaría en CADA
+            // escritura posterior, que es exactamente el comportamiento que
+            // este buffer viene a quitar.
+            self.flush_dirty()?;
+        }
+        Ok(())
+    }
+
+    /// Vuelca al medio todo lo acumulado, en orden de página.
+    ///
+    /// Se llama al cerrar el commit, ANTES de la meta: la meta es lo que
+    /// publica la transacción, así que todo lo que referencia tiene que estar
+    /// ya en el fichero. Es el mismo orden que tenía el camino de escritura a
+    /// través, solo que ahora cada página va una vez.
+    pub(crate) fn flush_dirty(&mut self) -> Result<()> {
+        for (page, bytes) in self.db.pager.take_pending() {
+            self.write_page_through(page, &bytes)?;
+        }
+        Ok(())
+    }
+
+    fn write_page_through(&mut self, page: PageNo, bytes: &[u8]) -> Result<()> {
         let pager = &self.db.pager;
         let state = self.guard.as_mut().expect("el estado del escritor siempre está presente");
         // ANTES de sellar, no después: comprobarlo a posteriori llegaría
@@ -2002,7 +2072,6 @@ impl<'db> WriteTxn<'db> {
             return Err(Error::NonceReuse { page });
         }
         pager.write_encrypted(page, state.nonce_stream.as_mut(), bytes)?;
-        self.write_count += 1;
         Ok(())
     }
 
@@ -2810,6 +2879,15 @@ impl<'db> WriteTxn<'db> {
         // `n_pages`/`page_size` en `u32`, el producto desborda de sobra
         // antes de que ninguno de los dos se acerque a su máximo real.
         if (self.meta.n_pages as u64) * (self.page_size() as u64) > 4096 {
+            // El fichero tiene que estar MATERIALIZADO hasta `n_pages` antes
+            // de reubicar la meta B: la reubicación escribe en su página
+            // destino contando con que el fichero ya llega hasta ahí, y con
+            // el buffer de páginas sucias esas páginas pueden seguir en RAM.
+            // Sin esto, un corte justo en la reubicación deja una meta que
+            // apunta más allá del final del fichero y la base no vuelve a
+            // abrirse: `Io(UnexpectedEof)`, que es lo que cazó
+            // `relocation_survives_a_torn_write_at_every_cut_point_under_every_sync_policy`.
+            self.flush_dirty()?;
             self.relocate_meta_b()?;
         }
         let mut n_pages = self.meta.n_pages;
@@ -2963,6 +3041,14 @@ impl<'db> WriteTxn<'db> {
         // esta sincronización ocurre, lo que se demuestra duradero es el
         // commit ANTERIOR (con las páginas de este ya en el medio, que es
         // justo el orden que hace atómico el commit). Ver `Db::sync_upto`.
+        // TODO lo que la meta va a referenciar tiene que estar en el fichero
+        // ANTES que la meta: es lo que hace que un corte a mitad de commit
+        // deje la transacción entera fuera y no a medias. Con el buffer de
+        // páginas sucias eso deja de ser automático —hasta aquí solo estaban
+        // en RAM— así que el volcado va antes del `fsync` que hace duradero
+        // el commit anterior y, sobre todo, antes de escribir esta meta.
+        self.flush_dirty()?;
+
         let previous = self.db.committed.read().unwrap().0.txn_id;
         self.db.maybe_sync(previous)?;
 
@@ -3604,21 +3690,25 @@ mod tests {
         assert!(db.audit_pages().unwrap(), "pagina perdida o contada dos veces");
     }
 
-    /// `pending_writes` (tarea 20): tiene que contar EXACTAMENTE las
-    /// escrituras físicas que `write_page` ha emitido hasta ahora, sea cual
-    /// sea el número — nada que ver con `written` (el guardián de nonces de
-    /// arriba, que solo se puebla bajo cifrado, ver su comentario). Si
-    /// `pending_writes` delegara en `written.len()` sin más — la primera
-    /// tentación, ya que ambos son "cuántas escrituras lleva esta
-    /// transacción" — esta comprobación fallaría en una base SIN cifrar
-    /// como esta: `written` se queda vacío para siempre, y
-    /// `tests/faults.rs` (que SÍ necesita este número para apuntar con
-    /// precisión a la escritura de la meta) apuntaría al sitio equivocado
-    /// sin que ninguna prueba lo notara. Se comprueba contra
-    /// `FaultStorage::write_count`, que cuenta escrituras al MEDIO — la
-    /// única fuente de verdad independiente de `WriteTxn` que existe.
+    /// **Nada llega al medio antes del commit**, y `pending_writes` cuenta
+    /// las páginas que esta transacción ha ensuciado.
+    ///
+    /// Hasta el buffer de páginas sucias (ver `Pager::pending`) las dos cosas
+    /// eran la misma: `write_page` escribía a través, así que "páginas
+    /// ensuciadas" y "escrituras físicas emitidas" coincidían y esta prueba
+    /// las comparaba. Ya no coinciden, y la diferencia ES la mejora: un
+    /// commit de mil filas ensucia 2.009 veces y escribe 13 páginas.
+    ///
+    /// Lo que se comprueba ahora es lo que de verdad hay que defender: a
+    /// mitad de transacción el medio no ha visto NADA. Si alguien vuelve a
+    /// escribir a través, esta prueba se pone en rojo — la anterior no lo
+    /// habría hecho, porque su invariante se cumplía en los dos mundos.
+    ///
+    /// `tests/faults.rs` no se ve afectado: no calcula la escritura de la
+    /// meta con `pending_writes()`, sino midiendo un commit de referencia
+    /// sobre un medio aparte, así que se recalibra solo.
     #[test]
-    fn pending_writes_counts_every_physical_write_issued_so_far() {
+    fn nothing_reaches_the_medium_before_the_commit() {
         let s = Arc::new(crate::storage::FaultStorage::new(MemStorage::new(), None));
         let db = Db::create(Box::new(Arc::clone(&s)), Options::default()).unwrap();
         let before = s.write_count();
@@ -3626,13 +3716,16 @@ mod tests {
         for i in 0..50u32 {
             tx.put(0x01, &i.to_be_bytes(), b"v").unwrap();
         }
-        let physical = s.write_count() - before;
-        assert!(physical > 0, "la carga de la prueba deberia emitir al menos una escritura fisica");
+        assert!(tx.pending_writes() > 0, "cincuenta `put` tienen que ensuciar alguna página");
         assert_eq!(
-            tx.pending_writes(),
-            physical,
-            "pending_writes debe igualar las escrituras fisicas ya emitidas por esta transaccion"
+            s.write_count() - before,
+            0,
+            "el medio ha recibido escrituras a mitad de transacción: las páginas sucias se están \
+             escribiendo a través en vez de acumularse hasta el commit"
         );
+        tx.commit().unwrap();
+        let physical = s.write_count() - before;
+        assert!(physical > 0, "el commit tiene que haber escrito de verdad");
     }
 
     /// **Las dos pruebas que pide la tarea 19 (segunda ronda de revisión,

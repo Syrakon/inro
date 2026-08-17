@@ -38,6 +38,20 @@ pub struct Pager {
     /// una lectura de página.
     geometry: RwLock<Geometry>,
     cache: Mutex<Cache>,
+    /// Páginas escritas por la transacción en curso y todavía NO en el medio.
+    ///
+    /// Vive aquí y no en `WriteTxn` porque aquí es donde pasa toda lectura:
+    /// el árbol lee por `WriteTxn::read_page`, pero la lista de libres, el
+    /// catálogo y los índices leen por el pager directamente. Con el buffer
+    /// en la transacción, esos tres caminos leían del fichero páginas que
+    /// todavía estaban en RAM y se llevaban un `UnexpectedEof` —el fichero
+    /// aún no ha crecido hasta ellas—. 186 pruebas lo dijeron a la primera.
+    ///
+    /// **No las ve ningún lector**, y no por cortesía: el copy-on-write
+    /// escribe siempre en páginas NUEVAS, así que ninguna meta confirmada
+    /// referencia una página pendiente. Un lector con un snapshot antiguo no
+    /// tiene forma de nombrarlas.
+    pending: Mutex<alloc::collections::BTreeMap<PageNo, Arc<[u8]>>>,
     /// Número de llamadas a `read` desde la creación del `Pager`. Cuenta
     /// TODA llamada, acierto de caché o no: lo que la tarea 15 necesita
     /// medir es cuántas veces el código del árbol PIDE una página durante
@@ -70,6 +84,7 @@ impl Pager {
         Self {
             storage,
             geometry: RwLock::new(geometry),
+            pending: Mutex::new(Default::default()),
             cache: Mutex::new(Cache {
                 entries: Vec::with_capacity(cache_pages),
                 budget: cache_pages,
@@ -227,6 +242,11 @@ impl Pager {
     /// invalidar", y de eso no se ha tocado nada.
     pub fn read(&self, page_no: PageNo) -> Result<ValidPage> {
         self.reads.fetch_add(1, Ordering::Relaxed);
+        // Lo pendiente manda sobre el medio y sobre la caché: es la versión
+        // más reciente de esa página y todavía no ha salido de la RAM.
+        if let Some(bytes) = self.pending.lock().unwrap().get(&page_no) {
+            return ValidPage::parse(Arc::clone(bytes), page_no);
+        }
         {
             let mut c = self.cache.lock().unwrap();
             c.tick += 1;
@@ -359,6 +379,31 @@ impl Pager {
     /// aun así llegara `None` sobre una base cifrada, esto falla alto
     /// (`Error::BadFormat`) en vez de escribir la página en claro bajo la
     /// apariencia de que se cifró.
+    /// Aparca una página escrita por la transacción en curso. Sale al medio
+    /// en `take_pending`, al cerrar el commit — ver el campo `pending`.
+    pub fn stage(&self, page_no: PageNo, bytes: &[u8]) {
+        self.pending.lock().unwrap().insert(page_no, Arc::from(bytes));
+    }
+
+    /// Cuántas páginas hay aparcadas. La transacción lo usa para decidir si
+    /// derrama.
+    pub fn pending_len(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    /// Se lleva lo aparcado, en orden de página —que es secuencial en el
+    /// fichero—. El sellado no puede hacerse aquí: la clave de nonce vive en
+    /// el estado del escritor, así que quien vacía es `WriteTxn::flush_dirty`.
+    pub fn take_pending(&self) -> alloc::vec::Vec<(PageNo, Arc<[u8]>)> {
+        core::mem::take(&mut *self.pending.lock().unwrap()).into_iter().collect()
+    }
+
+    /// Descarta lo aparcado sin escribirlo: una transacción abandonada no deja
+    /// rastro, que es lo que el contrato de `WriteTxn` promete.
+    pub fn drop_pending(&self) {
+        self.pending.lock().unwrap().clear();
+    }
+
     pub fn write_encrypted(
         &self,
         page_no: PageNo,

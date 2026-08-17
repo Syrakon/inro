@@ -47,6 +47,9 @@ struct Counting<S> {
     reads: AtomicU64,
     writes: AtomicU64,
     written_bytes: AtomicU64,
+    /// Offsets distintos escritos desde el último `reset_offsets`. Es lo que
+    /// separa "cuántas escrituras" de "cuántas páginas".
+    offsets: std::sync::Mutex<std::collections::BTreeSet<u64>>,
 }
 
 impl<S: Storage> Counting<S> {
@@ -56,6 +59,7 @@ impl<S: Storage> Counting<S> {
             reads: AtomicU64::new(0),
             writes: AtomicU64::new(0),
             written_bytes: AtomicU64::new(0),
+            offsets: std::sync::Mutex::new(Default::default()),
         }
     }
     fn count(&self) -> u64 {
@@ -67,6 +71,12 @@ impl<S: Storage> Counting<S> {
     fn written_bytes(&self) -> u64 {
         self.written_bytes.load(Ordering::Relaxed)
     }
+    fn reset_offsets(&self) {
+        self.offsets.lock().unwrap().clear();
+    }
+    fn distinct_offsets(&self) -> usize {
+        self.offsets.lock().unwrap().len()
+    }
 }
 
 impl<S: Storage> Storage for Counting<S> {
@@ -77,6 +87,7 @@ impl<S: Storage> Storage for Counting<S> {
     fn write_at(&self, offset: u64, buf: &[u8]) -> inro::Result<()> {
         self.writes.fetch_add(1, Ordering::Relaxed);
         self.written_bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        self.offsets.lock().unwrap().insert(offset);
         self.inner.write_at(offset, buf)
     }
     fn sync(&self) -> inro::Result<()> {
@@ -376,6 +387,143 @@ fn what_each_cache_budget_costs_in_writes() {
             "{cache_pages:>12}  {writes:>14}  {:>14.1}  {:>16.2}  {reads:>12}",
             bytes as f64 / 1e6,
             bytes as f64 / useful as f64,
+        );
+    }
+}
+
+/// Cuántas páginas DISTINTAS toca un commit, contra cuántas escrituras emite.
+///
+/// El cociente entre las dos es exactamente lo que se ahorraría bufferizando
+/// las páginas sucias hasta el commit en vez de escribir a través en cada
+/// `put`: una página tocada mil veces se escribiría una. Sin este número, "el
+/// arreglo baja la amplificación a ~2×" es aritmética de servilleta.
+#[test]
+#[ignore]
+fn how_many_distinct_pages_a_commit_touches() {
+    use std::collections::BTreeSet;
+    const PAGE: u32 = 4096;
+    const BATCH: u32 = 1_000;
+
+    let path = std::env::temp_dir().join(format!("inro-distinct-{}.inro", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let counting = Arc::new(Counting::new(FileStorage::open(&path).unwrap()));
+    let db = Db::create(
+        Box::new(counting.clone()),
+        Options { page_size: PAGE, sync: Sync::Never, ..Options::default() },
+    )
+    .unwrap();
+
+    // Se calienta con unos cuantos lotes para que el árbol tenga profundidad y
+    // el commit medido no sea el de un árbol de una página.
+    for chunk in (0..20_000u32).collect::<Vec<_>>().chunks(BATCH as usize) {
+        let mut tx = db.begin_write().unwrap();
+        for &i in chunk {
+            let (k, v) = synthetic(i);
+            tx.put(0x01, &k, &v).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    println!(
+        "{:>8}  {:>12}  {:>16}  {:>14}  {:>12}",
+        "filas", "escrituras", "páginas distintas", "escrituras/pág", "útil"
+    );
+    for batch in [10u32, 100, 1_000, 5_000] {
+        counting.reset_offsets();
+        let before = counting.writes();
+        let mut useful = 0u64;
+        let mut tx = db.begin_write().unwrap();
+        for i in 100_000..100_000 + batch {
+            let (k, v) = synthetic(i);
+            useful += (k.len() + v.len()) as u64;
+            tx.put(0x01, &k, &v).unwrap();
+        }
+        tx.commit().unwrap();
+        let writes = counting.writes() - before;
+        let distinct = counting.distinct_offsets();
+        println!(
+            "{batch:>8}  {writes:>12}  {distinct:>16}  {:>14.1}  {:>9} KB",
+            writes as f64 / distinct as f64,
+            useful / 1024,
+        );
+        println!(
+            "          amplificación {:>6.2}×   ·   suelo de granularidad {:>5.2}×",
+            (writes as u64 * u64::from(PAGE)) as f64 / useful as f64,
+            (distinct as u64 * u64::from(PAGE)) as f64 / useful as f64,
+        );
+        // **La propiedad**: una página tocada mil veces en una transacción se
+        // escribe UNA. El copy-on-write obliga a copiar el camino raíz-hoja en
+        // cada `put`, pero no obliga a mandarlo al medio cada vez: eso era
+        // escribir a través, y costaba 154 escrituras por página viva.
+        //
+        // El margen de 1,5 no es holgura arbitraria: el cierre del commit
+        // escribe además la meta y las páginas de la lista de libres, que sí
+        // pueden tocarse dos veces si el volcado de la lista crece mientras se
+        // serializa.
+        assert!(
+            writes as f64 <= distinct as f64 * 1.5,
+            "un commit de {batch} filas emitió {writes} escrituras para {distinct} páginas \
+             distintas: las páginas sucias se están mandando al medio en cada `put` en vez de \
+             acumularse hasta el commit"
+        );
+    }
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Qué parte del FICHERO es basura transitoria del propio commit.
+///
+/// El desperdicio de escritura (2.009 escrituras para 13 páginas vivas) no se
+/// traduce automáticamente en disco: las páginas que un `put` supera dentro de
+/// la misma transacción vuelven a la lista de libres y se reutilizan. Esta
+/// prueba separa las tres cifras que hay que mirar antes de decidir si
+/// bufferizar el commit ahorra ESPACIO además de escrituras:
+///
+/// - **fichero**: el máximo histórico, que es contra lo que mide el tope por
+///   inquilino (`Options::max_pages`).
+/// - **páginas vivas**: lo que el árbol de verdad necesita.
+/// - **la diferencia**: basura reciclable más holgura de lista de libres.
+#[test]
+#[ignore]
+fn how_much_of_the_file_is_transient_garbage() {
+    const PAGE: u32 = 4096;
+    let n = entries();
+
+    println!(
+        "{:>10}  {:>12}  {:>13}  {:>13}  {:>12}  {:>10}",
+        "lote", "fichero KB", "páginas fich.", "páginas vivas", "basura", "B/entrada"
+    );
+    for batch in [100u32, 1_000, 5_000] {
+        let path =
+            std::env::temp_dir().join(format!("inro-garbage-{}-{batch}.inro", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::create(
+            Box::new(FileStorage::open(&path).unwrap()),
+            Options { page_size: PAGE, sync: Sync::Never, ..Options::default() },
+        )
+        .unwrap();
+        for chunk in (0..n).collect::<Vec<_>>().chunks(batch as usize) {
+            let mut tx = db.begin_write().unwrap();
+            for &i in chunk {
+                let (k, v) = synthetic(i);
+                tx.put(0x01, &k, &v).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let live = {
+            let mut tx = db.begin_write().unwrap();
+            tx.pages_in_use()
+        };
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        let file_pages = (bytes / u64::from(PAGE)) as u32;
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+
+        println!(
+            "{batch:>10}  {:>12}  {file_pages:>13}  {live:>13}  {:>11.1}%  {:>10.2}",
+            bytes / 1024,
+            f64::from(file_pages - live) / f64::from(file_pages) * 100.0,
+            bytes as f64 / f64::from(n),
         );
     }
 }

@@ -1558,7 +1558,15 @@ mod tests {
         tx.commit().unwrap();
 
         // 4. Muchas transacciones pequeñas.
-        for i in 0..60u32 {
+        //
+        // Eran 60 y son 240 desde el buffer de páginas sucias (`Pager::pending`).
+        // El motivo no es que la carga fuera floja: es que el buffer recortó
+        // las escrituras físicas —y por tanto los sellados— a un tercio, y el
+        // suelo de esta prueba existe justamente para que "cero duplicados"
+        // siga significando algo. Se sube la carga hasta recuperar la
+        // cobertura ANTERIOR en vez de bajar el suelo, que es lo que haría
+        // que la prueba pasara sin volver a probar nada.
+        for i in 0..240u32 {
             let mut tx = db.begin_write().unwrap();
             tx.put(0x04, &(i + salt).to_be_bytes(), b"pequenya").unwrap();
             tx.commit().unwrap();
