@@ -673,26 +673,48 @@ El documento de diseño
 (`docs/superpowers/specs/2026-08-10-inro-motor-kv-design.md`) argumenta
 decisiones y compara alternativas; **no es una referencia de formato y ha
 estado equivocado antes**. Cuando discrepe con lo de arriba, manda el código.
-Discrepancias conocidas en el momento de escribir esto:
 
-### 12.1 Discrepancias que afectan al FORMATO
+Las discrepancias que afectaban al formato están **cerradas** desde el
+17-08-2026 (§12.1): el diseño ya no rompe a nadie que escriba un lector
+siguiéndolo. Eso no lo convierte en la referencia — sigue siendo un documento de
+argumentos, sin garantía de seguir al día, y este documento es el que se
+mantiene contra el código. Lo que queda abierto es de comportamiento, no de
+bytes:
 
-Estas son las que importan para escribir un lector independiente. **Si sigue el
-diseño en cualquiera de ellas, su lector no funcionará.**
+### 12.1 Discrepancias que afectan al FORMATO — CERRADAS el 17-08-2026
 
-| El diseño dice | El código hace | Dónde verificarlo |
-|---|---|---|
-| §4.4: cabecera de página de «8 bytes más 4 de CRC», con el array de slots en el offset 12 | **20 bytes** (`PAGE_HEADER_SIZE`), con `extra` en 12..16, `prefix_len` en 16..18 y el array de slots en `20 + prefix_len` | `page.rs` |
-| §4.4: el CRC32 de página está «ausente si hay cifrado» | **Nunca está ausente.** `PageRef::parse` lo comprueba incondicionalmente. El propio §9 del diseño ya dice lo contrario, así que se contradice a sí mismo | `page.rs` |
-| §4.4: «con página de 512 B quedan unos 500 bytes útiles» | 492 antes del prefijo y los slots; **472** en una base cifrada | `page.rs`, `pager.rs` |
-| §4.1: los `flags` de la cabecera fijan «checksums de página, compresión de prefijo, cifrado» | Solo existen dos bits, y **solo uno se escribe jamás**: `FLAG_ENCRYPTED`. No hay bit de checksum (el CRC es incondicional) y `FLAG_PREFIX_COMPRESSION` está muerto — la compresión de prefijo es incondicional | `header.rs`, `tx.rs` |
-| §4.1: la cabecera «se escribe una vez y **nunca se reescribe**» | La reubicación de la meta B la reescribe. Y el diseño **no menciona en absoluto el espejo** de la cabecera (bytes 64..128 de la página 0), que es lo que impide que un desgarro de esa reescritura deje la base inabrible para siempre | `header.rs`, `tx.rs` |
-| §9: «ChaCha20-Poly1305 por defecto, AES-256-GCM seleccionable» | **X**ChaCha20-Poly1305 (nonce de 24 B, que es lo que deja meter el prefijo aleatorio) y AES-256-**GCM-SIV**. `aes-gcm` desapareció del manifiesto. El propio §9 ya dice «GCM-SIV» unas líneas más abajo | `crypto.rs`, `Cargo.toml` |
-| §9: «con ChaCha20-Poly1305 y con AES-GCM, [repetir nonce] rompe la confidencialidad de ambas páginas» | Cierto para XChaCha20; **falso para GCM-SIV**, resistente a la reutilización de nonce por construcción (RFC 8452). Es justo el motivo del cambio | `crypto.rs`, `Cargo.toml` |
-| §9: «invariante del nonce: `página \|\| contador`» | El nonce es `prefijo aleatorio \|\| contador`. **El número de página no está en el nonce**: es dato asociado | `crypto.rs` |
-| §4.1: solo describe el rechazo por versión «demasiado nueva» | También se rechaza una versión **más vieja**, y es una propiedad de seguridad, no de comodidad (ver la sección 11 de este documento) | `header.rs`, `error.rs` |
-| §4.1: no dice cuál es el rango legal de `page_size` | 512 B a **32 768 B** (`MIN_PAGE_SIZE`/`MAX_PAGE_SIZE`), impuesto en `Geometry::decode` | `header.rs` |
-| §4.2: describe la meta como una lista de campos, sin offsets ni tamaño, y **omite `catalog_root` y `freelist_tail`** | 152 bytes con la disposición de la sección 5 de este documento | `meta.rs` |
+**Ninguna, a día de hoy.** Eran once y se corrigieron todas en el documento de
+diseño, que es el que estaba equivocado; el código no se tocó. La lista se
+conserva porque dice *dónde* se desvía un documento de diseño cuando se desvía,
+y ese patrón sirve para la próxima vez.
+
+| Lo que el diseño decía | Lo que se escribió en su lugar |
+|---|---|
+| §4.4: cabecera de página de «8 bytes más 4 de CRC», array de slots en el offset 12 | Los 20 bytes reales, con `extra` en 12..16, `prefix_len` en 16..18 y los slots en `20 + prefix_len` |
+| §4.4: el CRC32 de página está «ausente si hay cifrado» | Nunca está ausente, con el motivo: quitarlo sería un formato de página distinto según esté cifrada o no la base. Y la regla de cálculo, `0..8` seguido de `12..fin` como un solo flujo |
+| §4.4: «con página de 512 B quedan unos 500 bytes útiles» | 492 sin cifrar y 452 cifrada, distinguiendo los dos cortes que la cifra antigua mezclaba: la página lógica (472) y lo que queda bajo la cabecera |
+| §4.1: los `flags` fijan «checksums de página, compresión de prefijo, cifrado» | Que solo se escribe `FLAG_ENCRYPTED`, que `FLAG_PREFIX_COMPRESSION` está definido y muerto, y que no hay bit de checksum |
+| §4.1: la cabecera «se escribe una vez y nunca se reescribe» | Que la reubicación de la meta B la reescribe, y **el espejo entero** (bytes 64..128, offset fijo del fichero, regla de lectura y reparación oportunista), que el diseño no mencionaba en absoluto. §4.3 dice ahora que la reubicación escribe el espejo antes de tocar la principal |
+| §9: «ChaCha20-Poly1305 por defecto, AES-256-GCM seleccionable» | XChaCha20-Poly1305 y AES-256-GCM-SIV, y por qué ninguno de los dos es la variante de libro de su familia: en ambos casos el motivo es el nonce |
+| §9: repetir nonce «rompe la confidencialidad» con los dos algoritmos | La asimetría real: catastrófico con XChaCha20, degradado a «dos textos planos eran iguales» con GCM-SIV (RFC 8452). Es el motivo del cambio, así que ocultarlo borraba la razón de la decisión |
+| §9: «invariante del nonce: `página \|\| contador`» | `prefijo aleatorio \|\| contador`, con el número de página como dato asociado, y las dos rectificaciones que llevaron ahí |
+| §4.1: solo el rechazo por versión «demasiado nueva» | El orden de validación completo, incluida la versión demasiado vieja **y por qué es una propiedad de seguridad**: aceptar un formato 1 o 2 sería aceptar su protocolo de nonce |
+| §4.1: sin rango legal de `page_size` | 512 B a 32 768 B, en la propia fila de la tabla |
+| §4.2: meta como lista de campos, sin offsets, sin `catalog_root` ni `freelist_tail` | La tabla de 152 bytes con offsets, incluidos los dos campos que faltaban, el hueco donde vivía `write_counter` y por qué el CRC y el tag no son redundantes entre sí |
+
+Dos cosas que este cierre deja aprendidas, porque las once discrepancias caen
+casi todas en una de las dos:
+
+- **Lo que más se desvía no es el campo, es el campo que se añadió después.**
+  `catalog_root`, `freelist_tail`, `extra`, `prefix_len` y el espejo entero no
+  estaban «mal» en el diseño: no estaban. Un documento que argumenta decisiones
+  no nota que le falta un campo, porque ningún argumento se rompe por ello.
+- **Al corregir un mecanismo, la razón del cambio se va con él si no se
+  escribe.** Los tres desvíos de §9 eran el mismo: alguien cambió a XChaCha20 y
+  a GCM-SIV con un motivo excelente —el tamaño del nonce— y dejó el diseño
+  hablando de los algoritmos viejos. El resultado no era solo un nombre
+  desactualizado: era un documento que ya no contenía el porqué de su propia
+  decisión más delicada.
 
 ### 12.2 Discrepancias de comportamiento, no de formato
 
@@ -701,8 +723,8 @@ Relevantes para operar, no para leer bytes.
 **Cinco de estas filas ya están corregidas en el diseño** (17-08-2026): las tres
 lecturas de apertura que eran cuatro, `cargo geiger` en integración continua, la
 prueba de cifrado sobre `txn_id`, la tabla de módulos con `node.rs` y el conteo
-de líneas. Las demás siguen abiertas, y las de la tabla 12.1 —las de formato—
-**todas**.
+de líneas. Las demás siguen abiertas. Las de formato (§12.1) están **todas
+cerradas**.
 
 | El diseño dice | El código hace |
 |---|---|
