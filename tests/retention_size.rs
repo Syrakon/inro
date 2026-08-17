@@ -780,3 +780,116 @@ fn what_blocks_reclaim_tail_in_the_steady_state() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// El llenado de hoja que consigue un `Rollup` REAL, no una reconstrucción
+/// sintética de sus filas.
+///
+/// `where_the_aggregate_space_loses_its_leaf_fill`, arriba, separa las causas
+/// escribiendo las filas a mano en tres órdenes distintos. Esta mide lo único
+/// que importa para el disco de un inquilino: cuántas páginas gasta la capa
+/// cuando la usa quien la usa de verdad, y si el sesgo de anexado de `tree.rs`
+/// llega a dispararse alguna vez.
+///
+/// El umbral es un llenado del **93%**, que es donde debe quedar una escritura
+/// en orden de clave (medida aparte: 96,1%). Con el volcado desordenado esta
+/// misma carga da 85%, así que el umbral discrimina: si se pone en rojo, el
+/// volcado ha vuelto a emitir las filas fuera de orden.
+#[test]
+#[ignore]
+fn the_aggregate_layer_fills_its_leaves() {
+    let path = tmp("inro-agg-fill.inro");
+    let _ = std::fs::remove_file(&path);
+    let db = Db::create(
+        Box::new(FileStorage::open(&path).unwrap()),
+        Options { page_size: 4096, sync: Sync::Never, ..Options::default() },
+    )
+    .unwrap();
+    let mut rollup = Rollup::new(Config::default());
+
+    // Tres días de un inquilino con la cardinalidad del edge: suficientes
+    // celdas horarias para que el árbol tenga varios niveles, y días de sobra
+    // para que las claves de día se intercalen con las de hora, que es lo que
+    // apaga el sesgo de anexado.
+    let mut rows = 0u64;
+    let mut bytes = 0u64;
+
+    for hour in 0..72u32 {
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..200u32 {
+            let ep = format!("/e{}", i % 60);
+            let user = format!("u{}", i % 400);
+            rollup
+                .observe(
+                    &mut tx,
+                    &Observation {
+                        ts: T0 + u64::from(hour) * 3_600 + u64::from(i) * 17,
+                        endpoint: ep.as_bytes(),
+                        user: user.as_bytes(),
+                        country: if i % 3 == 0 { b"ES" } else { b"FR" },
+                        status: if i % 50 == 0 { 500 } else { 200 },
+                        latency_ms: 5 + i % 90,
+                        bytes_in: 300,
+                        bytes_out: 1_200,
+                        error: i % 50 == 0,
+                    },
+                )
+                .unwrap();
+        }
+        let st = rollup.flush(&mut tx).unwrap();
+        rows += st.rows_written;
+        bytes += st.bytes_written;
+        tx.commit().unwrap();
+    }
+
+    let pages = pages_in_use(&db);
+
+    // El estado final tal cual quedó, leído del propio árbol: así el control
+    // replica exactamente las mismas claves y los mismos tamaños de valor,
+    // sin que la prueba tenga que saber cómo se construyen.
+    let final_rows: Vec<(Vec<u8>, Vec<u8>)> = {
+        let rd = db.begin_read();
+        let mut c = rd.scan(0x02, &[], &[0xff; 16]).unwrap();
+        let mut out = Vec::new();
+        while let Some((k, v)) = c.next().unwrap() {
+            out.push((k, v));
+        }
+        out
+    };
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+
+    // Control: las MISMAS filas, escritas de una pasada y en orden de clave
+    // ascendente sobre una base nueva. Es el mejor caso posible del árbol, y
+    // comparar contra él evita que el umbral dependa de cuántas páginas
+    // internas tenga esta carga o de la media de bytes por fila.
+    let ctl_path = tmp("inro-agg-fill-control.inro");
+    let _ = std::fs::remove_file(&ctl_path);
+    let ctl = Db::create(
+        Box::new(FileStorage::open(&ctl_path).unwrap()),
+        Options { page_size: 4096, sync: Sync::Never, ..Options::default() },
+    )
+    .unwrap();
+    {
+        let mut tx = ctl.begin_write().unwrap();
+        // Ya vienen en orden de clave: `scan` recorre el árbol ordenado.
+        for (k, v) in &final_rows {
+            tx.put(0x02, k, v).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let ctl_pages = pages_in_use(&ctl);
+    drop(ctl);
+    let _ = std::fs::remove_file(&ctl_path);
+
+    let ratio = f64::from(pages) / f64::from(ctl_pages);
+    println!(
+        "agregado: {rows} filas y {bytes} B escritos · {pages} páginas vivas · \
+         control en orden de clave {ctl_pages} · {ratio:.2}× del mejor caso"
+    );
+    assert!(
+        ratio < 1.25,
+        "el volcado gasta {ratio:.2}× las páginas del mismo juego de filas escrito en orden de \
+         clave ({pages} contra {ctl_pages}): el sesgo de anexado no se está disparando (ver \
+         `write_cell` y `WriteTxn::put_within`)"
+    );
+}

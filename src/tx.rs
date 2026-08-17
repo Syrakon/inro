@@ -2103,6 +2103,56 @@ impl<'db> WriteTxn<'db> {
     /// espacios reservados (`Error::ReservedNamespace`) esa es la única vía
     /// dentro del crate. No amplía nada de cara al usuario: `put_raw` sigue
     /// sin ser `pub`.
+    /// `put` con región de anexado acotada. Misma puerta que `put` —espacios
+    /// reservados e índices sin declarar— y, si el espacio tiene índices, cae
+    /// al camino normal: mantener el índice importa más que el llenado.
+    pub(crate) fn put_within(
+        &mut self,
+        ns: u8,
+        key: &[u8],
+        value: &[u8],
+        upper: &[u8],
+    ) -> Result<()> {
+        if ns == CATALOG_NS || ns >= INDEX_NS_BASE {
+            return Err(Error::ReservedNamespace { ns });
+        }
+        let defs = self.db.indexes_for(ns);
+        self.refuse_undeclared(ns, &defs)?;
+        if !defs.is_empty() {
+            return self.put(ns, key, value);
+        }
+        self.put_bounded(ns, key, value, upper)
+    }
+
+    /// Igual que `put_raw`, pero con una región de anexado MÁS FINA que el
+    /// espacio de claves.
+    ///
+    /// `put_raw` acota la región a `[ns, ns+1)`, que es la traducción exacta
+    /// de "el mayor de su espacio". Para el crudo basta: sus claves crecen y
+    /// nada por encima comparte espacio. Para los agregados no, y el efecto
+    /// es caro: hora y día conviven en `0x02`, las claves de día ordenan por
+    /// encima de TODAS las de hora, y en cuanto existe una sola fila de día
+    /// ninguna inserción horaria vuelve a ser la mayor de su espacio. El sesgo
+    /// de anexado deja de dispararse y el llenado de hoja cae al 40% medido.
+    ///
+    /// Con esto, quien escribe declara la región dentro de la que su clave sí
+    /// es la mayor —para el agregado, la celda `[res][ts_bucket]`— y el árbol
+    /// vuelve a partir por el borde. `upper` va SIN el prefijo de espacio:
+    /// se le antepone aquí, igual que a la clave.
+    pub(crate) fn put_bounded(
+        &mut self,
+        ns: u8,
+        key: &[u8],
+        value: &[u8],
+        upper: &[u8],
+    ) -> Result<()> {
+        let full = scoped(ns, key);
+        let bound = scoped(ns, upper);
+        let root = crate::tree::put(self, self.meta.root, &full, value, Some(&bound))?;
+        self.meta.root = root;
+        Ok(())
+    }
+
     pub(crate) fn put_raw(&mut self, ns: u8, key: &[u8], value: &[u8]) -> Result<()> {
         let full = scoped(ns, key);
         // La cota de anexado del árbol (ver `tree::put`): el byte siguiente a

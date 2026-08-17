@@ -993,6 +993,23 @@ mod engine {
         /// desalojado y readmitido entre dos volcados, de modo que está a la
         /// vez en la lista de borrados y en la tabla. Al revés se borraría la
         /// fila recién escrita.
+        /// Escribe una celda **en orden de clave ascendente**.
+        ///
+        /// El orden no es cosmético: `tree::SplitBias` solo parte sesgado al
+        /// anexar cuando la clave que entra es la mayor del árbol, y eso es lo
+        /// que sube el llenado de hoja del ~50% al ~99%. Esta función emitía
+        /// las filas por ranura de dimensión y, dentro, en el orden de la tabla
+        /// del top-K —que no es el de la clave— y la fila de totales la última,
+        /// cuando su clave (`Dimension::Total = 0`) ordena la primera. Cada
+        /// celda entraba desordenada y el sesgo no se disparaba nunca.
+        ///
+        /// Medido con `the_aggregate_layer_fills_its_leaves`: 40% de llenado
+        /// emitiendo en el orden de las estructuras, y los mismos bytes en
+        /// dos quintos de las páginas al ordenarlos antes de escribir.
+        ///
+        /// El coste es una `Vec` de las filas sucias de la celda y un `sort`:
+        /// unas cientos de entradas una vez por hora, contra las páginas que
+        /// ahorra en cada commit.
         fn write_cell(
             tx: &mut WriteTxn<'_>,
             res: Resolution,
@@ -1002,6 +1019,9 @@ mod engine {
             let mut stats = FlushStats::default();
             let rc = res.code();
 
+            // Los borrados van antes y aparte: liberan claves que las
+            // inserciones de abajo pueden volver a necesitar, y su orden no
+            // afecta al llenado porque no asignan hoja nueva.
             for slot in 0..DIM_SLOTS {
                 let Some(t) = cell.dims[slot].as_mut() else { continue };
                 let dim = Dimension::from_code(slot as u8)?;
@@ -1012,43 +1032,67 @@ mod engine {
                     }
                 }
                 t.clear_pending_deletes();
+            }
 
-                for i in 0..t.entries().len() {
-                    if !t.entries()[i].dirty {
-                        continue;
-                    }
-                    let (k, v) = {
-                        let e = &t.entries()[i];
-                        (
+            // Se recogen todas las filas sucias de la celda —totales incluidos—
+            // y se ordenan por clave antes de tocar el árbol.
+            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            if cell.total_dirty && !cell.total.is_empty() {
+                rows.push((
+                    key::total_key(rc, tsb, Dimension::Total.code()),
+                    cell.total.encode(),
+                ));
+            }
+            for slot in 0..DIM_SLOTS {
+                let Some(t) = cell.dims[slot].as_ref() else { continue };
+                let dim = Dimension::from_code(slot as u8)?;
+                for e in t.entries() {
+                    if e.dirty {
+                        rows.push((
                             key::dim_key(rc, tsb, dim.code(), Some(&e.value)),
                             e.bucket.encode(),
-                        )
-                    };
-                    tx.put(AGG_NS, &k, &v)?;
-                    stats.rows_written += 1;
-                    stats.bytes_written += (k.len() + v.len() + 1) as u64;
-                    let e = &mut t.entries_mut()[i];
-                    e.dirty = false;
-                    e.on_disk = true;
+                        ));
+                    }
                 }
-
                 if t.drawer_dirty && !t.drawer.is_empty() {
-                    let k = key::dim_key(rc, tsb, dim.code(), None);
-                    let v = t.drawer.encode();
-                    tx.put(AGG_NS, &k, &v)?;
-                    stats.rows_written += 1;
-                    stats.bytes_written += (k.len() + v.len() + 1) as u64;
+                    rows.push((key::dim_key(rc, tsb, dim.code(), None), t.drawer.encode()));
+                }
+            }
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+            // La región de anexado es LA CELDA, no el espacio de claves. Es la
+            // otra mitad del arreglo: ordenar las filas no basta mientras el
+            // árbol solo sesgue al anexar cuando la clave es la mayor de todo
+            // `0x02`, porque las claves de día ordenan por encima de todas las
+            // de hora y basta una fila de día para apagarlo. Ver
+            // `WriteTxn::put_within`.
+            let cell_upper = key::cell_range(rc, tsb).1;
+
+            for (k, v) in &rows {
+                tx.put_within(AGG_NS, k, v, &cell_upper)?;
+                stats.rows_written += 1;
+                stats.bytes_written += (k.len() + v.len() + 1) as u64;
+            }
+
+            // Las marcas se limpian DESPUÉS de que todas las escrituras hayan
+            // ido bien: si una falla, la transacción se abandona entera y la
+            // celda tiene que seguir sabiéndose sucia.
+            for slot in 0..DIM_SLOTS {
+                let Some(t) = cell.dims[slot].as_mut() else { continue };
+                for i in 0..t.entries().len() {
+                    let e = &mut t.entries_mut()[i];
+                    if e.dirty {
+                        e.dirty = false;
+                        e.on_disk = true;
+                    }
+                }
+                if t.drawer_dirty && !t.drawer.is_empty() {
                     t.drawer_dirty = false;
                     t.drawer_on_disk = true;
                 }
             }
 
             if cell.total_dirty && !cell.total.is_empty() {
-                let k = key::total_key(rc, tsb, Dimension::Total.code());
-                let v = cell.total.encode();
-                tx.put(AGG_NS, &k, &v)?;
-                stats.rows_written += 1;
-                stats.bytes_written += (k.len() + v.len() + 1) as u64;
                 cell.total_dirty = false;
                 cell.total_on_disk = true;
             }
