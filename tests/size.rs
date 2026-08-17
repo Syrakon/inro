@@ -646,16 +646,30 @@ fn opening_costs_the_same_at_thirty_kilobytes_and_at_two_gigabytes() {
          fichero de {size} bytes con {entries} entradas ({:.2} B/entrada)",
         size as f64 / entries as f64
     );
-    assert_eq!(
-        small, big,
-        "la apertura debe costar lo mismo a 2 GB que a 30 KB — ver el comentario \
-         de la prueba de 200.000 entradas sobre por qué, si difiere, la causa no \
-         es el tamaño del fichero"
+    // **La propiedad NO es la igualdad exacta, y conviene decir por qué antes
+    // de que alguien la "arregle" endureciéndola.** `Db::open` lee la
+    // cabecera, las dos meta-páginas y, si la lista de libres no está vacía,
+    // su cabeza y su cola: cinco páginas físicas como mucho, cuatro si cabeza
+    // y cola comparten página. Eso es lo que dice la sección 5 de la
+    // especificación, y lo que decide cuál de los dos casos toca es el estado
+    // de la lista de libres, no el tamaño del fichero. Medido en
+    // `tests/page_size.rs`: 4 lecturas con 200.000 entradas y 5 con 2,5
+    // millones, con las mismas páginas de 4 KB. Exigir `small == big` aquí
+    // haría fallar el banco por una diferencia de una página que la
+    // especificación permite explícitamente, y esa sí sería una prueba
+    // midiendo lo que no dice medir.
+    assert!(
+        big <= 5 && small <= 5,
+        "abrir cuesta {small} lecturas en pequeño y {big} en grande: la cota son 5 \
+         —cabecera, dos metas y cabeza/cola de la lista de libres— y pasarse significa \
+         que algo de `Db::open` empezó a depender del contenido del fichero; ver \
+         `Meta::load` y `Freelist::load`"
     );
     assert!(
-        small <= 4,
-        "cabecera, dos meta-páginas y como mucho cabeza/cola de la lista de libres — \
-         nunca más; ver `Db::open`, `Meta::load` y `Freelist::load` en freelist.rs"
+        big.abs_diff(small) <= 1,
+        "abrir cuesta {small} lecturas con 30 KB y {big} con 2 GB: una página de \
+         diferencia es la cola de la lista de libres, más de una no la explica nada \
+         del diseño y significa que el coste de apertura SÍ depende del tamaño"
     );
 }
 
