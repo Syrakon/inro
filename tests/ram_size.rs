@@ -291,6 +291,46 @@ fn ram_per_open_database_with_pro_defaults() {
     );
 }
 
+/// **La curva entera, que es lo que de verdad hay que mirar.**
+///
+/// Los dos bancos de arriba miden un punto cada uno, y el punto lo elige una
+/// constante. El tamaño de página SÍ lo fija la especificación por tier
+/// (§12.4: 512 B en micro y starter, 4 KB en pro y enterprise, decidido al
+/// crear el fichero), pero **`cache_pages` no aparece por ningún lado**: el
+/// único valor que la especificación menciona es el `32` del ejemplo de API,
+/// que es el de `Options::default()`. Llamar "configuración de un nodo pro" a
+/// `64` era una invención de este banco.
+///
+/// Así que en vez de defender un número inventado, esta prueba barre el
+/// presupuesto y publica la tabla: cuánta RAM por base cuesta cada valor, con
+/// los dos tamaños de página que la especificación sí fija. Con eso, elegir
+/// `cache_pages` por tier pasa a ser una decisión con datos delante — y el
+/// coste en LECTURAS de cada opción, que es la otra mitad de esa decisión,
+/// es la primera tarea de la fase 2.
+#[test]
+#[ignore]
+fn ram_across_cache_budgets() {
+    if rss_bytes().is_none() {
+        eprintln!("sin /proc: banco omitido");
+        return;
+    }
+    for (tag, page_size) in [("micro", 512u32), ("pro", 4096u32)] {
+        let dir = dir_for(&format!("sweep-{tag}"));
+        build_all(&dir, ENTRIES, page_size);
+        println!("--- páginas de {page_size} B ---");
+        for cache_pages in [0usize, 4, 8, 16, 32, 64, 128] {
+            let (cold, warm) =
+                measure_in_child(&dir, page_size, cache_pages).expect("el hijo no publicó");
+            let budget = (cache_pages as f64) * (page_size as f64);
+            println!(
+                "cache_pages={cache_pages:3}  presupuesto={budget:8.0} B  \
+                 frío={cold:8.0} B/base  caliente={warm:8.0} B/base"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// **El suelo fijo por base abierta**, medido con `cache_pages = 0`: la
 /// estructura que existe aunque no se cachee ni una página — `Pager`,
 /// `Freelist`, catálogo, geometría, los cerrojos, el `Box<dyn Storage>` y el
