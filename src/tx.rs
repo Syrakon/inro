@@ -155,8 +155,9 @@ impl Default for Options {
         // cambia nada, ni un byte: el copy-on-write escribe cada página en un
         // número nuevo, así que no hay nada que cachear.
         //
-        // Con 4, la RAM por base baja de 22,3 a 4,3 KB con páginas de 512 B y
-        // de 271 a 18,6 KB con las de 4 KB, que es lo que pone los dos
+        // Con 4, la RAM por base baja de 21,9 a 4,9 KB con páginas de 512 B y
+        // de 271 a 19,3 KB con las de 4 KB (medido, no derivado del modelo),
+        // que es lo que pone los dos
         // criterios de salida de RAM de la fase 2 por debajo del tope sin
         // tocar una línea de motor. Ver `the_default_cache_is_four_pages`.
         Self { page_size: 512, sync: Sync::Commit, cache_pages: 4, encryption: None, max_pages: None }

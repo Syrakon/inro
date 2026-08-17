@@ -235,9 +235,12 @@ fn ram_measurement_child() {
     );
 }
 
-/// Línea base con la configuración de un nodo micro: páginas de 512 B y 32 de
-/// caché, que son los valores por defecto de `Options`. Presupuesto de caché:
-/// 16.384 B.
+/// Línea base con la configuración de un nodo micro: páginas de 512 B y el
+/// presupuesto de caché **por defecto**, que se lee de `Options` en vez de
+/// escribirse a mano. Estaba puesto a 32 y se quedó midiendo una
+/// configuración que dejó de ser la de nadie en cuanto el defecto bajó a 4:
+/// el banco seguía en verde informando de un número que ya no describía a
+/// ninguna base real.
 ///
 /// **Medido** (17-08-2026, `--release`, glibc, 128 bases de 20.000 entradas,
 /// proceso propio): ver el informe que imprime. El techo del `assert` es
@@ -252,11 +255,12 @@ fn ram_per_open_database_with_micro_defaults() {
     }
     let dir = dir_for("micro");
     build_all(&dir, ENTRIES, 512);
-    let (cold, warm) = measure_in_child(&dir, 512, 32).expect("el hijo no publicó resultado");
+    let cache = Options::default().cache_pages;
+    let (cold, warm) = measure_in_child(&dir, 512, cache).expect("el hijo no publicó resultado");
     let _ = std::fs::remove_dir_all(&dir);
-    let budget = 32.0 * 512.0;
+    let budget = cache as f64 * 512.0;
     println!(
-        "micro (512 B/página, 32 de caché = {budget:.0} B de presupuesto): \
+        "micro (512 B/página, {cache} de caché = {budget:.0} B de presupuesto): \
          {cold:.0} B/base en frío, {warm:.0} B/base en caliente \
          ({:.2}× el presupuesto)",
         warm / budget
@@ -268,9 +272,9 @@ fn ram_per_open_database_with_micro_defaults() {
     );
 }
 
-/// La misma medición con la configuración de un nodo pro: páginas de 4 KB y 64
-/// de caché, presupuesto de 262.144 B. Es la fila de la tabla de fases que
-/// dice "~832 KB, sin medir".
+/// La misma medición con la configuración de un nodo pro: páginas de 4 KB y el
+/// presupuesto por defecto. Es la fila de la tabla de fases que decía
+/// "~832 KB, sin medir".
 #[test]
 #[ignore]
 fn ram_per_open_database_with_pro_defaults() {
@@ -280,11 +284,12 @@ fn ram_per_open_database_with_pro_defaults() {
     }
     let dir = dir_for("pro");
     build_all(&dir, ENTRIES, 4096);
-    let (cold, warm) = measure_in_child(&dir, 4096, 64).expect("el hijo no publicó resultado");
+    let cache = Options::default().cache_pages;
+    let (cold, warm) = measure_in_child(&dir, 4096, cache).expect("el hijo no publicó resultado");
     let _ = std::fs::remove_dir_all(&dir);
-    let budget = 64.0 * 4096.0;
+    let budget = cache as f64 * 4096.0;
     println!(
-        "pro (4 KB/página, 64 de caché = {budget:.0} B de presupuesto): \
+        "pro (4 KB/página, {cache} de caché = {budget:.0} B de presupuesto): \
          {cold:.0} B/base en frío, {warm:.0} B/base en caliente \
          ({:.2}× el presupuesto)",
         warm / budget
