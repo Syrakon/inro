@@ -667,19 +667,21 @@ constituye ningún mecanismo de negociación: es espacio reservado.
 
 ---
 
-## 12. Dónde el código y el documento de diseño no coinciden
+## 12. Dónde el código y el documento de diseño no coincidían
 
 El documento de diseño
 (`docs/superpowers/specs/2026-08-10-inro-motor-kv-design.md`) argumenta
 decisiones y compara alternativas; **no es una referencia de formato y ha
 estado equivocado antes**. Cuando discrepe con lo de arriba, manda el código.
 
-Las discrepancias que afectaban al formato están **cerradas** desde el
-17-08-2026 (§12.1): el diseño ya no rompe a nadie que escriba un lector
-siguiéndolo. Eso no lo convierte en la referencia — sigue siendo un documento de
-argumentos, sin garantía de seguir al día, y este documento es el que se
-mantiene contra el código. Lo que queda abierto es de comportamiento, no de
-bytes:
+**Las veinticinco discrepancias que había están cerradas** desde el 17-08-2026:
+las once de formato (§12.1) y las catorce de comportamiento (§12.2). Eso no
+convierte el diseño en la referencia — sigue siendo un documento de argumentos,
+sin garantía de seguir al día, y este documento es el que se mantiene contra el
+código. Lo que sí significa es que hoy nadie se rompe siguiéndolo, y que las dos
+tablas de abajo dejan de ser una lista de trampas para quedarse como registro de
+**dónde** se desvía un documento de diseño cuando se desvía. El patrón es
+distinto en cada mitad, y las dos conclusiones están al pie de su tabla.
 
 ### 12.1 Discrepancias que afectan al FORMATO — CERRADAS el 17-08-2026
 
@@ -716,32 +718,40 @@ casi todas en una de las dos:
   desactualizado: era un documento que ya no contenía el porqué de su propia
   decisión más delicada.
 
-### 12.2 Discrepancias de comportamiento, no de formato
+### 12.2 Discrepancias de comportamiento, no de formato — CERRADAS el 17-08-2026
 
-Relevantes para operar, no para leer bytes.
+Eran catorce y **no queda ninguna**. Como en §12.1, el que se corrigió fue el
+diseño; la excepción es una fila, la métrica de retención, donde lo que faltaba
+estaba en el código y se añadió.
 
-**Cinco de estas filas ya están corregidas en el diseño** (17-08-2026): las tres
-lecturas de apertura que eran cuatro, `cargo geiger` en integración continua, la
-prueba de cifrado sobre `txn_id`, la tabla de módulos con `node.rs` y el conteo
-de líneas. Las demás siguen abiertas. Las de formato (§12.1) están **todas
-cerradas**.
-
-| El diseño dice | El código hace |
+| Lo que el diseño decía | Lo que se hizo |
 |---|---|
-| §11: enumera nueve variantes de `Error` | Hay **diecisiete**, y ocho de las que faltan son las que más se ven en operación: `VersionTooOld`, `AlreadyOpen`, `WriterPoisoned`, `DuplicateKey`, `IndexNotDeclared`, `DeleteRangeIndexed`, `NonceReuse`, `NonceExhausted`. `CorruptKind` tiene nueve variantes y el diseño no enumera ninguna |
-| §10: muestra un ejemplo de API | **No compila.** `Db::open` toma un `Box<dyn Storage>`, no una ruta; `Db::create` no aparece; `delete_range`/`scan` toman `(ns, from, to)` y no rangos de Rust; `begin_read` no devuelve `Result`; `scan_index` devuelve un `Vec` ya materializado |
-| §7: ante un desajuste de versión de índice, «se niega a abrir o **reconstruye** el índice, según configuración» | Siempre `Err(IndexVersionMismatch)`. No hay opción de reconstrucción ni configuración que la active |
-| §7: la unicidad se garantiza «por colisión de clave, sin comprobación adicional» | Hay una comprobación explícita y un error propio, `DuplicateKey` |
-| §8: los índices sobre un espacio con retención deben incluir el componente temporal para que `delete_range` borre también un rango contiguo de índice | **No implementado.** `delete_range` sobre un `ns` indexado se rechaza con `DeleteRangeIndexed`, se declare el índice o no |
-| §5: «el motor debe exponer una métrica del `txn_id` más antiguo retenido» | **No existe.** `Db::reuse_floor`, que es ese valor, es privado |
-| §12.4: recuperar espacio es trabajo del llamante («truncar o recrear la base») | `Db::reclaim_tail` existe, con contrato completo |
-| §6: «abrir cuesta tres lecturas» | **Cuatro**, medidas y fijadas por prueba (el §12.2 del propio diseño ya dice 4) |
-| §6: con cifrado hay un `fsync` incondicional extra | Desapareció con los nonces por apertura. Una base cifrada paga hoy exactamente las mismas sincronizaciones que una sin cifrar |
-| §13: la prueba de cifrado verifica que «ningún par (página, `txn_id`) se repite» | `txn_id` no interviene en el nonce. Lo que se comprueba es la inyectividad del flujo de nonces |
-| §13: `cargo geiger` en integración continua | Retirado deliberadamente: `--forbid-only` no dice nada de este *crate*, porque la prohibición vive en `Cargo.toml` y no como atributo `#![forbid]` |
-| §14: tabla de módulos con `node.rs` | `node.rs` **no existe**. Faltan `header.rs`, `crypto.rs`, `storage.rs`, `error.rs`, `crc32.rs`, `varint.rs`, y `meta.rs`/`pager.rs` están mal atribuidos |
-| §14: «entre 4 000 y 6 000 líneas» | Más de 23 000 |
-| §13/§14: no mencionan `Db::audit_pages` | Existe, tras la *feature* `audit`, activada por defecto |
+| §11: enumera nueve variantes de `Error` | Las **dieciocho** (no diecisiete, como decía esta tabla: se contó de menos), agrupadas por lo que el llamante puede hacer con cada grupo, más las nueve de `CorruptKind` y las cinco de `IoError` — que es una enumeración propia y no `std::io::Error`, porque en `no_std` no existe |
+| §11: `Full` significa solo «se agotó el contador de páginas de 32 bits» | Significa también «esta base llegó a su tope» (`max_pages`), que es el caso del edge. No son dos variantes porque el llamante hace lo mismo con ambas, y lo que sí se dice es que un tope alcanzado **no** impide podar |
+| §10: el ejemplo de API **no compila** | Ahora **es una prueba**: `tests/api.rs` contiene el bloque y el compilador lo mira en cada `cargo test`. Con las firmas de verdad, y con las dos que más sorprenden explicadas: `begin_read` no devuelve `Result` porque no toca el medio, y `scan` devuelve un cursor falible porque `Cursor` no implementa `Iterator` |
+| §7: el ejemplo de `IndexDef` omite `ns` | Añadido |
+| §7: ante un desajuste de versión de índice, «se niega a abrir o **reconstruye**, según configuración» | Siempre `IndexVersionMismatch`, y **por qué** no hay reconstrucción: releer y reescribir el espacio entero es una transacción de tamaño arbitrario disparada por abrir la base, justo lo que un nodo con tope de páginas no puede permitirse a la callada |
+| §7: la unicidad sale «por colisión de clave, sin comprobación adicional» | No sale: una colisión en un árbol es una sobreescritura silenciosa, no un rechazo. Hay comprobación explícita, `DuplicateKey`, y el matiz de que compara la clave primaria existente con la que entra, para que actualizar una fila no choque consigo misma |
+| §8: regla derivada de prefijo temporal en los índices con retención | Se dice que **no está implementado** y por qué (la correspondencia depende de una propiedad de `extract` que el motor no puede verificar), que `delete_range` se rechaza con `DeleteRangeIndexed`, que el rechazo se decide contra el catálogo y no contra los índices declarados, y la medición del episodio que lo motivó: 95,3 % de basura con `audit_pages` diciendo `true` |
+| §5: «el motor **debe** exponer una métrica del `txn_id` más antiguo retenido» | **Se añadió al código**: `Db::oldest_retained_txn` (pública, con prueba). Es la única fila de las veinticinco donde el diseño tenía razón y el código no llegaba |
+| §6: con cifrado hay un `fsync` incondicional extra | Desapareció con los nonces por apertura: una base cifrada paga exactamente las mismas sincronizaciones que una sin cifrar |
+| §6: «abrir cuesta tres lecturas» | Cuatro, medidas y fijadas por prueba |
+| §12.4: recuperar espacio es del llamante («truncar o recrear la base») | `Db::reclaim_tail`, con las tres propiedades de su contrato que hacen que se pueda usar sin miedo: explícita y nunca automática, solo la cola, y repite hasta que deja de ganar. Y por qué la salida del diseño no servía: recrear una base para recuperar espacio es cambiar el fichero por debajo de una flota en producción |
+| §13: la prueba de cifrado verifica que «ningún par (página, `txn_id`) se repite» | `txn_id` no interviene en el nonce; se comprueba la inyectividad del flujo |
+| §13: `cargo geiger` en integración continua | Se ejecuta a mano: `--forbid-only` no reconoce una prohibición que vive en `[lints.rust]` |
+| §13/§14: no mencionan `Db::audit_pages` | Documentado, con la *feature* que lo activa **y lo que no ve**: la divergencia semántica de §8, donde devolvió `true` con razón sobre un fichero que era 95,3 % basura |
+| §14: tabla de módulos con un `node.rs` inexistente, «entre 4.000 y 6.000 líneas» | Tabla real contra `src/`, y ~27.000 líneas |
+| §14: `inro-rollup` es «un crate aparte» | Es el módulo `src/rollup/` tras una *feature*. La frontera que importaba se conserva sin publicar y versionar dos crates |
+
+Lo que se aprende de estas catorce, distinto de lo de §12.1: **el diseño no se
+equivocó casi nunca en el mecanismo, se equivocó en el reparto de trabajo entre
+motor y llamante.** Recuperar espacio, reconstruir un índice, mantener el índice
+al podar un rango: en las tres el diseño repartió por intuición y la
+implementación tuvo que repartir por coste medido, dos veces hacia el motor
+(`reclaim_tail`) y una hacia el llamante (`DeleteRangeIndexed`). Un documento que
+argumenta decisiones acierta las estructuras de datos —esas se piensan— y falla
+las fronteras, porque una frontera solo se puede juzgar con el coste de los dos
+lados delante.
 
 ### 12.3 Los 67,72 bytes por entrada, y todo lo que cuelga de ellos
 

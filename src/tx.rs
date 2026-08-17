@@ -3177,6 +3177,35 @@ impl Db {
         }
     }
 
+    /// El `txn_id` más antiguo que el motor todavía tiene que respetar: por
+    /// debajo de él, una página liberada ya se puede reutilizar.
+    ///
+    /// Es la métrica que la sección 5 del documento de diseño exige, y existe
+    /// para diagnosticar el único modo de fallo operativo del diseño
+    /// copy-on-write: **un lector que no suelta su snapshot impide reciclar
+    /// todo lo liberado desde entonces, y el fichero crece sin que nada esté
+    /// roto**. Es la misma limitación conocida de LMDB. Sin este número el
+    /// síntoma es indistinguible de una fuga del motor, porque `audit_pages`
+    /// dice `true` con razón —las páginas son coherentes, solo que ninguna se
+    /// puede tocar— y el tamaño del fichero no dice de quién es la culpa.
+    ///
+    /// Se lee comparándolo con el `txn_id` actual (`db.begin_read().txn_id()`):
+    /// la diferencia es el retraso, y un retraso que no baja es un lector
+    /// olvidado. Cero es el valor de una base recién abierta sin commits.
+    ///
+    /// Cuenta como lector, además de los reales, **la meta durable**: hasta
+    /// que un `fsync` la pone al día, un corte de corriente todavía puede
+    /// hacer montar ese estado anterior, así que sus páginas siguen vivas. Por
+    /// eso con `Sync::Never` este número se queda atrás aunque no haya ningún
+    /// lector abierto, y es la explicación de por qué esa política deja el
+    /// fichero más grande (§12.4 del diseño).
+    ///
+    /// Es un valor instantáneo, no una reserva: puede subir en cuanto un
+    /// lector se suelta o un `fsync` avanza el punto durable.
+    pub fn oldest_retained_txn(&self) -> TxnId {
+        self.reuse_floor()
+    }
+
     /// ¿Toca pagar un `fsync` para poder reciclar?
     ///
     /// Solo tiene sentido preguntarlo cuando la lista de libres no ha
