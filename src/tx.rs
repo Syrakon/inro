@@ -102,8 +102,10 @@ pub enum Sync {
     /// punto durable más de `MAX_DURABLE_LAG` transacciones por detrás.
     Interval(Duration),
     /// Sin `fsync` por commit: solo los que el motor necesita para
-    /// recuperar espacio (y, con cifrado, para no reutilizar contadores)
-    /// — ver el comentario del enum. Pensado para pruebas y bancos.
+    /// recuperar espacio — ver el comentario del enum. Una base cifrada paga
+    /// exactamente los mismos que una sin cifrar: el `fsync` extra por
+    /// contadores de nonce desapareció al pasar a nonces por apertura
+    /// (`crypto::NonceStream`). Pensado para pruebas y bancos.
     Never,
 }
 

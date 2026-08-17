@@ -696,7 +696,13 @@ diseño en cualquiera de ellas, su lector no funcionará.**
 
 ### 12.2 Discrepancias de comportamiento, no de formato
 
-Relevantes para operar, no para leer bytes:
+Relevantes para operar, no para leer bytes.
+
+**Cinco de estas filas ya están corregidas en el diseño** (17-08-2026): las tres
+lecturas de apertura que eran cuatro, `cargo geiger` en integración continua, la
+prueba de cifrado sobre `txn_id`, la tabla de módulos con `node.rs` y el conteo
+de líneas. Las demás siguen abiertas, y las de la tabla 12.1 —las de formato—
+**todas**.
 
 | El diseño dice | El código hace |
 |---|---|
@@ -717,13 +723,16 @@ Relevantes para operar, no para leer bytes:
 
 ### 12.3 Los 67,72 bytes por entrada, y todo lo que cuelga de ellos
 
-El diseño cita **67,72 B/entrada en trece sitios** y construye sobre esa cifra
-una cascada entera de números derivados: dimensionado de flota por plan,
-amplificación de escritura, coste diario, criterios de salida y la comparativa
-con SQLite. **La cifra actual medida es 34,14** — la partición sesgada al
-anexar (`SplitBias::Append`, `tree.rs`) subió el llenado medio de hoja del
-49,5 % al 99,5 %, y el criterio de salida de 40 B/entrada, que el diseño da por
-incumplido, **hoy se cumple**.
+**Corregido en el propio diseño el 17-08-2026**; esta sección se conserva
+porque explica el mecanismo y porque cualquier copia anterior del diseño sigue
+mintiendo. El diseño citaba **67,72 B/entrada en trece sitios** y construía
+sobre esa cifra una cascada entera de números derivados: dimensionado de flota
+por plan, amplificación de escritura, coste diario, criterios de salida y la
+comparativa con SQLite. **La cifra actual medida es 34,14** — la partición
+sesgada al anexar (`SplitBias::Append`, `tree.rs`) subió el llenado medio de
+hoja del 49,5 % al 99,5 %, y el criterio de salida de 40 B/entrada, que el
+diseño daba por incumplido, **hoy se cumple**. Donde el diseño siga citando
+67,72 hoy es hablando en pasado, de forma explícita.
 
 Como regla práctica: todo número del diseño derivado de 67,72 **se divide
 aproximadamente por dos** (34,14 / 67,72 ≈ 0,504). No los reproduzcas desde el
@@ -744,7 +753,11 @@ Dos casos merecen mención aparte:
           poda 235.133382ms
   ```
 
-  Es decir 1,64× menos disco y 59× menos tiempo de poda. La cifra de SQLite no
+  Es decir 1,64× menos disco y 59× menos tiempo de poda. Reejecutada el
+  17-08-2026 con el mismo resultado en disco —byte a byte los mismos dos
+  tamaños— y la poda en 2,089 ms frente a 256,482 ms, 123×: el disco es
+  determinista y el tiempo de poda no, así que ese factor se lee como orden de
+  magnitud (decenas a cientos), no como una constante. La cifra de SQLite no
   cambió al rehacerla porque nada del lado de SQLite se tocó; lo que cambió fue
   el lado de inro. La poda no es comparable de tú a tú: `delete_range` libera
   subárboles sin leer las hojas, mientras SQLite ejecuta un `DELETE` con índice
@@ -755,11 +768,16 @@ Dos casos merecen mención aparte:
 
 ### 12.4 Fuera del diseño
 
-- **`README.md`** sigue diciendo «The design is complete and implementation has
-  not started. There is no public API yet.» Dejó de ser cierto hace tiempo.
-- **`src/tx.rs`**, en el comentario de `Sync::Never`, sigue diciendo «y, con
-  cifrado, para no reutilizar contadores». Ese `fsync` ya no existe (ver la
-  fila correspondiente de la tabla 12.2).
+**Los dos puntos que había aquí quedaron corregidos el 17-08-2026**, y se dejan
+anotados en vez de borrados para que se vea que la lista se cierra, no se
+acumula:
+
+- ~~**`README.md`** sigue diciendo «The design is complete and implementation
+  has not started. There is no public API yet.»~~ Reescrito con el estado real
+  y las cifras medidas.
+- ~~**`src/tx.rs`**, en el comentario de `Sync::Never`, sigue diciendo «y, con
+  cifrado, para no reutilizar contadores».~~ Corregido: ese `fsync` desapareció
+  con los nonces por apertura (ver la fila correspondiente de la tabla 12.2).
 
 ---
 

@@ -28,8 +28,27 @@ footprint, and gives up SQL, time-travel and branching to get there.
 
 ## Status
 
-**Name reservation.** The design is complete and implementation has not started.
-There is no public API yet.
+**Phase one — the core — is implemented and measured.** Copy-on-write B+tree,
+free list, transactions with a single writer and lock-free readers, secondary
+indexes, range delete by subtree unlink, per-page authenticated encryption, and
+a temporal aggregation layer that lets reports outlive the raw records behind
+them.
+
+Measured, not estimated — a million synthetic rows with the exact shape of a
+real request log, 4 KB pages:
+
+| | |
+|---|---|
+| Bytes per log entry | **34.14** |
+| A freshly created database | **1,536 bytes** |
+| Opening a database | **4 physical reads**, identical at 30 KB and at 14 MB |
+| Same workload against SQLite | **39% smaller file**, pruning **123× faster** |
+| Runtime dependencies | **zero** by default (`cargo tree --edges normal` is one line) |
+| `unsafe` in inro itself | **zero**, forbidden crate-wide from `Cargo.toml` |
+
+**There is no published API yet.** The crate name is reserved while the engine
+lives in a private repository; phases two to four — RAM and CPU, append-only
+segments, columnar encoding — are still ahead.
 
 ## Licence
 
