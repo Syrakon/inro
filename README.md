@@ -41,7 +41,7 @@ real request log, 4 KB pages:
 |---|---|
 | Bytes per log entry | **34.14** |
 | A freshly created database | **1,536 bytes** |
-| Opening a database | **4 physical reads**, identical at 30 KB and at 14 MB |
+| Opening a database | **4 physical reads**, identical at 30 KB, at 14 MB and at 2 GB |
 | Same workload against SQLite | **39% smaller file**, pruning **123× faster** |
 | Runtime dependencies | **zero** by default (`cargo tree --edges normal` is one line) |
 | `unsafe` in inro itself | **zero**, forbidden crate-wide from `Cargo.toml` |
