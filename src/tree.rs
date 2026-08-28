@@ -504,6 +504,21 @@ type SplitAttempt = (Vec<u8>, bool, Vec<u8>, Vec<u8>, bool);
 enum Insertion {
     /// El subárbol sigue cabiendo en una página; esta es la nueva.
     Updated(PageNo, bool),
+    /// La hoja se anexó EN EL SITIO (`page::append_in_place`): conserva su
+    /// número de página, así que el puntero que la nombra desde arriba sigue
+    /// siendo correcto y ese nivel no tiene nada que reconstruir. Es el
+    /// motivo entero de esta variante: sin ella, una inserción que no crea
+    /// ninguna página nueva obligaría igualmente a reescribir el camino
+    /// completo hasta la raíz.
+    ///
+    /// `non_plain` es lo único que el nivel de arriba necesita para mantener
+    /// su bit `children_plain`, y significa "este hijo NO es una hoja
+    /// plana". `false` no afirma que lo sea: afirma algo más débil y
+    /// suficiente, que su condición de plano no ha cambiado con esta
+    /// inserción. Con las dos lecturas la cuenta del padre es la misma
+    /// —`bit_nuevo = bit_viejo && !non_plain`— y solo hay que reconstruir si
+    /// ese bit cambia de verdad.
+    InPlace { page: PageNo, non_plain: bool },
     /// El subárbol se dividió. `sep` es la primera clave de `right`.
     Split { left: PageNo, left_plain: bool, sep: Vec<u8>, right: PageNo, right_plain: bool },
 }
@@ -904,9 +919,13 @@ fn insert_rec(
         return Err(Error::Corrupt { page: page_no, kind: crate::CorruptKind::TreeLoop });
     }
     let valid = tx.read_page(page_no)?;
-    let page = valid.page();
+    // El tipo de página se copia fuera para poder SOLTAR `valid` dentro de la
+    // rama de hoja: el camino rápido muta esos mismos bytes, y el pager se
+    // niega a dárselos mutables mientras siga viva una referencia a ellos
+    // (ver `Pager::with_pending_mut`).
+    let page_type = valid.page().page_type();
 
-    match page.page_type() {
+    match page_type {
         PageType::Leaf => {
             // Convertir el valor entrante antes de tocar las entradas de la
             // hoja: si es grande, escribe su propia cadena de overflow y
@@ -920,6 +939,32 @@ fn insert_rec(
             } else {
                 LeafPayload::Inline(value.to_vec())
             });
+
+            // Camino rápido: anexar al final de la hoja sin reconstruirla.
+            //
+            // Se intenta ANTES de copiar una sola entrada, que es justo el
+            // trabajo que evita. No hace falta buscar la clave primero:
+            // `append_in_place` solo acepta si es estrictamente mayor que la
+            // última de la página, y una clave mayor que la última de la hoja
+            // que el descenso eligió para ella no puede estar en ninguna otra
+            // parte del árbol — así que aceptar implica que es una inserción
+            // nueva, nunca un reemplazo encubierto. Una clave igual la
+            // rechaza (`ascending` es estricto) y cae al camino lento, que sí
+            // sabe reemplazar.
+            //
+            // `valid` se suelta aquí: mientras viva, sus bytes no se pueden
+            // tomar prestados mutables. Si el intento falla hay que volver a
+            // leer la página, y ese `read_page` de más es el precio del
+            // camino rápido cuando no aplica: un `parse` sobre bytes que ya
+            // están en RAM.
+            let cell = new_payload.as_ref().expect("se consume una sola vez").as_cell_payload();
+            let non_plain = matches!(new_payload, Some(LeafPayload::Overflow { .. }));
+            drop(valid);
+            if tx.append_in_place(page_no, key, cell) {
+                return Ok(Insertion::InPlace { page: page_no, non_plain });
+            }
+            let valid = tx.read_page(page_no)?;
+            let page = valid.page();
 
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page.n_slots() + 1);
             let mut payloads: Vec<LeafPayload> = Vec::with_capacity(page.n_slots() + 1);
@@ -985,6 +1030,7 @@ fn insert_rec(
         }
 
         PageType::Internal => {
+            let page = valid.page();
             let idx = child_index(&page, key);
             let child = child_at(&page, idx);
             // El hijo conserva el invariante de anexado solo si esta página lo
@@ -996,6 +1042,29 @@ fn insert_rec(
             let child_rightmost =
                 rightmost && (idx == page.n_slots() || beyond(upper, &page.key(idx)));
             let result = insert_rec(tx, child, key, value, depth + 1, child_rightmost, upper)?;
+
+            // Si el hijo se anexó en el sitio conserva su número, así que la
+            // celda que lo nombra desde aquí ya es correcta y esta página no
+            // necesita reconstruirse — salvo que el bit `children_plain`
+            // cambie de valor, que es el único dato de esta cabecera que
+            // depende del hijo. Se resuelve antes de copiar ninguna entrada,
+            // porque copiarlas es exactamente el trabajo que se evita.
+            if let Insertion::InPlace { page: child_page, non_plain } = result {
+                debug_assert_eq!(
+                    child_page, child,
+                    "un anexado en el sitio conserva el número de página del hijo"
+                );
+                if !(page.children_plain() && non_plain) {
+                    // El bit se queda como está: nada que reescribir. Hacia
+                    // arriba se propaga `non_plain: true` porque un nodo
+                    // interno nunca es una hoja plana — es lo mismo que
+                    // reporta `emit` para esta página (ver `entries_are_plain`).
+                    return Ok(Insertion::InPlace { page: page_no, non_plain: true });
+                }
+                // El bit pasa de `true` a `false`: hay que reescribir la
+                // cabecera, y esta página no sabe hacerlo sin reconstruirse.
+                // Cae al camino de abajo.
+            }
 
             let mut entries: Vec<(Vec<u8>, CellPayload)> = Vec::with_capacity(page.n_slots() + 2);
             let mut extra = page.extra();
@@ -1014,6 +1083,13 @@ fn insert_rec(
             }
 
             match result {
+                Insertion::InPlace { non_plain, .. } => {
+                    // Solo se llega aquí si el bit cambia (ver arriba): el
+                    // hijo conserva su número, así que ninguna celda cambia,
+                    // solo la cabecera.
+                    debug_assert!(non_plain && page.children_plain());
+                    children_plain = false;
+                }
                 Insertion::Updated(new_child, plain) => {
                     children_plain &= plain;
                     if idx < page.n_slots() {
@@ -1131,6 +1207,9 @@ pub fn put(
         let entries = alloc::vec![(key.to_vec(), payload)];
         return match emit(tx, None, PageType::Leaf, 0, &entries, false, SplitBias::Middle)? {
             Insertion::Updated(p, _) => Ok(p),
+            Insertion::InPlace { .. } => {
+                unreachable!("emit nunca devuelve InPlace: siempre asigna página nueva")
+            }
             Insertion::Split { .. } => unreachable!(
                 "emit con una sola entrada nunca divide: cabe (Updated) o falla dentro de \
                  emit (Err), nunca Split"
@@ -1140,6 +1219,9 @@ pub fn put(
 
     match insert_rec(tx, root, key, value, 1, true, upper)? {
         Insertion::Updated(p, _) => Ok(p),
+        // La raíz conserva su número: no hay nada que actualizar arriba,
+        // porque arriba es la meta y sigue apuntando bien.
+        Insertion::InPlace { page: p, .. } => Ok(p),
         Insertion::Split { left, left_plain, sep, right, right_plain } => {
             // El árbol crece por arriba: raíz nueva con un solo separador.
             // Sus dos hijos son exactamente `left`/`right`, la partición de
@@ -1160,6 +1242,9 @@ pub fn put(
             )?;
             match emitted {
                 Insertion::Updated(p, _) => Ok(p),
+                Insertion::InPlace { .. } => {
+                    unreachable!("emit nunca devuelve InPlace: siempre asigna página nueva")
+                }
                 Insertion::Split { .. } => unreachable!("una raíz de una entrada siempre cabe"),
             }
         }
@@ -1226,6 +1311,9 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
                 Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
                 // Quitar una entrada nunca puede hacer que las restantes dejen
                 // de caber donde ya cabían.
+                Insertion::InPlace { .. } => {
+                    unreachable!("emit nunca devuelve InPlace: siempre asigna página nueva")
+                }
                 Insertion::Split { .. } => unreachable!("borrar no divide"),
             }
         }
@@ -1350,6 +1438,9 @@ fn delete_rec(tx: &mut WriteTxn, page_no: PageNo, key: &[u8], depth: u32) -> Res
             )?;
             match emitted {
                 Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
+                Insertion::InPlace { .. } => {
+                    unreachable!("emit nunca devuelve InPlace: siempre asigna página nueva")
+                }
                 Insertion::Split { .. } => unreachable!("borrar no divide"),
             }
         }
@@ -1821,6 +1912,9 @@ fn delete_range_rec(
             let entries: Vec<(Vec<u8>, CellPayload)> = keys.into_iter().zip(values).collect();
             match emit(tx, Some(page_no), PageType::Leaf, 0, &entries, false, SplitBias::Middle)? {
                 Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
+                Insertion::InPlace { .. } => {
+                    unreachable!("emit nunca devuelve InPlace: siempre asigna página nueva")
+                }
                 Insertion::Split { .. } => unreachable!("borrar no divide"),
             }
         }
@@ -1957,6 +2051,9 @@ fn delete_range_rec(
                 SplitBias::Middle,
             )? {
                 Insertion::Updated(p, plain) => Ok(Removal::Updated(p, plain)),
+                Insertion::InPlace { .. } => {
+                    unreachable!("emit nunca devuelve InPlace: siempre asigna página nueva")
+                }
                 Insertion::Split { .. } => unreachable!("borrar no divide"),
             }
         }

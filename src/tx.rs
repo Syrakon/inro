@@ -2043,6 +2043,29 @@ impl<'db> WriteTxn<'db> {
     /// revisión, hallazgo sobre coste de memoria — ver su comentario).
     /// Acumula una página sucia. Solo llega al medio en `flush_dirty`, al
     /// cerrar el commit — ver el campo `dirty`.
+    /// Intenta anexar una celda al final de `page` mutándola en el sitio.
+    /// `true` si se hizo: la página conserva su número y su contenido
+    /// anterior, y el nivel de arriba no tiene que reconstruir nada.
+    ///
+    /// `false` significa "aquí no aplica, hazlo por el camino largo", nunca
+    /// un error: o la página no está aparcada por esta transacción, o el
+    /// caso no es un anexado limpio (ver `page::append_in_place`). En
+    /// ninguno de los dos se ha escrito un solo byte.
+    ///
+    /// No incrementa `write_count` ni puede provocar un derrame: no hay
+    /// página nueva que aparcar, la que se toca ya estaba en el buffer.
+    pub(crate) fn append_in_place(
+        &mut self,
+        page: PageNo,
+        key: &[u8],
+        payload: crate::page::CellPayload,
+    ) -> bool {
+        self.db
+            .pager
+            .with_pending_mut(page, |bytes| crate::page::append_in_place(bytes, key, payload))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn write_page(&mut self, page: PageNo, bytes: &[u8]) -> Result<()> {
         self.db.pager.stage(page, bytes);
         self.write_count += 1;

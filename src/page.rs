@@ -126,6 +126,140 @@ const CHILDREN_PLAIN_FLAG: u8 = 0x01;
 /// sobre todos los pares de un conjunto que incluye el vacío, prefijos,
 /// iguales y longitudes distintas.
 #[inline]
+/// Anexa una celda al final del array de slots de una página YA construida,
+/// mutándola en el sitio: sin copiar sus entradas a `Vec`s, sin volver a
+/// codificar las que ya estaban y sin pedir una página nueva. Devuelve
+/// `false`, **sin haber tocado un solo byte**, si el caso no es anexable, y
+/// entonces el llamante reconstruye por el camino de siempre.
+///
+/// # Por qué solo anexar, y no insertar en cualquier posición
+///
+/// `parse` exige que los offsets de celda BAJEN según sube la clave (ver el
+/// bloque de "dirección del solape" ahí): la celda de la entrada `i` va
+/// pegada justo antes de la de `i - 1`. Una inserción por el medio tendría
+/// que desplazar todas las celdas posteriores para mantener ese invariante,
+/// que es reconstruir la página con otro nombre. Anexar al final es el único
+/// caso en el que la celda nueva cabe donde toca —en el hueco libre, que es
+/// exactamente el sitio de menor offset— sin mover ninguna otra.
+///
+/// El slot nuevo tampoco desplaza nada: va en `free_start`, que es el primer
+/// byte tras el último slot y ya es hueco libre.
+///
+/// # Condiciones
+///
+/// Todas se comprueban aquí, y todas devuelven `false` en vez de entrar en
+/// pánico o corromper:
+///
+/// 1. La página tiene cabecera y al menos una entrada. Con cero entradas el
+///    prefijo común sería la clave entera y `build` produciría una página
+///    distinta de la que saldría de aquí; no vale la pena el caso.
+/// 2. `free_start` cuadra con `n_slots` y `prefix_len` — la misma
+///    comprobación redundante que hace `parse`, aquí como red antes de
+///    escribir.
+/// 3. La clave nueva empieza por el prefijo común actual. Si no, el prefijo
+///    se acortaría y habría que recolocar `slots_at` y todas las celdas: eso
+///    es reconstruir.
+/// 4. El sufijo nuevo es estrictamente mayor que el último — el mismo orden
+///    que `parse` verifica. El llamante ya lo sabe por su búsqueda, pero
+///    escribir en el sitio sin comprobarlo dejaría una página corrupta si
+///    algún día esa búsqueda cambiara.
+/// 5. La celda y su slot caben en el hueco libre.
+///
+/// El CRC se recalcula al final, sobre la página entera: es el único trabajo
+/// que sigue siendo proporcional al tamaño de página.
+pub fn append_in_place(bytes: &mut [u8], key: &[u8], payload: CellPayload) -> bool {
+    if bytes.len() < PAGE_HEADER_SIZE {
+        return false;
+    }
+    let n_slots = u16::from_le_bytes(bytes[2..4].try_into().unwrap()) as usize;
+    let free_start = u16::from_le_bytes(bytes[4..6].try_into().unwrap()) as usize;
+    let cell_start = u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize;
+    let prefix_len = u16::from_le_bytes(bytes[16..18].try_into().unwrap()) as usize;
+    let slots_at = PAGE_HEADER_SIZE + prefix_len;
+
+    // Condiciones 1 y 2.
+    if n_slots == 0
+        || slots_at + 2 * n_slots != free_start
+        || cell_start > bytes.len()
+        || cell_start < free_start
+    {
+        return false;
+    }
+
+    // Condición 3.
+    if key.len() < prefix_len || key[..prefix_len] != bytes[PAGE_HEADER_SIZE..slots_at] {
+        return false;
+    }
+    let suffix = &key[prefix_len..];
+
+    // Condición 4: decodificar el sufijo del último slot y compararlo.
+    let last_off =
+        u16::from_le_bytes(bytes[free_start - 2..free_start].try_into().unwrap()) as usize;
+    let Some((last_suffix_len, n_last)) = varint::read(&bytes[last_off..]) else {
+        return false;
+    };
+    let last_from = last_off + n_last;
+    let Some(last_suffix) = bytes.get(last_from..last_from + last_suffix_len as usize) else {
+        return false;
+    };
+    if !ascending(last_suffix, suffix) {
+        return false;
+    }
+
+    // Condición 5. Mismas longitudes que calcula `PageBuilder::build`.
+    let mut tmp = [0u8; 10];
+    let n1 = varint::write(&mut tmp, suffix.len() as u64);
+    let body_len = match payload {
+        CellPayload::Value(v) => varint::len(v.len() as u64) + v.len(),
+        CellPayload::Overflow { .. } => varint::len(OVERFLOW_MARKER) + 12,
+        CellPayload::Child(_) => 4,
+    };
+    let cell_len = n1 + suffix.len() + body_len;
+    let Some(new_off) = cell_start.checked_sub(cell_len) else {
+        return false;
+    };
+    // `+ 2` por el slot nuevo, que se escribe en `free_start`.
+    if new_off < free_start + 2 {
+        return false;
+    }
+
+    // A partir de aquí ya no puede fallar nada: se escribe.
+    let mut at = new_off;
+    bytes[at..at + n1].copy_from_slice(&tmp[..n1]);
+    at += n1;
+    bytes[at..at + suffix.len()].copy_from_slice(suffix);
+    at += suffix.len();
+    match payload {
+        CellPayload::Value(v) => {
+            let n2 = varint::write(&mut tmp, v.len() as u64);
+            bytes[at..at + n2].copy_from_slice(&tmp[..n2]);
+            at += n2;
+            bytes[at..at + v.len()].copy_from_slice(v);
+        }
+        CellPayload::Overflow { len, first } => {
+            let n2 = varint::write(&mut tmp, OVERFLOW_MARKER);
+            bytes[at..at + n2].copy_from_slice(&tmp[..n2]);
+            at += n2;
+            bytes[at..at + 8].copy_from_slice(&len.to_le_bytes());
+            at += 8;
+            bytes[at..at + 4].copy_from_slice(&first.to_le_bytes());
+        }
+        CellPayload::Child(c) => {
+            bytes[at..at + 4].copy_from_slice(&c.to_le_bytes());
+        }
+    }
+    bytes[free_start..free_start + 2].copy_from_slice(&(new_off as u16).to_le_bytes());
+    bytes[2..4].copy_from_slice(&((n_slots + 1) as u16).to_le_bytes());
+    bytes[4..6].copy_from_slice(&((free_start + 2) as u16).to_le_bytes());
+    bytes[6..8].copy_from_slice(&(new_off as u16).to_le_bytes());
+
+    let mut h = crc32::Hasher::new();
+    h.update(&bytes[..8]);
+    h.update(&bytes[12..]);
+    bytes[8..12].copy_from_slice(&h.finish().to_le_bytes());
+    true
+}
+
 fn ascending(prev: &[u8], next: &[u8]) -> bool {
     for (a, b) in prev.iter().zip(next.iter()) {
         if a != b {
@@ -843,6 +977,150 @@ mod builder_tests {
         assert_eq!(p.prefix(), b"logs/000");
         assert_eq!(p.n_slots(), 3);
         assert_eq!(p.search(b"2"), Ok(1));
+    }
+
+    /// El camino rápido tiene que producir una página que `parse` acepte y
+    /// que se lea EXACTAMENTE igual que si se hubiera reconstruido con
+    /// `build`: es la única garantía que lo hace intercambiable con el
+    /// camino lento.
+    #[test]
+    fn appending_in_place_matches_a_full_rebuild() {
+        let three: Vec<(&[u8], CellPayload)> = alloc::vec![
+            (b"logs/0001".as_slice(), CellPayload::Value(b"uno")),
+            (b"logs/0002".as_slice(), CellPayload::Value(b"dos")),
+            (b"logs/0003".as_slice(), CellPayload::Value(b"tres")),
+        ];
+        let mut raw = PageBuilder::new(512, PageType::Leaf).build(&three).unwrap();
+        assert!(append_in_place(&mut raw, b"logs/0004", CellPayload::Value(b"cuatro")));
+
+        let p = PageRef::parse(&raw, 1).unwrap();
+        assert_eq!(p.n_slots(), 4);
+        let expected = [
+            ("logs/0001", "uno"),
+            ("logs/0002", "dos"),
+            ("logs/0003", "tres"),
+            ("logs/0004", "cuatro"),
+        ];
+        for (i, (k, v)) in expected.iter().enumerate() {
+            assert_eq!(p.key(i), k.as_bytes());
+            assert_eq!(p.leaf_value(i), LeafValue::Inline(v.as_bytes()));
+        }
+
+        // Y el mismo contenido reconstruido desde cero se lee igual. Los
+        // bytes NO tienen por qué coincidir —anexar no vuelve a comprimir el
+        // prefijo—, así que se compara lo que se lee, no la representación.
+        let four: Vec<(&[u8], CellPayload)> = alloc::vec![
+            (b"logs/0001".as_slice(), CellPayload::Value(b"uno")),
+            (b"logs/0002".as_slice(), CellPayload::Value(b"dos")),
+            (b"logs/0003".as_slice(), CellPayload::Value(b"tres")),
+            (b"logs/0004".as_slice(), CellPayload::Value(b"cuatro")),
+        ];
+        let rebuilt = PageBuilder::new(512, PageType::Leaf).build(&four).unwrap();
+        let q = PageRef::parse(&rebuilt, 1).unwrap();
+        assert_eq!(p.n_slots(), q.n_slots());
+        for i in 0..q.n_slots() {
+            assert_eq!(p.key(i), q.key(i));
+            assert_eq!(p.leaf_value(i), q.leaf_value(i));
+        }
+    }
+
+    /// Una celda de overflow es de tamaño fijo y también se anexa: es el caso
+    /// dominante del registro del edge, donde toda fila supera el umbral.
+    #[test]
+    fn appending_an_overflow_cell_in_place_reads_back() {
+        let two: Vec<(&[u8], CellPayload)> = alloc::vec![
+            (b"k0".as_slice(), CellPayload::Overflow { len: 900, first: 7 }),
+            (b"k1".as_slice(), CellPayload::Overflow { len: 950, first: 8 }),
+        ];
+        let mut raw = PageBuilder::new(512, PageType::Leaf).build(&two).unwrap();
+        assert!(append_in_place(&mut raw, b"k2", CellPayload::Overflow { len: 1200, first: 9 }));
+        let p = PageRef::parse(&raw, 1).unwrap();
+        assert_eq!(p.n_slots(), 3);
+        assert_eq!(p.leaf_value(2), LeafValue::Overflow { len: 1200, first: 9 });
+    }
+
+    /// **El límite del camino rápido, y no es un caso raro.** El prefijo
+    /// común de una página de UNA entrada es su clave entera, así que ninguna
+    /// otra clave lo comparte y todo anexado se rechaza. Ocurre de verdad:
+    /// justo después de una división, la mitad derecha nace con una sola
+    /// entrada. El árbol se recupera solo —el rechazo cae al camino lento,
+    /// que reconstruye con el prefijo común de las dos claves, ya más corto,
+    /// y a partir de ahí los anexados vuelven a entrar por el camino
+    /// rápido—, pero conviene tenerlo escrito: el camino rápido no cubre el
+    /// 100% de los anexados, y por eso el lento no puede quitarse.
+    #[test]
+    fn a_single_entry_page_has_the_whole_key_as_prefix_and_refuses() {
+        let one: Vec<(&[u8], CellPayload)> =
+            alloc::vec![(b"k0".as_slice(), CellPayload::Value(b"v"))];
+        let raw = PageBuilder::new(512, PageType::Leaf).build(&one).unwrap();
+        assert_eq!(PageRef::parse(&raw, 1).unwrap().prefix(), b"k0");
+
+        let mut mutated = raw.clone();
+        assert!(!append_in_place(&mut mutated, b"k1", CellPayload::Value(b"v")));
+        assert_eq!(mutated, raw);
+    }
+
+    /// Los cuatro rechazos. En todos, la página debe quedar BYTE A BYTE como
+    /// estaba: el llamante reconstruye a partir de ella, así que una página
+    /// medio escrita sería corrupción silenciosa.
+    #[test]
+    fn append_in_place_refuses_and_leaves_the_page_untouched() {
+        let entries: Vec<(&[u8], CellPayload)> = alloc::vec![
+            (b"logs/0001".as_slice(), CellPayload::Value(b"uno")),
+            (b"logs/0002".as_slice(), CellPayload::Value(b"dos")),
+        ];
+        let original = PageBuilder::new(512, PageType::Leaf).build(&entries).unwrap();
+
+        // Prefijo distinto: reconstruir acortaría el prefijo común.
+        let mut raw = original.clone();
+        assert!(!append_in_place(&mut raw, b"otra/clave", CellPayload::Value(b"x")));
+        assert_eq!(raw, original);
+
+        // Fuera de orden: no es un anexado.
+        let mut raw = original.clone();
+        assert!(!append_in_place(&mut raw, b"logs/0000", CellPayload::Value(b"x")));
+        assert_eq!(raw, original);
+
+        // Duplicada: `ascending` es estricto, una clave igual no es mayor.
+        let mut raw = original.clone();
+        assert!(!append_in_place(&mut raw, b"logs/0002", CellPayload::Value(b"x")));
+        assert_eq!(raw, original);
+
+        // No cabe.
+        let mut raw = original.clone();
+        let big = alloc::vec![b'z'; 480];
+        assert!(!append_in_place(&mut raw, b"logs/0003", CellPayload::Value(&big)));
+        assert_eq!(raw, original);
+    }
+
+    /// Anexar hasta llenar: la página debe seguir siendo válida en cada paso
+    /// y el primer anexado que no cabe debe rechazarse limpiamente, no
+    /// escribir a medias.
+    #[test]
+    fn appending_until_full_stays_valid_and_then_refuses() {
+        // Dos entradas de arranque que ya dejan el prefijo común en `k`, para
+        // que el bucle mida el llenado y no el prefijo (ver
+        // `a_single_entry_page_has_the_whole_key_as_prefix_and_refuses`).
+        let seed: Vec<(&[u8], CellPayload)> = alloc::vec![
+            (b"k0".as_slice(), CellPayload::Value(b"payload-de-relleno")),
+            (b"k1".as_slice(), CellPayload::Value(b"payload-de-relleno")),
+        ];
+        let mut raw = PageBuilder::new(512, PageType::Leaf).build(&seed).unwrap();
+        let mut n = 2;
+        let mut refused = false;
+        for c in b'2'..=b'~' {
+            let key = [b'k', c];
+            let before = raw.clone();
+            if !append_in_place(&mut raw, &key, CellPayload::Value(b"payload-de-relleno")) {
+                assert_eq!(raw, before, "un rechazo no puede dejar la página a medias");
+                refused = true;
+                break;
+            }
+            n += 1;
+            assert_eq!(PageRef::parse(&raw, 1).unwrap().n_slots(), n);
+        }
+        assert!(n > 2, "debería haber cabido más de una entrada anexada");
+        assert!(refused, "debería haberse llenado antes de agotar el alfabeto");
     }
 
     #[test]

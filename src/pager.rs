@@ -385,6 +385,30 @@ impl Pager {
         self.pending.lock().unwrap().insert(page_no, Arc::from(bytes));
     }
 
+    /// Muta EN EL SITIO una página que esta transacción ya tiene aparcada,
+    /// sin volver a copiarla ni asignarle un número nuevo.
+    ///
+    /// **Por qué es seguro saltarse el copy-on-write aquí**: es el propio
+    /// invariante del buffer `pending` (ver su comentario). Una página
+    /// aparcada la escribió esta transacción y todavía no ha salido a disco,
+    /// así que ninguna meta confirmada la referencia y ningún lector puede
+    /// nombrarla. Reescribirla no puede romper el snapshot de nadie: lo que
+    /// el copy-on-write protege es la versión CONFIRMADA de la página, y
+    /// esta no lo es.
+    ///
+    /// Devuelve `None` —y no toca nada— en los dos casos en los que no se
+    /// puede: la página no está aparcada (nunca lo estuvo, o ya se derramó
+    /// al medio por presión de buffer), o alguien más tiene viva una
+    /// referencia a esos bytes (`ValidPage`), en cuyo caso mutarlos por
+    /// debajo le dejaría una página validada que ya no cuadra con su
+    /// validación. El llamante reconstruye por el camino de siempre.
+    pub fn with_pending_mut<R>(&self, page_no: PageNo, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        let mut pending = self.pending.lock().unwrap();
+        let arc = pending.get_mut(&page_no)?;
+        let bytes = Arc::get_mut(arc)?;
+        Some(f(bytes))
+    }
+
     /// Cuántas páginas hay aparcadas. La transacción lo usa para decidir si
     /// derrama.
     pub fn pending_len(&self) -> usize {
