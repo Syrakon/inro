@@ -46,9 +46,9 @@ real request log, 4 KB pages:
 | Runtime dependencies | **zero** by default (`cargo tree --edges normal` is one line) |
 | `unsafe` in inro itself | **zero**, forbidden crate-wide from `Cargo.toml` |
 
-**There is no published API yet.** The crate name is reserved while the engine
-lives in a private repository; phases two to four — RAM and CPU, append-only
-segments, columnar encoding — are still ahead.
+**The surface is published but not frozen.** 0.x means what it says: the API
+may still move between minor versions, and phases two to four — RAM and CPU,
+append-only segments, columnar encoding — are still ahead.
 
 ## Licence
 
