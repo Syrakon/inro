@@ -1,7 +1,7 @@
 //! El tope de tamaño por base (`Options::max_pages`).
 //!
 //! **Por qué vive en el motor y no en el llamante.** En el despliegue real de
-//! quota cada inquilino es un fichero en un disco compartido con los otros
+//! el caso de referencia cada inquilino es un fichero en un disco compartido con los otros
 //! 2.699, y los volúmenes de `local-path` no imponen cuota ninguna: son
 //! directorios en el disco del host. El único sitio donde puede existir un
 //! límite por inquilino es dentro de `inro`, y sin él una sola ráfaga larga

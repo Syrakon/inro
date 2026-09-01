@@ -119,7 +119,7 @@ fn push_varint(buf: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-/// La misma forma de registro que `tests/size.rs`: el log del edge de quota.
+/// La misma forma de registro que `tests/size.rs`: un log de peticiones de borde.
 fn synthetic(i: u32) -> (Vec<u8>, Vec<u8>) {
     let ts = 1_760_000_000_000u64 + i as u64 * 520;
     let mut key = Vec::with_capacity(10);

@@ -677,7 +677,7 @@ hojas raquíticas. **No pasa.** Con un ciclo de poda por hora simulada durante
 ### 8.9 La meseta no es el peor caso: la ráfaga sí
 
 Las cifras de arriba reparten el tope **mensual** del plan. El limitador de
-`quota` deja pasar un rps mucho mayor, y **el crudo vivo lo fija el ritmo, no el
+el limitador deja pasar un rps mucho mayor, y **el crudo vivo lo fija el ritmo, no el
 mes**. Seis horas seguidas al tope de ráfaga, con el ciclo de retención
 corriendo (`the_burst_ceiling_of_a_plan_bounds_the_live_raw`):
 

@@ -434,7 +434,7 @@ fn rows_per_cell_measured_against_a_real_rollup() {
     }
 }
 
-/// Tiers de `quota` (`edge/src/protection/limits.rs`, la fuente única).
+/// Perfiles de carga de referencia, del producto que estrena el motor.
 struct Tier {
     name: &'static str,
     monthly: u64,

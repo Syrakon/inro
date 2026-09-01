@@ -43,8 +43,8 @@ use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
 
-/// Espacio de claves de los agregados. Convención del caso de uso de quota
-/// (sección 10 de la especificación), **no** un espacio reservado del motor:
+/// Espacio de claves de los agregados. Convención del caso de uso de
+/// referencia, **no** un espacio reservado del motor:
 /// `arquitectura.md` documenta `0x01..0x7F` como datos de usuario, y este
 /// módulo escribe con `WriteTxn::put` como cualquier otro llamante.
 pub const AGG_NS: u8 = 0x02;

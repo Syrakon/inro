@@ -35,8 +35,8 @@
 //!
 //! ## El ritmo: el tope mensual, no el tope de rps
 //!
-//! Los planes de `quota` (`edge/src/protection/limits.rs`) fijan DOS topes por
-//! plan, y no son la misma carga:
+//! Los perfiles de carga de referencia fijan DOS topes por plan, y no son la
+//! misma carga:
 //!
 //! | Tier | Mensual | rps |
 //! |---|---|---|

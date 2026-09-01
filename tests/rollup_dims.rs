@@ -27,7 +27,7 @@ use inro::{Db, Options, Sync};
 /// La primera versión de estas pruebas pasaba milisegundos y cada observación
 /// caía en un cubo distinto: la hora acababa con una petición y el día con 55
 /// de 300. El error era de la prueba, pero el pie del que se tropieza es real
-/// — el resto de la pila de quota mide en milisegundos.
+/// — el resto de la pila que lo usa mide en milisegundos.
 const T0: u64 = 1_760_000_000;
 
 fn db() -> Db {

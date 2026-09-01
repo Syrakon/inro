@@ -25,8 +25,8 @@
 //! | slice-by-4 | 4 KB | 0,80 | 3,28 | 1 249 | 3,0× |
 //! | **slice-by-8** | **8 KB** | **0,53** | **2,17** | **1 888** | **4,5×** |
 //!
-//! De punta a punta, sobre una base de 300 000 entradas de la forma del
-//! edge de quota (páginas de 4096 B, árbol de profundidad 3):
+//! De punta a punta, sobre una base de 300 000 entradas con la forma de una
+//! serie temporal por nodo (páginas de 4096 B, árbol de profundidad 3):
 //!
 //! | | antes | después |
 //! |---|---:|---:|

@@ -2,7 +2,7 @@
 //! 1 que hasta ahora eran estimaciones de la especificación (sección 12.2,
 //! "37 bytes por entrada") se sustituyen aquí por mediciones reales sobre
 //! un millón de registros con la forma exacta de `request_logs` del edge de
-//! quota.
+//! el producto que estrena el motor.
 //!
 //! **Todo el fichero vive tras `feature = "std"`** (abajo, `#![cfg(...)]`),
 //! igual que `tests/props.rs` y `tests/faults.rs`: `Db`/`WriteTxn`/
@@ -34,7 +34,7 @@
 //! acceso a nada que no sea `pub`. La función de abajo genera la MISMA
 //! forma de bytes que `varint::write` (LEB128 sin signo, grupos de 7 bits,
 //! bit de continuación en la posición 8) porque el objetivo es medir el
-//! tamaño de un registro con la forma real del edge de quota, no ejercitar
+//! tamaño de un registro con la forma real de un log de borde, no ejercitar
 //! el varint del motor — eso ya lo cubre `varint::tests` dentro del crate.
 //!
 //! ## Qué prueba cada banco, y qué NO prueba
@@ -124,7 +124,7 @@ fn push_varint(buf: &mut Vec<u8>, mut v: u64) {
 }
 
 /// Genera un registro con la forma real de `request_logs` del edge de
-/// quota y comprueba los bytes por entrada en disco.
+/// de borde y comprueba los bytes por entrada en disco.
 ///
 /// Distribución tomada del esquema real: 200 endpoints distintos, 5.000
 /// user agents, 40 países, 10.000 usuarios, y la inmensa mayoría de las
@@ -148,7 +148,7 @@ fn synthetic_log(i: u32) -> (Vec<u8>, Vec<u8>) {
     push_varint(&mut v, (i % 5_000) as u64); // user_agent_id
     push_varint(&mut v, (i % 300) as u64); // referer_id
     push_varint(&mut v, (i % 1_200) as u64); // city_id
-    push_varint(&mut v, (i % 10_000) as u64); // quota_user_id
+    push_varint(&mut v, (i % 10_000) as u64); // tenant_user_id
     push_varint(&mut v, (i % 10_000) as u64); // client_user_id
     (key, v)
 }
@@ -746,7 +746,7 @@ mod sqlite_comparison {
             ua_id       INTEGER NOT NULL,
             referer_id  INTEGER NOT NULL,
             city_id     INTEGER NOT NULL,
-            quota_uid   INTEGER NOT NULL,
+            tenant_uid   INTEGER NOT NULL,
             client_uid  INTEGER NOT NULL,
             PRIMARY KEY (ts, seq)
         ) WITHOUT ROWID;
@@ -772,7 +772,7 @@ mod sqlite_comparison {
         ua_id: u64,
         referer_id: u64,
         city_id: u64,
-        quota_uid: u64,
+        tenant_uid: u64,
         client_uid: u64,
     }
 
@@ -791,7 +791,7 @@ mod sqlite_comparison {
             ua_id: (i % 5_000) as u64,
             referer_id: (i % 300) as u64,
             city_id: (i % 1_200) as u64,
-            quota_uid: (i % 10_000) as u64,
+            tenant_uid: (i % 10_000) as u64,
             client_uid: (i % 10_000) as u64,
         }
     }
@@ -903,7 +903,7 @@ mod sqlite_comparison {
                 .prepare(
                     "INSERT INTO logs (ts, seq, method, status, latency_ms, bytes_sent, \
                      bytes_recv, client_ip, country, path_id, ua_id, referer_id, city_id, \
-                     quota_uid, client_uid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     tenant_uid, client_uid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 )
                 .unwrap();
             for chunk in (0..N).collect::<Vec<_>>().chunks(1000) {
@@ -924,7 +924,7 @@ mod sqlite_comparison {
                         r.ua_id,
                         r.referer_id,
                         r.city_id,
-                        r.quota_uid,
+                        r.tenant_uid,
                         r.client_uid,
                     ])
                     .unwrap();

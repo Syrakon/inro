@@ -4442,7 +4442,7 @@ mod tests {
         use super::*;
         use crate::meta::{Meta, MetaSlot};
 
-        /// Un registro con la forma del `request_logs` del edge de quota,
+        /// Un registro con la forma de un `request_logs` de borde,
         /// que es la carga real de este motor y la que midió el eje de
         /// espacio de la revisión final: clave de 10 B (marca de tiempo de
         /// 8 B en big-endian, para que el orden de clave sea el orden
