@@ -823,6 +823,11 @@ mod tests {
             Some(Error::WriterPoisoned),
             "un candado envenenado no debe confundirse con WriterBusy"
         );
+        // La auditoría, en cambio, sigue funcionando: solo necesita la
+        // exclusión del candado, no el estado que el pánico dejó a medias,
+        // y es lo primero que uno quiere ejecutar después de un pánico.
+        #[cfg(feature = "audit")]
+        assert_eq!(db.audit_pages(), Ok(true));
     }
 
     /// Hallazgo 9 (documentado, sin arreglo — ver el comentario de

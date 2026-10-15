@@ -1101,12 +1101,16 @@ impl Db {
     /// suelo lo leyera, así que su snapshot no es más viejo que el
     /// `committed` que ya acota el suelo por arriba.
     ///
-    /// **Orden de candados: `readers` → `committed`**, y es el único sitio
-    /// del motor que sostiene dos de los candados de `Db` a la vez. No hay
-    /// ciclo posible: nadie toma `readers` sosteniendo `committed` (todo
-    /// acceso a `committed` es un temporal que se suelta al acabar su
-    /// sentencia), y el commit publica con `committed.write()` sin tener
-    /// `readers` tomado.
+    /// **Orden de candados: `readers` → `committed`**, y este es el único
+    /// sitio que anida esos DOS. No es el único anidamiento del motor —una
+    /// transacción de escritura sostiene `write_lock` mientras toma
+    /// `committed`, `readers` y los del `Pager`, y `with_catalog` sostiene
+    /// `catalog_indexes` a través de lecturas del `Pager`—; la tabla
+    /// completa está en `docs/invariantes.md` §25. No hay ciclo posible con
+    /// este: nadie toma `readers` sosteniendo `committed` (todo acceso a
+    /// `committed` es un temporal que se suelta al acabar su sentencia), y
+    /// el commit publica con `committed.write()` sin tener `readers`
+    /// tomado.
     pub fn begin_read(&self) -> ReadTxn<'_> {
         let mut readers = self.readers.lock().unwrap();
         let meta = self.committed.read().unwrap().0;
@@ -3504,10 +3508,34 @@ impl Db {
     /// bajo `std` (ver su comentario en `Cargo.toml`).
     ///
     /// Opera sobre la META CONFIRMADA (`self.committed`), nunca sobre una
-    /// transacción de escritura en curso: por eso es segura de llamar desde
-    /// fuera de cualquier `WriteTxn`, con el candado de escritor libre —
-    /// coherente con la firma que pide el brief, `db.audit_pages()` sobre
-    /// `&Db`, no sobre `&mut WriteTxn`.
+    /// transacción de escritura en curso — coherente con la firma que pide
+    /// el brief, `db.audit_pages()` sobre `&Db`, no sobre `&mut WriteTxn`.
+    ///
+    /// # Toma el candado de escritor (0.5.1)
+    ///
+    /// Hasta la 0.5.0 esto decía «segura de llamar con el candado de
+    /// escritor libre», pero no lo comprobaba: leía la meta y recorría el
+    /// árbol y la cadena de libres sin apuntarse como lector y sin el
+    /// candado. Con un escritor concurrente es la misma clase de defecto que
+    /// `begin_read` tenía (`docs/invariantes.md` §25): el escritor podía
+    /// reciclar o recortar páginas en mitad del recorrido y la auditoría
+    /// denunciaba una corrupción que no existía.
+    ///
+    /// Apuntarse como lector (`begin_read`) NO bastaría aquí: la tabla de
+    /// lectores protege el ÁRBOL de un snapshot, pero no su cadena de la
+    /// lista de libres —ningún lector normal la lee, así que nada la
+    /// retiene— ni su `n_pages` frente a un recorte de cola. Esta función
+    /// necesita las tres cosas quietas, y eso es justo lo que da el candado
+    /// de escritor: mientras lo sostiene no hay commit, ni reciclado, ni
+    /// recorte.
+    ///
+    /// `try_lock`, igual que `begin_write`: con un escritor vivo devuelve
+    /// `Error::WriterBusy` en vez de esperar —esperar dejaría colgado a
+    /// quien la llame desde el mismo hilo que tiene abierta una `WriteTxn`—.
+    /// Un candado ENVENENADO no la detiene, a diferencia de `begin_write`:
+    /// aquí solo hace falta la exclusión, no el `WriterState` que el pánico
+    /// pudo dejar a medias, y una auditoría es justo lo que uno quiere
+    /// ejecutar después de un pánico.
     ///
     /// # Por qué `Db::open` NO la llama
     ///
@@ -3536,6 +3564,11 @@ impl Db {
     /// Quien quiera la comprobación la tiene aquí, explícita y bajo su
     /// propia feature, para ejecutarla cuando le convenga.
     pub fn audit_pages(&self) -> Result<bool> {
+        let _writer = match self.write_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(Error::WriterBusy),
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        };
         let (meta, _slot) = *self.committed.read().unwrap();
         let n_pages = meta.n_pages;
         let geometry = self.pager.geometry();
@@ -4258,6 +4291,23 @@ mod tests {
         let (_s, db) = fresh();
         let _tx = db.begin_write().unwrap();
         assert_eq!(db.begin_write().err(), Some(Error::WriterBusy));
+    }
+
+    /// `audit_pages` recorre el árbol, la cadena de libres y `n_pages` de
+    /// la meta confirmada: con un escritor vivo, cualquiera de las tres
+    /// puede cambiar en mitad del recorrido (`docs/invariantes.md` §25). Por
+    /// eso toma el candado de escritor, y con uno vivo responde
+    /// `WriterBusy` —sin esperar, que desde el mismo hilo sería un cuelgue—
+    /// en vez de auditar algo que se mueve.
+    #[cfg(feature = "audit")]
+    #[test]
+    fn audit_pages_refuses_while_a_writer_is_live() {
+        let (_s, db) = fresh();
+        let mut tx = db.begin_write().unwrap();
+        tx.put(0x01, b"k", b"v").unwrap();
+        assert_eq!(db.audit_pages().err(), Some(Error::WriterBusy));
+        tx.commit().unwrap();
+        assert_eq!(db.audit_pages(), Ok(true));
     }
 
     #[test]
