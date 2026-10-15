@@ -647,7 +647,8 @@ planificación, con el `+1` del byte de espacio de claves que `scoped` antepone.
 
 **La regla.** `Pager::write` **borra** la entrada de la caché justo después de
 escribir; no la actualiza. `Pager::truncate` descarta toda entrada por encima
-del corte **antes** de recortar.
+del corte **antes y después** de recortar el medio (la de después corre aunque
+el recorte falle; ver la tabla de abajo).
 
 **Qué se rompe.** Una página reescrita puede además haber cambiado de dueño
 tras pasar por la lista de libres, y servir contenido antiguo bajo el mismo
@@ -666,7 +667,7 @@ la página se reciclaba — el escritor la leía y perdía claves confirmadas. A
 | Rechazo | Por qué |
 |---|---|
 | Ya hay entrada para ese número | Otro hilo rellenó primero. Una sola entrada por número es lo que hace que una invalidación baste |
-| `epoch` se movió desde el fallo | Cada `write`/`truncate` sube `epoch` **después** de escribir en el medio. Un relleno que falló antes trae bytes que pueden ser los de antes, y no entra |
+| `epoch` se movió desde el fallo | `write` sube `epoch` **después** de escribir en el medio; `truncate` lo sube antes **y después** de recortarlo. Un relleno que falló antes de esa última subida trae bytes que pueden ser los de antes, y no entra |
 
 **«Insertar reemplazando» no basta, y por eso existe `epoch`.** El entrelazado
 que lo burla: el lector falla y lee los bytes viejos → el escritor escribe e
@@ -676,6 +677,15 @@ limpia. El contador es único y global, no por página: por página habría que
 recordar páginas que ya no están en la caché, un mapa sin tope en un motor que
 promete RAM constante. Su precio es que un lector que falla mientras el
 escritor vuelca su commit devuelve la página sin cachearla.
+
+**Por qué `truncate` necesita las dos pasadas.** Con solo la de antes queda un
+hueco: un hilo que falle entre la limpieza de la caché y el recorte del medio
+anota el `epoch` ya subido, lee la página todavía entera y su relleno entra —
+una entrada de una página que deja de existir un instante después. La pasada de
+después lo cierra como `write` cierra el suyo: todo relleno anterior a ella, o
+ya entró y se purga, o llega tarde y se descarta; todo fallo posterior lee el
+medio ya cortado. La de antes se conserva porque deja la caché limpia aunque
+`Storage::truncate` entre en pánico y la de después no corra.
 
 **Esta capa ya no depende de la de transacciones para no servir bytes
 viejos.** La 0.5.0 sí dependía, y cuando aquella falló (§25) la caché convirtió
@@ -698,7 +708,8 @@ leer una meta-página a través del `Pager`.**
 `cache_never_grows_past_its_budget`, y desde la 0.5.1
 `two_concurrent_misses_of_one_page_leave_a_single_entry`,
 `a_fill_that_started_before_a_write_is_dropped`,
-`a_fill_that_started_before_a_truncate_is_dropped` (deterministas, en
+`a_fill_that_started_before_a_truncate_is_dropped`,
+`a_fill_between_the_cache_cut_and_the_storage_cut_does_not_survive` (deterministas, en
 `pager.rs`) y `concurrent_readers_never_make_a_writer_lose_keys`
 (`tests/concurrency.rs`, por estrés).
 

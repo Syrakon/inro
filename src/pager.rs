@@ -508,13 +508,26 @@ impl Pager {
     /// el candado de escritor tomado y con la meta que declara ese
     /// `n_pages` ya sincronizada — ver allí el orden completo.
     ///
-    /// **La caché se limpia ANTES de recortar, no después.** Una entrada
-    /// cacheada de una página que ya no existe no puede servirse a nadie
-    /// mientras el escritor tiene el candado, pero si el `truncate` falla a
-    /// mitad y el llamante reintenta, o si la página vuelve a existir tras
-    /// una extensión posterior, servir el contenido viejo bajo el mismo
-    /// número sería exactamente la corrupción silenciosa que `write` evita
-    /// invalidando en vez de actualizar (ver su comentario).
+    /// **La caché se limpia ANTES y DESPUÉS de recortar** (0.5.1). Una
+    /// entrada cacheada de una página que ya no existe no puede servirse a
+    /// nadie mientras el escritor tiene el candado, pero si el `truncate`
+    /// falla a mitad y el llamante reintenta, o si la página vuelve a
+    /// existir tras una extensión posterior, servir el contenido viejo bajo
+    /// el mismo número sería exactamente la corrupción silenciosa que
+    /// `write` evita invalidando en vez de actualizar (ver su comentario).
+    ///
+    /// Solo ANTES no basta: un hilo que falle en la caché entre la limpieza
+    /// y el recorte del medio anota el `epoch` ya subido, lee la página
+    /// todavía sin cortar y su relleno entra limpio — una entrada de una
+    /// página que un instante después deja de existir. La pasada de
+    /// DESPUÉS lo cierra igual que `write` cierra el suyo: sube `epoch`
+    /// otra vez y purga, así que todo relleno cuyo fallo fue anterior al
+    /// corte del medio, o ya entró y se purga, o llega tarde y se descarta;
+    /// y todo fallo posterior lee el medio ya cortado. Corre aunque el
+    /// recorte devuelva `Err`: un recorte a medias es justo el caso en el
+    /// que no se sabe qué bytes quedaron. La pasada de ANTES se conserva:
+    /// no cuesta nada y deja la caché limpia aunque `Storage::truncate`
+    /// entre en pánico y la de después no llegue a correr.
     ///
     /// Ocupa el sitio del antiguo `invalidate(&[PageNo])`, que se conservaba
     /// sin llamador "para cuando haga falta invalidar un lote de páginas sin
@@ -525,7 +538,17 @@ impl Pager {
     pub fn truncate(&self, pages: PageNo) -> Result<()> {
         let len = pages as u64 * self.geometry().page_size as u64;
         self.cache.lock().unwrap().truncate(pages);
-        self.storage.truncate(len)
+        self.cut_storage(pages, len)
+    }
+
+    /// La segunda mitad de `truncate`: recorta el medio y DESPUÉS vuelve a
+    /// purgar y a subir `epoch`, pase lo que pase con el recorte. Separada
+    /// solo para que una prueba pueda colar un relleno entre las dos
+    /// mitades, que es el hueco que esta pasada existe para cerrar.
+    fn cut_storage(&self, pages: PageNo, len: u64) -> Result<()> {
+        let cut = self.storage.truncate(len);
+        self.cache.lock().unwrap().truncate(pages);
+        cut
     }
 
     /// Páginas que caben en el fichero actual. Se usa al abrir para detectar
@@ -833,6 +856,24 @@ mod tests {
         p.truncate(3).unwrap();
         p.cache.lock().unwrap().fill(3, seen, old);
         assert!(!p.is_cached(3));
+    }
+
+    /// El hueco de DENTRO de `truncate`: la caché ya se limpió pero el medio
+    /// todavía no se ha cortado. Un fallo ahí anota el `epoch` nuevo, lee la
+    /// página aún entera y su relleno entra; la pasada posterior al corte
+    /// tiene que echarlo. Sin ella, la página 3 seguiría cacheada después
+    /// de dejar de existir.
+    #[test]
+    fn a_fill_between_the_cache_cut_and_the_storage_cut_does_not_survive() {
+        let p = pager(4);
+        p.write(3, &marked_page(1)).unwrap();
+        p.cache.lock().unwrap().truncate(3);
+        let seen = p.cache.lock().unwrap().lookup(3).unwrap_err();
+        let old = p.read_valid_uncached(3);
+        p.cache.lock().unwrap().fill(3, seen, old);
+        assert!(p.is_cached(3), "el hueco existe: el relleno entra antes del corte del medio");
+        p.cut_storage(3, 3 * 512).unwrap();
+        assert!(!p.is_cached(3), "la pasada posterior al corte tiene que echar la página cortada");
     }
 
     #[test]
