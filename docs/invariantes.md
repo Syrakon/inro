@@ -1072,18 +1072,41 @@ después, y entonces leyó `committed` después de que el suelo lo leyera, así 
 su snapshot no es más viejo que el `committed` que ya acota el suelo. En los dos
 el suelo no pasa del snapshot de ningún lector vivo, y no retrocede.
 
-**Orden de candados de `Db` y `Pager`:**
+**Orden de candados.** Todos los candados del motor fuera de las pruebas,
+comprobados contra `src/` en la 0.5.1. «Sostiene» quiere decir que el guardián
+sigue vivo mientras se pide otro; todo lo demás es un temporal que muere al
+acabar su sentencia.
 
-| Candado | Se toma con otro sostenido | Nota |
-|---|---|---|
-| `readers` → `committed` (lectura) | Sí, solo en `begin_read` | El único anidamiento entre candados de `Db` |
-| `committed` (escritura) | No | El commit publica sin sostener `readers` |
-| `write_lock` | Durante toda la transacción de escritura | Dentro se toman `committed`, `readers`, `last_sync` y los del `Pager`, siempre como temporales de una sentencia. Se pide con `try_lock`, que no espera, así que no puede cerrar un ciclo (`durable` es un atómico, no un candado) |
-| `Pager::pending`, `Pager::cache`, `Pager::geometry` | No | Cada uno se toma y se suelta solo; `read` suelta la caché durante el I/O (§16) |
+| Candado | Dónde se toma | Qué se pide mientras se sostiene | Por qué no cierra un ciclo |
+|---|---|---|---|
+| `Db::write_lock` | `begin_write` (toda la vida de la `WriteTxn`) y `audit_pages` (todo el recorrido) | `committed`, `readers`, `last_sync`, `indexes`, `catalog_indexes`, los tres del `Pager` y los del medio | Es el más externo y solo se pide con `try_lock`, que no espera: nunca es el eslabón que se queda esperando |
+| `Db::readers` | `begin_read` (sostiene), `oldest_reader` y `Drop` de `ReadTxn` (temporales) | Solo en `begin_read`: `committed` en lectura | Nadie pide `readers` sosteniendo `committed` |
+| `Db::committed` (lectura) | Temporales en todo el motor; en `begin_read`, bajo `readers` | Nada | Hoja |
+| `Db::committed` (escritura) | La publicación del commit, bajo `write_lock` | Nada | Hoja; no sostiene `readers` |
+| `Db::catalog_indexes` | `WriteTxn::with_catalog`, bajo `write_lock` | Lecturas del `Pager` (`pending`, `cache`, `geometry`, medio) mientras lee el catálogo; el cierre que recibe no toma nada | Nada por debajo del `Pager` conoce este campo |
+| `Db::indexes` | Temporales (`indexes_for`, `scan_index`); `define_index` lo toma después de su propio commit, con la transacción ya consumida | Nada | Hoja |
+| `Db::last_sync` | `maybe_sync` (`Sync::Interval`), bajo `write_lock` | `Storage::sync` a través de `sync_upto` (`durable` es un atómico, no un candado) | Lo de debajo es el medio, que no conoce `Db` |
+| `Pager::pending` | `read` (sostiene durante el `parse` de una página aparcada), `with_pending_mut` (durante un cierre puro), resto temporales | Nada | Hoja |
+| `Pager::cache` | Temporales; `read` lo **suelta** durante el I/O (§16) | Nada | Hoja |
+| `Pager::geometry` | Temporales (`geometry()` devuelve una copia) | Nada | Hoja |
+| Candados del medio (`MemStorage::data`, `FaultStorage::fault`, el registro `OPEN_FILES` de `FileStorage`) | Dentro de cada llamada a `Storage` | Nada | Hojas: no conocen el motor |
 
-Nadie toma `readers` sosteniendo `committed`: todo acceso a `committed` es un
-temporal que muere al acabar su sentencia. **Quien añada un sitio que sostenga
-`committed` y luego pida `readers` crea un ciclo con `begin_read`.**
+Así que los anidamientos reales son cuatro —`write_lock` → todo lo demás,
+`readers` → `committed`, `catalog_indexes` → `Pager`/medio y `last_sync` →
+medio— y todos van en el mismo sentido, de fuera hacia las hojas. **Quien añada
+un sitio que sostenga `committed` y luego pida `readers` crea un ciclo con
+`begin_read`**, y quien pida `write_lock` con `lock()` en vez de `try_lock`
+sosteniendo cualquiera de los de abajo, uno con toda transacción de escritura.
+
+**`audit_pages` también va por aquí** (0.5.1). Hasta la 0.5.0 recorría la meta
+confirmada sin apuntarse como lector y sin el candado: con un escritor
+concurrente, la misma clase de defecto que este apartado describe. Apuntarse
+como lector no le bastaría —la tabla de lectores protege el árbol de un
+snapshot, pero no su cadena de la lista de libres, que ningún lector normal lee,
+ni su `n_pages` frente a un recorte—, así que toma `write_lock` con `try_lock`:
+con un escritor vivo devuelve `WriterBusy`; con el candado envenenado audita
+igual, porque solo necesita la exclusión. Prueba:
+`audit_pages_refuses_while_a_writer_is_live`.
 
 **Trampa.** «Simplificar» `begin_read` a dos sentencias independientes, o
 reordenar `reuse_floor` para mirar la tabla antes que `committed`, reabre la

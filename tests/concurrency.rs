@@ -41,7 +41,7 @@ const WRITERS: usize = 2;
 /// sola hoja y la página que se recicla es justo la raíz de algún lector.
 const PUTS_PER_WRITER: usize = 10;
 /// Con 3 000 vueltas el código de la 0.5.0 falló en todas las ejecuciones
-/// medidas: 9-19 vueltas rotas de 3 000 sin caché, 166-181 con caché (unos
+/// medidas: 9-23 vueltas rotas de 3 000 sin caché, 164-181 con caché (unos
 /// 4,5 s por prueba en `--release`). En `debug` cada vuelta es bastante más
 /// lenta, así que ahí se recorta para que `cargo test` no se eternice.
 const ROUNDS: usize = if cfg!(debug_assertions) { 2000 } else { 3000 };
