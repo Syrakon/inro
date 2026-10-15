@@ -1079,9 +1079,39 @@ pub struct ReadTxn<'db> {
 }
 
 impl Db {
+    /// Abre un lector sobre la meta confirmada en este instante.
+    ///
+    /// **Leer la meta y apuntarse en la tabla de lectores es UN paso, no
+    /// dos** (0.5.1, ver `docs/invariantes.md` §25). Hasta la 0.5.0 se leía
+    /// `committed` bajo su `RwLock`, se soltaba, y después se tomaba
+    /// `readers` para apuntarse. En ese hueco el lector ya sostenía el
+    /// snapshot N pero el suelo de reutilización no lo veía: un commit de
+    /// N+1 seguido del `alloc` del siguiente escritor calculaba el suelo en
+    /// N+1, reciclaba las páginas que N+1 liberó —el árbol de N— y el
+    /// lector, al apuntarse ya tarde, recorría páginas reescritas
+    /// (`Corrupt { kind: PageType }`, o claves de otro snapshot). Ese
+    /// apunte tardío además hacía RETROCEDER el suelo, que la fusión de
+    /// grupos de `Freelist::flush` da por imposible.
+    ///
+    /// Ahora `committed` se lee CON `readers` tomado. `reuse_floor` lee
+    /// `committed` antes de tomar `readers`, así que para cualquier cálculo
+    /// del suelo hay dos casos y los dos son seguros: o este lector se
+    /// apuntó antes de que el suelo mirase la tabla —y el suelo lo cuenta—,
+    /// o se apuntó después, y entonces leyó `committed` después de que el
+    /// suelo lo leyera, así que su snapshot no es más viejo que el
+    /// `committed` que ya acota el suelo por arriba.
+    ///
+    /// **Orden de candados: `readers` → `committed`**, y es el único sitio
+    /// del motor que sostiene dos de los candados de `Db` a la vez. No hay
+    /// ciclo posible: nadie toma `readers` sosteniendo `committed` (todo
+    /// acceso a `committed` es un temporal que se suelta al acabar su
+    /// sentencia), y el commit publica con `committed.write()` sin tener
+    /// `readers` tomado.
     pub fn begin_read(&self) -> ReadTxn<'_> {
+        let mut readers = self.readers.lock().unwrap();
         let meta = self.committed.read().unwrap().0;
-        *self.readers.lock().unwrap().entry(meta.txn_id).or_insert(0) += 1;
+        *readers.entry(meta.txn_id).or_insert(0) += 1;
+        drop(readers);
         ReadTxn { db: self, meta }
     }
 
@@ -3188,8 +3218,13 @@ impl Db {
     /// confirmado, sin costar nada.
     ///
     /// Cada candado se toma y se suelta por separado, dentro de su propia
-    /// sentencia: así no hay ningún orden de adquisición que mantener
-    /// entre `committed`, `durable` y `readers`.
+    /// sentencia: aquí no se sostienen dos a la vez. **El orden de las
+    /// lecturas sí importa, y no se puede cambiar**: `committed` ANTES que
+    /// `readers`. Es la mitad de este lado del argumento de `begin_read`
+    /// (que lee `committed` sosteniendo `readers`): un lector que no esté
+    /// todavía en la tabla cuando el suelo la mira leerá un `committed` no
+    /// más viejo que el que el suelo ya tomó. Leer la tabla primero dejaría
+    /// abierto otra vez el hueco que la 0.5.1 cerró.
     fn reuse_floor(&self) -> TxnId {
         let committed = self.committed.read().unwrap().0.txn_id;
         let durable = self.durable.load(Ordering::SeqCst);
