@@ -1437,13 +1437,32 @@ mod tests {
             }
             tx.commit().unwrap();
             let root = db.begin_read().root();
+            // La víctima sale del ÁRBOL, no de un desplazamiento fijo. Antes
+            // era `root + 1`, que con la disposición actual del commit es la
+            // cabeza de la lista de libres: `Db::open` la recorre y la
+            // rechaza con `Decrypt` antes de llegar a la aserción, así que la
+            // prueba fallaba en el `unwrap` del `open` en vez de comprobar
+            // la lectura. La última hija de la raíz es una página de datos
+            // viva —ni lista de libres ni meta— que `Db::open` no lee (el
+            // catálogo, si lo leyera, vive en el espacio `0x00`, a la
+            // izquierda) y que un recorrido sí lee.
+            let victim = {
+                let raw = db.begin_read().read_page(root).unwrap();
+                let page = crate::page::PageRef::parse(&raw, root).unwrap();
+                assert_eq!(
+                    page.page_type(),
+                    crate::page::PageType::Internal,
+                    "{algorithm:?}: la prueba necesita una raíz interna para tener otra página de datos que pisar"
+                );
+                page.child(page.n_slots() - 1) as usize
+            };
+            assert_ne!(victim, root as usize);
             drop(db);
 
             // Copia la raíz encima de OTRA página de datos, con todos sus
             // bytes intactos: nonce, tag y texto cifrado. Lo único que
             // cambia es dónde vive.
             let mut bytes = s.snapshot();
-            let victim = (root as usize) + 1;
             let ps = TEST_PAGE_SIZE as usize;
             let (src, dst) = (root as usize * ps, victim * ps);
             let copy: Vec<u8> = bytes[src..src + ps].to_vec();
