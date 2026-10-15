@@ -73,10 +73,32 @@ pub struct Pager {
     encryption: Option<Encryption>,
 }
 
+/// La caché propiamente dicha. Dos invariantes, desde la 0.5.1 (ver
+/// `docs/invariantes.md` §16):
+///
+/// 1. **Nunca dos entradas para el mismo `page_no`.** `fill` lo comprueba
+///    antes de añadir, bajo el mismo cerrojo.
+/// 2. **Ninguna entrada es más vieja que la última escritura de su página.**
+///    `invalidate` sube `epoch` en cada escritura; un relleno que empezó
+///    (`lookup` que falló) antes de esa subida no entra.
 struct Cache {
     entries: Vec<Entry>,
     budget: usize,
     tick: u64,
+    /// Contador de invalidaciones: sube con cada `Pager::write` y cada
+    /// `Pager::truncate`. Un fallo de caché anota el valor que vio al
+    /// fallar, y su relleno solo entra si nadie lo ha movido mientras tanto
+    /// — ver `fill`.
+    ///
+    /// Es uno global y no uno por página a propósito: por página haría
+    /// falta recordar páginas que YA NO están en la caché (justo las que una
+    /// escritura acaba de echar), es decir, un mapa que crece sin tope en
+    /// un motor cuya caché promete RAM constante. El precio del global es
+    /// que un lector que falla mientras el escritor vuelca su commit no deja
+    /// su página cacheada: la devuelve igual, solo que la próxima lectura
+    /// vuelve al medio. Medido en el informe de la 0.5.1: sin efecto
+    /// visible.
+    epoch: u64,
 }
 
 impl Pager {
@@ -89,6 +111,7 @@ impl Pager {
                 entries: Vec::with_capacity(cache_pages),
                 budget: cache_pages,
                 tick: 0,
+                epoch: 0,
             }),
             reads: AtomicU64::new(0),
             encryption: None,
@@ -169,12 +192,16 @@ impl Pager {
     /// volver a tomarlo para insertar la entrada nueva: el I/O de
     /// `storage.read_at` ocurre sin el cerrojo tomado. Esa ventana podría
     /// publicar una entrada obsoleta si un `write` a la misma página se
-    /// colara justo en medio. No puede: `write` (ver su documentación)
-    /// solo reescribe páginas que ningún lector vivo puede estar todavía
-    /// leyendo, así que esa ventana nunca se solapa con un `write` a la
-    /// misma página. Esto es una precondición que impone quien llama —
-    /// otra vez la capa de transacciones — y no algo que `Pager`
-    /// compruebe ni haga cumplir por sí mismo.
+    /// colara justo en medio. Hasta la 0.5.0 lo impedía SOLO una
+    /// precondición de quien llama: `write` (ver su documentación) solo
+    /// reescribe páginas que ningún lector vivo puede estar todavía
+    /// leyendo. Esa precondición se rompió (`Db::begin_read`, ver
+    /// `docs/invariantes.md` §25), y además la ventana tenía un segundo
+    /// agujero que ninguna precondición tapaba: dos fallos simultáneos de
+    /// la misma página dejaban dos entradas. Desde la 0.5.1 esta capa lo
+    /// impide por sí misma, sin fiarse de nadie: un fallo anota el `epoch`
+    /// de la caché y el relleno no entra si una escritura lo movió, ni si
+    /// otro hilo ya rellenó esa página. Ver `Cache::fill`.
     ///
     /// Las páginas de meta se escriben a través de este `Pager`, pero
     /// ningún lector llama nunca a `read` sobre una página de meta: la
@@ -247,15 +274,13 @@ impl Pager {
         if let Some(bytes) = self.pending.lock().unwrap().get(&page_no) {
             return ValidPage::parse(Arc::clone(bytes), page_no);
         }
-        {
-            let mut c = self.cache.lock().unwrap();
-            c.tick += 1;
-            let tick = c.tick;
-            if let Some(e) = c.entries.iter_mut().find(|e| e.page_no == page_no) {
-                e.used = tick;
-                return Ok(e.page.clone());
-            }
-        }
+        // El fallo anota el `epoch` de la caché: el relleno de más abajo
+        // solo entra si ninguna escritura lo ha movido mientras este hilo
+        // leía del medio sin el cerrojo tomado. Ver `Cache::fill`.
+        let seen = match self.cache.lock().unwrap().lookup(page_no) {
+            Ok(page) => return Ok(page),
+            Err(epoch) => epoch,
+        };
 
         // Una sola lectura de la geometría para toda la llamada, en vez de
         // volver a tomar el cerrojo por cada campo que hace falta: barato de
@@ -285,8 +310,7 @@ impl Pager {
         // en la caché — así que no ocupa sitio ni se le vuelve a preguntar.
         let page = ValidPage::parse(bytes, page_no)?;
 
-        let mut c = self.cache.lock().unwrap();
-        c.insert(page_no, page.clone());
+        self.cache.lock().unwrap().fill(page_no, seen, page.clone());
         Ok(page)
     }
 
@@ -351,7 +375,13 @@ impl Pager {
         // Invalidar en vez de actualizar: una página reescrita puede además
         // haber cambiado de dueño tras pasar por la lista de libres, y servir
         // contenido antiguo bajo el mismo número sería corrupción silenciosa.
-        self.cache.lock().unwrap().remove(page_no);
+        //
+        // Y DESPUÉS de escribir en el medio, no antes: quien falle en la
+        // caché después de esta invalidación lee ya los bytes nuevos, y
+        // quien falló antes anotó un `epoch` que esta línea deja viejo, así
+        // que su relleno —con los bytes que fueran— no entra. Ver
+        // `Cache::fill` para el entrelazado entero.
+        self.cache.lock().unwrap().invalidate(page_no);
         Ok(())
     }
 
@@ -494,7 +524,7 @@ impl Pager {
     /// cuesta O(entradas en caché), no O(páginas recortadas).
     pub fn truncate(&self, pages: PageNo) -> Result<()> {
         let len = pages as u64 * self.geometry().page_size as u64;
-        self.cache.lock().unwrap().entries.retain(|e| e.page_no < pages);
+        self.cache.lock().unwrap().truncate(pages);
         self.storage.truncate(len)
     }
 
@@ -577,11 +607,58 @@ impl Pager {
 }
 
 impl Cache {
-    fn insert(&mut self, page_no: PageNo, page: ValidPage) {
-        if self.budget == 0 {
+    /// Acierto: la página, con su uso refrescado. Fallo: el `epoch` vigente,
+    /// que el llamante devuelve a `fill` con la página que lea del medio.
+    fn lookup(&mut self, page_no: PageNo) -> core::result::Result<ValidPage, u64> {
+        self.tick += 1;
+        let tick = self.tick;
+        match self.entries.iter_mut().find(|e| e.page_no == page_no) {
+            Some(e) => {
+                e.used = tick;
+                Ok(e.page.clone())
+            }
+            None => Err(self.epoch),
+        }
+    }
+
+    /// Mete en la caché una página leída del medio tras un fallo que vio
+    /// `seen` como `epoch`. Dos rechazos, uno por invariante:
+    ///
+    /// - **Ya hay una entrada para `page_no`** (otro hilo falló a la vez y
+    ///   rellenó primero): no se añade otra. Era el defecto de la 0.5.0:
+    ///   dos fallos simultáneos dejaban DOS entradas, `invalidate` —que
+    ///   entonces era un `remove` de la primera coincidencia— se llevaba
+    ///   una, y la otra seguía sirviendo el contenido viejo después de que
+    ///   la página se reciclara: claves confirmadas que el escritor dejaba
+    ///   de ver. Se conserva la que ya estaba en vez de reemplazarla: las
+    ///   dos son igual de válidas (ninguna escritura ha pasado desde
+    ///   `seen`, o no se llegaría hasta aquí), y no tocarla es más barato.
+    /// - **`epoch` se ha movido desde `seen`**: una escritura o un recorte
+    ///   ocurrió mientras este hilo leía del medio, y los bytes que trae
+    ///   pueden ser los de antes. «Insertar reemplazando» NO bastaría para
+    ///   esto, y por eso existe el contador: el entrelazado peligroso es
+    ///   lector falla → lector lee los bytes viejos → escritor escribe e
+    ///   invalida → lector inserta. En ese orden no hay ninguna entrada que
+    ///   reemplazar cuando el lector llega; sin el contador, la entrada
+    ///   obsoleta entraría limpia y sobreviviría a la invalidación que
+    ///   debía haberla impedido.
+    ///
+    /// Hoy la capa de transacciones ya impide que un escritor reescriba una
+    /// página que algún lector vivo pueda estar leyendo (§7, §25), así que
+    /// el segundo rechazo no debería dispararse por una página en uso. Está
+    /// igual, porque es lo que hace que esta capa NO dependa de esa
+    /// precondición para no servir bytes viejos: la 0.5.0 sí dependía, y
+    /// cuando la precondición se rompió (`begin_read`, §25) la caché
+    /// convirtió el daño de un lector en pérdida de datos del escritor.
+    fn fill(&mut self, page_no: PageNo, seen: u64, page: ValidPage) {
+        if self.budget == 0 || self.epoch != seen {
             return;
         }
         self.tick += 1;
+        if let Some(e) = self.entries.iter_mut().find(|e| e.page_no == page_no) {
+            e.used = self.tick;
+            return;
+        }
         if self.entries.len() >= self.budget {
             let victim = self
                 .entries
@@ -596,10 +673,20 @@ impl Cache {
         self.entries.push(Entry { page_no, page, used: self.tick });
     }
 
-    fn remove(&mut self, page_no: PageNo) {
-        if let Some(i) = self.entries.iter().position(|e| e.page_no == page_no) {
-            self.entries.swap_remove(i);
-        }
+    /// Echa `page_no` y deja viejo todo relleno en curso. `retain` y no
+    /// `position` + `swap_remove`: con la invariante 1 nunca hay más de una
+    /// entrada, pero si algún día volviera a haberla, quitar solo la primera
+    /// es exactamente el defecto de la 0.5.0.
+    fn invalidate(&mut self, page_no: PageNo) {
+        self.epoch += 1;
+        self.entries.retain(|e| e.page_no != page_no);
+    }
+
+    /// Echa toda entrada desde `pages` en adelante, y deja viejo todo
+    /// relleno en curso por el mismo motivo que `invalidate`.
+    fn truncate(&mut self, pages: PageNo) {
+        self.epoch += 1;
+        self.entries.retain(|e| e.page_no < pages);
     }
 }
 
@@ -618,6 +705,15 @@ mod tests {
 
     fn pager(cache_pages: usize) -> Pager {
         Pager::new(Box::new(MemStorage::new()), geometry(), cache_pages)
+    }
+
+    impl Pager {
+        /// La página validada tal como está en el medio, sin pasar por la
+        /// caché: lo que un hilo tiene en la mano entre su fallo y su
+        /// relleno.
+        fn read_valid_uncached(&self, page_no: PageNo) -> ValidPage {
+            ValidPage::parse(self.read_bytes(page_no).unwrap(), page_no).unwrap()
+        }
     }
 
     /// Una página VÁLIDA con una marca reconocible en su campo `extra`.
@@ -682,6 +778,60 @@ mod tests {
         p.write(3, &alloc::vec![0xabu8; 512]).unwrap();
         assert!(matches!(p.read(3), Err(crate::Error::Corrupt { page: 3, .. })));
         assert_eq!(p.cached_pages(), 0);
+        assert!(!p.is_cached(3));
+    }
+
+    /// Dos hilos fallan a la vez sobre la página 3 y los dos rellenan: la
+    /// caché tiene que quedarse con UNA entrada. Con dos (la 0.5.0), la
+    /// invalidación de `write` se llevaba una y la otra seguía sirviendo el
+    /// contenido viejo — es la prueba determinista de la carrera que
+    /// `tests/concurrency.rs` solo puede provocar por estrés.
+    #[test]
+    fn two_concurrent_misses_of_one_page_leave_a_single_entry() {
+        let p = pager(4);
+        p.write(3, &marked_page(1)).unwrap();
+        let old = p.read_valid_uncached(3);
+        let (a, b) = {
+            let mut c = p.cache.lock().unwrap();
+            (c.lookup(3).unwrap_err(), c.lookup(3).unwrap_err())
+        };
+        p.cache.lock().unwrap().fill(3, a, old.clone());
+        p.cache.lock().unwrap().fill(3, b, old);
+        assert_eq!(p.cache.lock().unwrap().entries.iter().filter(|e| e.page_no == 3).count(), 1);
+
+        p.write(3, &marked_page(2)).unwrap();
+        assert!(!p.is_cached(3), "una sola invalidacion tiene que dejar la pagina fuera");
+        assert_eq!(p.read(3).unwrap().page().extra(), 2);
+    }
+
+    /// El entrelazado que «insertar reemplazando» NO cierra: el lector
+    /// falla y lee los bytes viejos; el escritor escribe e invalida —no hay
+    /// nada que invalidar todavía—; el lector inserta lo viejo. Sin el
+    /// `epoch`, esa entrada entraba limpia y servía la versión anterior a la
+    /// escritura.
+    #[test]
+    fn a_fill_that_started_before_a_write_is_dropped() {
+        let p = pager(4);
+        p.write(3, &marked_page(1)).unwrap();
+        let seen = p.cache.lock().unwrap().lookup(3).unwrap_err();
+        let old = p.read_valid_uncached(3);
+        p.write(3, &marked_page(2)).unwrap();
+        p.cache.lock().unwrap().fill(3, seen, old);
+        assert!(!p.is_cached(3), "un relleno anterior a la escritura no puede entrar");
+        assert_eq!(p.read(3).unwrap().page().extra(), 2);
+        assert!(p.is_cached(3), "el relleno posterior a la escritura sí entra");
+    }
+
+    /// Lo mismo con `truncate` en lugar de `write`: una página recortada no
+    /// puede volver a la caché de la mano de un relleno que empezó antes.
+    #[test]
+    fn a_fill_that_started_before_a_truncate_is_dropped() {
+        let p = pager(4);
+        p.write(3, &marked_page(1)).unwrap();
+        let seen = p.cache.lock().unwrap().lookup(3).unwrap_err();
+        let old = p.read_valid_uncached(3);
+        p.truncate(3).unwrap();
+        p.cache.lock().unwrap().fill(3, seen, old);
         assert!(!p.is_cached(3));
     }
 

@@ -655,6 +655,32 @@ número sería corrupción silenciosa. En el recorte, si el `truncate` falla a
 mitad y el llamante reintenta, o si la página vuelve a existir tras una
 extensión posterior, se serviría el contenido viejo.
 
+**Y la caché nunca guarda dos copias de una página, ni una copia más vieja que
+la última escritura de esa página** (0.5.1). `Pager::read` suelta el cerrojo de
+la caché mientras lee del medio, así que dos hilos pueden fallar a la vez sobre
+la misma página. Hasta la 0.5.0 los dos insertaban: dos entradas para un número,
+`write` quitaba la primera y la otra seguía sirviendo el contenido viejo cuando
+la página se reciclaba — el escritor la leía y perdía claves confirmadas. Ahora
+`Cache::fill`, bajo el cerrojo, rechaza dos casos:
+
+| Rechazo | Por qué |
+|---|---|
+| Ya hay entrada para ese número | Otro hilo rellenó primero. Una sola entrada por número es lo que hace que una invalidación baste |
+| `epoch` se movió desde el fallo | Cada `write`/`truncate` sube `epoch` **después** de escribir en el medio. Un relleno que falló antes trae bytes que pueden ser los de antes, y no entra |
+
+**«Insertar reemplazando» no basta, y por eso existe `epoch`.** El entrelazado
+que lo burla: el lector falla y lee los bytes viejos → el escritor escribe e
+invalida (no hay nada que invalidar todavía) → el lector inserta. Cuando el
+lector llega no hay entrada que reemplazar; sin `epoch`, la obsoleta entraría
+limpia. El contador es único y global, no por página: por página habría que
+recordar páginas que ya no están en la caché, un mapa sin tope en un motor que
+promete RAM constante. Su precio es que un lector que falla mientras el
+escritor vuelca su commit devuelve la página sin cachearla.
+
+**Esta capa ya no depende de la de transacciones para no servir bytes
+viejos.** La 0.5.0 sí dependía, y cuando aquella falló (§25) la caché convirtió
+el daño de un lector en pérdida de datos del escritor.
+
 **Lo que esta capa NO garantiza**, y hay que saberlo: que nadie sostenga una
 página que el escritor va a reescribir. Eso lo garantiza la capa de
 transacciones (lista de libres + tabla de lectores), no el `Pager`. Y quien ya
@@ -669,7 +695,12 @@ leer una meta-página a través del `Pager`.**
 **Pruebas.** `a_rewritten_page_is_not_served_stale_from_cache`,
 `a_page_overwritten_with_garbage_is_not_served_from_the_validated_entry`,
 `a_corrupt_page_is_rejected_and_never_cached`,
-`cache_never_grows_past_its_budget`.
+`cache_never_grows_past_its_budget`, y desde la 0.5.1
+`two_concurrent_misses_of_one_page_leave_a_single_entry`,
+`a_fill_that_started_before_a_write_is_dropped`,
+`a_fill_that_started_before_a_truncate_is_dropped` (deterministas, en
+`pager.rs`) y `concurrent_readers_never_make_a_writer_lose_keys`
+(`tests/concurrency.rs`, por estrés).
 
 ---
 
@@ -1004,3 +1035,52 @@ meta-páginas quedan a salvo de servirse obsoletas (§16). El argumento que
 protege a las páginas de datos —que el escritor nunca reescribe una página que
 un lector vivo pueda estar leyendo— **no cubre las metas**, que se reescriben en
 cada commit.
+
+---
+
+## 25. Un lector se apunta en la tabla CON la meta en la mano — y el orden de candados
+
+**La regla.** `Db::begin_read` toma `readers`, lee `committed` sosteniéndolo,
+se apunta y suelta. Leer la meta y apuntarse son **un solo paso** frente a la
+publicación de una meta nueva.
+
+**Qué se rompe si se separan** (era la 0.5.0). El lector lee el snapshot N y
+suelta `committed`. Antes de que tome `readers`, un commit publica N+1 y el
+siguiente escritor calcula el suelo (§4, §7): `min(committed, durable,
+lectores)` = N+1, porque el lector todavía no está en la tabla. La lista de
+libres sirve las páginas que liberó N+1 —el árbol de N— y el escritor las
+reescribe. El lector se apunta ya tarde y recorre páginas recicladas:
+`Corrupt { kind: PageType }`, o claves de otro snapshot. Y su apunte tardío
+hace **retroceder** el suelo, que la fusión de grupos de `Freelist::flush` da
+por imposible.
+
+**Por qué el arreglo basta.** `reuse_floor` lee `committed` **antes** de mirar
+`readers`. Para cualquier cálculo del suelo, un lector nuevo está en uno de dos
+casos: se apuntó antes de que el suelo mirase la tabla, y cuenta; o se apuntó
+después, y entonces leyó `committed` después de que el suelo lo leyera, así que
+su snapshot no es más viejo que el `committed` que ya acota el suelo. En los dos
+el suelo no pasa del snapshot de ningún lector vivo, y no retrocede.
+
+**Orden de candados de `Db` y `Pager`:**
+
+| Candado | Se toma con otro sostenido | Nota |
+|---|---|---|
+| `readers` → `committed` (lectura) | Sí, solo en `begin_read` | El único anidamiento entre candados de `Db` |
+| `committed` (escritura) | No | El commit publica sin sostener `readers` |
+| `write_lock` | Durante toda la transacción de escritura | Dentro se toman `committed`, `readers`, `last_sync` y los del `Pager`, siempre como temporales de una sentencia. Se pide con `try_lock`, que no espera, así que no puede cerrar un ciclo (`durable` es un atómico, no un candado) |
+| `Pager::pending`, `Pager::cache`, `Pager::geometry` | No | Cada uno se toma y se suelta solo; `read` suelta la caché durante el I/O (§16) |
+
+Nadie toma `readers` sosteniendo `committed`: todo acceso a `committed` es un
+temporal que muere al acabar su sentencia. **Quien añada un sitio que sostenga
+`committed` y luego pida `readers` crea un ciclo con `begin_read`.**
+
+**Trampa.** «Simplificar» `begin_read` a dos sentencias independientes, o
+reordenar `reuse_floor` para mirar la tabla antes que `committed`, reabre la
+carrera. Ninguna prueba de un solo hilo lo nota.
+
+**Pruebas.** `readers_never_see_pages_recycled_under_their_snapshot`
+(`tests/concurrency.rs`): sin caché, para aislar esta carrera de la de §16;
+cada lector comprueba que el número de claves de su snapshot es exactamente el
+que corresponde a su `txn_id`. Sobre la 0.5.0 falló en todas las ejecuciones
+medidas (9-23 vueltas rotas de 3 000). No hay gancho determinista: la ventana
+son dos sentencias seguidas sin ningún punto donde inyectar una pausa.

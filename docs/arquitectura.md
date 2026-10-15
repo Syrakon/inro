@@ -113,7 +113,8 @@ los agregados en `0x02` el coste es el mismo que con el crudo arriba.
 
 ```
 Db::begin_read()
-  └─ copia la meta confirmada · se apunta en la tabla de lectores por txn_id
+  └─ con la tabla de lectores tomada: copia la meta confirmada y se apunta
+     por txn_id — un solo paso, no dos (invariantes §25)
 ReadTxn::get(ns, clave)
   └─ scoped(ns, clave) = [ns] ++ clave
      tree::get(src, meta.root, clave_completa)
@@ -123,7 +124,9 @@ ReadTxn::get(ns, clave)
                       ├─ acierto de caché → ValidPage clonada (no revalida)
                       └─ fallo → storage.read_at → crypto::open (si cifra)
                                 → ValidPage::parse (CRC + estructura)
-                                → entra en la caché
+                                → entra en la caché, salvo que otro hilo ya
+                                  la metiera o una escritura llegara entre
+                                  medias (invariantes §16)
             └─ interna: search_key sobre los sufijos → hijo · hoja: se devuelve
        └─ search_key en la hoja que descend ya validó (no se relee)
             ├─ LeafValue::Inline(v)          → copia

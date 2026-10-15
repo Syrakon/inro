@@ -165,3 +165,10 @@ fn stress(cache_pages: usize) {
 fn readers_never_see_pages_recycled_under_their_snapshot() {
     stress(0);
 }
+
+/// Con la caché por defecto: las dos carreras a la vez, y la de la caché es
+/// la que convierte el daño del lector en claves perdidas del escritor.
+#[test]
+fn concurrent_readers_never_make_a_writer_lose_keys() {
+    stress(Options::default().cache_pages);
+}
