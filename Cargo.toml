@@ -1,6 +1,6 @@
 [package]
 name = "inro"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Minimum-footprint embedded key-value database engine, in pure Rust: copy-on-write B+tree, single-writer transactions with lock-free readers, and an optional rollup layer for time series."
